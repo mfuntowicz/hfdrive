@@ -674,7 +674,7 @@ impl ConnectionPermit {
             // Return if we've already recently reported a partial completion.
             if info
                 .last_partial_report_ms
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last_ms| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |last_ms| {
                     if now_ms.saturating_sub(last_ms) >= MIN_PARTIAL_REPORT_INTERVAL_MS {
                         Some(now_ms)
                     } else {

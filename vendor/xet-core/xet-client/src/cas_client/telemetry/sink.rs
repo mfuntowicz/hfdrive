@@ -130,7 +130,7 @@ impl TelemetrySink {
     fn acquire_slot(&self) -> Option<InFlightGuard> {
         let max = self.max_in_flight;
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()?;
         Some(InFlightGuard(self.in_flight))
     }

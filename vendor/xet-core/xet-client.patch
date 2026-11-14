@@ -1,3 +1,9 @@
+diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/adaptive_concurrency/controller.rs vendor/xet-core/xet-client/src/cas_client/adaptive_concurrency/controller.rs
+--- C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/adaptive_concurrency/controller.rs
++++ vendor/xet-core/xet-client/src/cas_client/adaptive_concurrency/controller.rs
+@@ -677 +677 @@
+-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last_ms| {
++                .try_update(Ordering::AcqRel, Ordering::Acquire, |last_ms| {
 diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/progress_tracked_streams.rs vendor/xet-core/xet-client/src/cas_client/progress_tracked_streams.rs
 --- C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/progress_tracked_streams.rs	2006-07-24 03:21:28.000000000 +0200
 +++ vendor/xet-core/xet-client/src/cas_client/progress_tracked_streams.rs	2026-11-13 21:42:23.929668200 +0100
@@ -121,6 +127,9 @@ diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-
 diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/retry_wrapper.rs vendor/xet-core/xet-client/src/cas_client/retry_wrapper.rs
 --- C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/retry_wrapper.rs	2006-07-24 03:21:28.000000000 +0200
 +++ vendor/xet-core/xet-client/src/cas_client/retry_wrapper.rs	2026-11-13 21:45:56.861385200 +0100
+@@ -346 +346 @@
+-        let result = RetryIf::spawn(
++        let result = RetryIf::start(
 @@ -507,8 +507,11 @@
      {
          self.run_and_process(make_request, |resp: Response| {
@@ -150,6 +159,12 @@ diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-
  
      while let Some(chunk) = stream.try_next().await.map_err(map_stream_io_error)? {
          buffer.extend_from_slice(&chunk);
+diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/telemetry/sink.rs vendor/xet-core/xet-client/src/cas_client/telemetry/sink.rs
+--- C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/cas_client/telemetry/sink.rs
++++ vendor/xet-core/xet-client/src/cas_client/telemetry/sink.rs
+@@ -133 +133 @@
+-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
++            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
 diff -r C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/common/mod.rs vendor/xet-core/xet-client/src/common/mod.rs
 --- C:/Users/momo-/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xet-client-1.8.1/src/common/mod.rs	2006-07-24 03:21:28.000000000 +0200
 +++ vendor/xet-core/xet-client/src/common/mod.rs	2026-11-13 21:41:26.395154000 +0100

@@ -1,13 +1,13 @@
-# Vendored `xet-client` 1.8.1 — HF Drive transport-budget patch
+# Vendored `xet-client` 1.8.1 — HF Drive transport-budget and API compatibility patch
 
 ## What this is
 
 `xet-client/` is the **published crates.io `xet-client` 1.8.1 source, unmodified
-except for the minimal patch recorded in `xet-client.patch`** (441-line unified
-diff against the pristine registry source). The patch exists for exactly one
-reason, authorized by the HF Drive plan ("if absent, add a narrowly pinned
-source patch exposing body-stream token-bucket hooks and wire counters at the
-actual transport boundary"):
+except for the minimal patch recorded in `xet-client.patch`** (unified diff
+against the pristine registry source). The transport-budget changes are
+authorized by the HF Drive plan ("if absent, add a narrowly pinned source patch
+exposing body-stream token-bucket hooks and wire counters at the actual transport
+boundary"). Three behavior-preserving API renames also avoid deprecation warnings.
 
 The pinned official Xet SDK (hf-xet 1.8.1 → xet-client 1.8.1) has **no public
 hook** at its HTTP body transport boundary. Its `XetConfig` exposes only
@@ -15,7 +15,7 @@ concurrency/retry/timeout knobs (`client.*`, `data.*`, `reconstruction.*`, all
 inspected); `reqwest-middleware` middlewares cannot see body bytes; response
 bodies are consumed as opaque `reqwest::Response` streams. Therefore HF Drive
 cannot pace or count the encoded CAS/dedup/range wire bytes from outside the
-crate. The patch adds a hook and nothing else.
+crate. The transport-budget portion of the patch adds that hook.
 
 ## What the patch changes (and what it does not)
 
@@ -38,9 +38,17 @@ Wired into the **existing** body streams (six call sites, no logic changes):
 - `src/cas_client/retry_wrapper.rs` — `run_and_extract_bytes`, the generic
   bounded response collector.
 
+API compatibility (no policy or ordering changes):
+- `src/cas_client/retry_wrapper.rs` — `RetryIf::spawn` → `RetryIf::start`.
+- `src/cas_client/adaptive_concurrency/controller.rs` — `AtomicU64::fetch_update`
+  → `try_update`, preserving the throttling closure and both memory orderings.
+- `src/cas_client/telemetry/sink.rs` — `AtomicUsize::fetch_update` → `try_update`,
+  preserving the in-flight limit, closure, and both memory orderings.
+
 **Untouched:** Xet chunking, CAS protocol, deduplication, reconstruction,
 authentication, retry policy, adaptive concurrency, telemetry accounting, and
-all request shapes. Every patched line is a body stream that already existed.
+all request shapes. The transport edits wrap existing body streams; the API
+compatibility edits only replace deprecated entry-point names.
 
 Deliberately not metered by this patch (documented in `docs/transfers.md`):
 small JSON control bodies of hub/token-refresh calls and telemetry POSTs —

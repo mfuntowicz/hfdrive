@@ -343,7 +343,7 @@ impl RetryWrapper {
 
         let retry_info = Arc::new((make_request, process_fn, try_count, self_.clone()));
 
-        let result = RetryIf::spawn(
+        let result = RetryIf::start(
             strategy,
             move || {
                 let retry_info = retry_info.clone();
