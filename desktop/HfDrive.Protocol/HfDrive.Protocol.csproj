@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <Platforms>x64</Platforms>
+    <!-- Restore both portable and desktop assets from any project entry point. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <RootNamespace>HfDrive.Protocol</RootNamespace>
     <AssemblyName>HfDrive.Protocol</AssemblyName>
     <IsPackable>false</IsPackable>

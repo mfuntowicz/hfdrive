@@ -80,7 +80,7 @@ The manifest template `packaging/AppxManifest.xml` contains exactly two tokens,
 From a fresh PowerShell process at the repository root:
 
 ```
-pwsh -NoProfile -File scripts/build.ps1 -Configuration Debug -InitializeLocks   # first run only
+pwsh -NoProfile -File scripts/build.ps1 -Configuration Debug -Locked
 pwsh -NoProfile -File scripts/build.ps1 -Configuration Release -Locked
 ```
 
@@ -88,6 +88,24 @@ pwsh -NoProfile -File scripts/build.ps1 -Configuration Release -Locked
 --target x86_64-pc-windows-msvc` and the managed solution with the Build Tools
 x64 MSBuild, then writes build provenance to `artifacts/build/`. It never mutates
 machine/user PATH and never installs components.
+
+The checked-in lockfiles are used on the first checkout too. `-InitializeLocks`
+is only for intentional lockfile creation/updates, not a workaround for a failed
+locked restore. The portable protocol library declares `win-x64` as an additional
+restore target so solution builds and RID-specific desktop builds share the same
+lockfile; its target framework remains `net11.0`.
+
+Exit the desktop/tray UI before rebuilding. If the provider is running, stop it
+explicitly using the existing Debug CLI:
+
+```powershell
+& .\target\x86_64-pc-windows-msvc\debug\hfdrive.exe provider exit --confirm
+```
+
+Closing the UI alone does not stop the provider. Windows cannot replace a running
+`hfdrive-provider.exe`; graceful provider exit preserves work and registrations.
+Do not delete state or regenerate lockfiles to work around that executable lock.
+
 
 ## Signing identity — explicit and fail-closed
 
