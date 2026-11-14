@@ -79,7 +79,7 @@ pub fn probe_payload_block(index: u64, out: &mut [u8]) {
     if state == 0 {
         state = 0x2545F491_4F6CDD1D;
     }
-    let mut fill = |state: &mut u64| -> u64 {
+    let fill = |state: &mut u64| -> u64 {
         *state ^= *state >> 12;
         *state ^= *state << 25;
         *state ^= *state >> 27;

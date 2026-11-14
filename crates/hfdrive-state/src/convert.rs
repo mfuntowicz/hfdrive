@@ -50,33 +50,35 @@ pub(crate) fn uuid_from(value: ValueRef<'_>, entity: &'static str) -> Result<uui
 }
 
 macro_rules! id_readers {
-    ($($fn_req:ident, $fn_opt:ident => $ty:ty),+ $(,)?) => {$(
+    ($($fn_req:ident $(, $fn_opt:ident)? => $ty:ty),+ $(,)?) => {$(
         pub(crate) fn $fn_req(value: ValueRef<'_>) -> Result<$ty, StateError> {
             let id = uuid_from(value, stringify!($ty))?;
             <$ty>::from_uuid(id).map_err(|_| StateError::InvalidId { entity: stringify!($ty) })
         }
-        pub(crate) fn $fn_opt(value: ValueRef<'_>) -> Result<Option<$ty>, StateError> {
-            match blob_opt(value, stringify!($ty), UUID_BYTES)? {
-                None => Ok(None),
-                Some(_) => Ok(Some($fn_req(value)?)),
+        $(
+            pub(crate) fn $fn_opt(value: ValueRef<'_>) -> Result<Option<$ty>, StateError> {
+                match blob_opt(value, stringify!($ty), UUID_BYTES)? {
+                    None => Ok(None),
+                    Some(_) => Ok(Some($fn_req(value)?)),
+                }
             }
-        }
+        )?
     )+};
 }
 
 id_readers!(
     connection_id, connection_id_opt => ConnectionId,
-    workspace_id, workspace_id_opt => WorkspaceId,
+    workspace_id => WorkspaceId,
     item_id, item_id_opt => ItemId,
     version_id, version_id_opt => VersionId,
     operation_id, operation_id_opt => OperationId,
     commit_id, commit_id_opt => CommitId,
-    generation_id, generation_id_opt => GenerationId,
+    generation_id => GenerationId,
     snapshot_id, snapshot_id_opt => SnapshotId,
-    transfer_id, transfer_id_opt => TransferId,
-    action_id, action_id_opt => ActionId,
+    transfer_id => TransferId,
+    action_id => ActionId,
     setup_id, setup_id_opt => SetupId,
-    conflict_id, conflict_id_opt => ConflictId,
+    conflict_id => ConflictId,
 );
 
 pub(crate) fn digest_from(value: ValueRef<'_>, entity: &'static str) -> Result<Sha256Digest, StateError> {

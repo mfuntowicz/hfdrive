@@ -31,8 +31,6 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// `DRIVE_FIXED` — GetDriveTypeW result for a fixed hard disk.
 pub(crate) const DRIVE_FIXED_TYPE: u32 = 3;
-/// `DRIVE_REMOTE` — network share; never acceptable for a sync root.
-pub(crate) const DRIVE_REMOTE_TYPE: u32 = 4;
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 pub(crate) const ATTR_REPARSE_POINT: u32 = 0x400;
 /// `FILE_ATTRIBUTE_ENCRYPTED` (EFS).
@@ -118,13 +116,6 @@ pub(crate) fn handle_into_file(handle: OwnedHandle) -> std::fs::File {
     // SAFETY: `OwnedHandle` owns a valid kernel handle; `File` takes that
     // ownership over exactly once via the raw handle conversion.
     unsafe { std::fs::File::from_raw_handle(handle.into_raw_handle()) }
-}
-
-/// Open an existing file for queries without following its reparse point and
-/// without write/delete sharing restrictions (used for reconciliation of
-/// existing paths during placeholder creation).
-pub(crate) fn open_probe(path: &Path) -> Result<OwnedHandle, u32> {
-    open_query(path, true)
 }
 
 /// Open an existing regular file for read/write without following reparse
@@ -214,12 +205,10 @@ pub(crate) fn attr_tag(handle: &OwnedHandle) -> Result<AttrTag, u32> {
     })
 }
 
-/// Size, link count and directory/delete-pending flags.
+/// Size and link count.
 pub(crate) struct StandardInfo {
     pub size: u64,
     pub link_count: u32,
-    pub delete_pending: bool,
-    pub directory: bool,
 }
 
 pub(crate) fn standard_info(handle: &OwnedHandle) -> Result<StandardInfo, u32> {
@@ -227,24 +216,18 @@ pub(crate) fn standard_info(handle: &OwnedHandle) -> Result<StandardInfo, u32> {
     Ok(StandardInfo {
         size: info.EndOfFile as u64,
         link_count: info.NumberOfLinks,
-        delete_pending: info.DeletePending,
-        directory: info.Directory,
     })
 }
 
-/// Creation/last-write timestamps (100 ns since 1601 UTC) and attributes.
+/// Last-write timestamp (100 ns since 1601 UTC).
 pub(crate) struct BasicInfo {
-    pub creation_time_100ns: i64,
     pub last_write_time_100ns: i64,
-    pub attributes: u32,
 }
 
 pub(crate) fn basic_info(handle: &OwnedHandle) -> Result<BasicInfo, u32> {
     let info: FILE_BASIC_INFO = file_info(handle, FileBasicInfo)?;
     Ok(BasicInfo {
-        creation_time_100ns: info.CreationTime,
         last_write_time_100ns: info.LastWriteTime,
-        attributes: info.FileAttributes,
     })
 }
 
@@ -405,13 +388,4 @@ fn nul_terminated(units: &[u16]) -> Vec<u16> {
 /// Borrow a `HANDLE` view of an owned handle for cross-adapter calls.
 pub(crate) fn as_handle(handle: &OwnedHandle) -> HANDLE {
     handle.as_win()
-}
-
-/// Wrap a raw `HANDLE` produced by a CFAPI call into an owned handle.
-///
-/// # Safety
-/// `raw` must be a valid, uniquely owned handle.
-pub(crate) unsafe fn own(raw: HANDLE) -> Option<OwnedHandle> {
-    // SAFETY: forwarded to the caller's documented ownership contract.
-    unsafe { OwnedHandle::from_raw(raw) }
 }

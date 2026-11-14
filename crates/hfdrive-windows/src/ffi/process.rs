@@ -13,7 +13,6 @@ use super::token::TokenIdentity;
 /// A handle to a peer process, opened for identity queries only.
 pub(crate) struct PeerProcess {
     handle: OwnedHandle,
-    pid: u32,
 }
 
 impl PeerProcess {
@@ -29,13 +28,8 @@ impl PeerProcess {
             if verified_pid != pid {
                 return Err(windows::core::Error::from_thread());
             }
-            Ok(Self { handle, pid })
+            Ok(Self { handle })
         }
-    }
-
-    /// The PID this handle was opened for.
-    pub(crate) fn pid(&self) -> u32 {
-        self.pid
     }
 
     /// Open the peer's process token for identity queries.

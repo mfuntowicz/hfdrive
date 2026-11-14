@@ -246,7 +246,6 @@ pub async fn walk_ancestry<R: AncestrySource + ?Sized>(
         match commit.parent_commit_id {
             Some(parent) => cursor.next = Some(parent),
             None => {
-                cursor.next = None;
                 return Ok(AncestryProgress::Complete { matches });
             }
         }

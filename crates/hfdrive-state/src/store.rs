@@ -31,10 +31,6 @@ const SETUP_COLUMNS: &str = "setup_id, connection_id, operation_id, account_key,
      request_fingerprint, phase, status, created_resources_json, preview_json, root_path, mode, \
      credential_ref, probe_evidence_json, failure_reason, evidence_generation, account_committed, control_committed";
 
-const CONTROL_CONNECTION_COLUMNS: &str = "connection_id, account_key, workspace_id, owner_kind, owner_id, \
-     owner_namespace, bucket_id, bucket_name, prefix, root_path, mode, registered, volume_guid, volume_serial, \
-     sync_root_id, oauth_ref, s3_ref, config_json";
-
 const ACCOUNT_CONNECTION_COLUMNS: &str = "connection_id, account_key, workspace_id, owner_kind, owner_id, \
      owner_namespace, bucket_id, bucket_name, prefix, root_path, volume_guid, volume_serial, sync_root_id, \
      oauth_ref, s3_ref, schema_version, mode, config_json";

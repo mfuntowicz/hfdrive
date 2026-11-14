@@ -5,7 +5,7 @@
 //! the OS writes whole `FILE_NOTIFY_INFORMATION` chains into the fixed
 //! buffer, which this module decodes into plain `RawNotify` records. A zero
 //! byte completion means the directory changed faster than the buffer could
-//! report and is surfaced as `Ok(None)` (overflow) — never silently dropped.
+//! report and is surfaced as an overflow outcome — never silently dropped.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -30,8 +30,8 @@ use super::{error_code, last_error_code};
 /// directory-watch buffer size; overflow is surfaced, never hidden).
 const WATCH_BUFFER_BYTES: usize = 64 * 1024;
 
-/// One decoded change notification: the action code (see
-/// `RawNotify::ACTION_ADDED` and siblings) and the relative wide name.
+/// One decoded change notification: the raw `FILE_ACTION` code and the
+/// relative wide name.
 pub(crate) struct RawNotify {
     pub action: u32,
     pub name: Vec<u16>,
@@ -44,14 +44,6 @@ pub(crate) enum BatchOutcome {
     /// evidence is void until a rescan.
     Overflow,
     TimedOut,
-}
-
-impl RawNotify {
-    pub const ACTION_ADDED: u32 = 1;
-    pub const ACTION_REMOVED: u32 = 2;
-    pub const ACTION_MODIFIED: u32 = 3;
-    pub const ACTION_RENAMED_OLD: u32 = 4;
-    pub const ACTION_RENAMED_NEW: u32 = 5;
 }
 
 /// An armed directory watch. Methods are `&mut self`: one outstanding

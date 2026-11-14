@@ -10,7 +10,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, FILE_ATTRIBUTE_NORMAL, FILE_CREATION_DISPOSITION,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_MODE, FILE_SHARE_NONE, FILE_SHARE_READ, FlushFileBuffers,
     FILE_WRITE_DATA, LOCK_FILE_FLAGS, LockFileEx, MOVE_FILE_FLAGS, MoveFileExW, ReadFile,
-    SetFilePointerEx, WriteFile, CREATE_NEW, FILE_ALL_ACCESS, FILE_BEGIN,
+    WriteFile, CREATE_NEW, FILE_ALL_ACCESS,
     LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
@@ -66,12 +66,6 @@ pub(crate) fn write_all(handle: HANDLE, mut data: &[u8]) -> windows::core::Resul
         data = &data[written as usize..];
     }
     Ok(())
-}
-
-/// Rewind the file pointer to the start.
-pub(crate) fn rewind(handle: HANDLE) -> windows::core::Result<()> {
-    // SAFETY: standard seek on an open handle; no new pointer needed.
-    unsafe { SetFilePointerEx(handle, 0, None, FILE_BEGIN) }
 }
 
 /// Read the whole file from the current position, bounded by `max`.

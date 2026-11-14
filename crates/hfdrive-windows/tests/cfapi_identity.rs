@@ -37,8 +37,10 @@ fn validation_precedes_decoding_on_every_reject_path() {
         PlaceholderIdentity::decode(&bytes[..IDENTITY_LEN - 1], Some(workspace)),
         Err(IdentityError::BadLength)
     );
+    let mut oversized = bytes.to_vec();
+    oversized.push(0);
     assert_eq!(
-        PlaceholderIdentity::decode(&bytes[..IDENTITY_LEN + 1], Some(workspace)),
+        PlaceholderIdentity::decode(&oversized, Some(workspace)),
         Err(IdentityError::BadLength)
     );
 
@@ -70,7 +72,7 @@ fn nil_identifiers_are_rejected() {
     let workspace = WorkspaceId::new();
     let mut bytes =
         PlaceholderIdentity::file(workspace, ItemId::new(), VersionId::new()).encode();
-    bytes[21..37].copy_from_slice(&Uuid::nil().as_bytes());
+    bytes[21..37].copy_from_slice(Uuid::nil().as_bytes());
     assert_eq!(
         PlaceholderIdentity::decode(&bytes, Some(workspace)),
         Err(IdentityError::NilIdentifier)

@@ -60,7 +60,6 @@ pub struct ProviderStreams {
 
 struct Interest {
     request_key: i64,
-    transfer_key: i64,
     ranges: Vec<ByteRange>,
     cancelled: Arc<AtomicBool>,
 }
@@ -160,7 +159,6 @@ impl EventSink for CallbackHub {
         let ack = request.ack;
         let interest = Interest {
             request_key: ack.request_key,
-            transfer_key: ack.transfer_key,
             ranges: std::iter::once(request.required)
                 .chain(request.optional)
                 .collect(),
@@ -189,9 +187,9 @@ impl EventSink for CallbackHub {
     }
 
     fn on_fetch_placeholders(&self, request: PlaceholdersRequest) {
-        if self.placeholders.try_send(request.clone()).is_err() {
+        if let Err(error) = self.placeholders.try_send(request) {
             let _ = crate::ffi::cfapi::transfer_placeholders(
-                request.ack,
+                error.into_inner().ack,
                 TransferStatus::Failed(FetchFailure::ResourceExhausted),
                 0,
                 &[],
@@ -204,18 +202,18 @@ impl EventSink for CallbackHub {
     }
 
     fn on_rename(&self, notification: RenameNotification) {
-        if self.renames.try_send(notification.clone()).is_err() {
+        if let Err(error) = self.renames.try_send(notification) {
             let _ = crate::ffi::cfapi::ack_rename(
-                notification.ack,
+                error.into_inner().ack,
                 TransferStatus::Failed(FetchFailure::ResourceExhausted),
             );
         }
     }
 
     fn on_delete(&self, notification: DeleteNotification) {
-        if self.deletes.try_send(notification.clone()).is_err() {
+        if let Err(error) = self.deletes.try_send(notification) {
             let _ = crate::ffi::cfapi::ack_delete(
-                notification.ack,
+                error.into_inner().ack,
                 TransferStatus::Failed(FetchFailure::ResourceExhausted),
             );
         }

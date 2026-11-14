@@ -19,8 +19,8 @@ use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Storage::CloudFilters::{
     CfConnectSyncRoot, CfConvertToPlaceholder, CfCreatePlaceholders, CfDehydratePlaceholder,
     CfDisconnectSyncRoot, CfExecute, CfGetPlaceholderInfo, CfGetPlaceholderRangeInfo,
-    CfGetPlaceholderStateFromAttributeTag, CfGetTransferKey, CfHydratePlaceholder,
-    CfOpenFileWithOplock, CfReleaseTransferKey, CfReportProviderProgress, CfRevertPlaceholder,
+    CfGetPlaceholderStateFromAttributeTag, CfHydratePlaceholder,
+    CfOpenFileWithOplock, CfReportProviderProgress, CfRevertPlaceholder,
     CfSetInSyncState, CfSetPinState, CfUpdatePlaceholder, CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS,
     CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
     CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_FETCH_DATA,
@@ -1013,12 +1013,11 @@ pub(crate) fn dehydrate(handle: &OwnedHandle) -> Result<(), u32> {
     }
 }
 
-/// Pin/in-sync state plus the raw identity bytes of a placeholder.
+/// Pin/in-sync state of a placeholder.
 #[derive(Clone, Debug)]
 pub(crate) struct PlaceholderInfoBits {
     pub pin_state: i32,
     pub in_sync_state: i32,
-    pub identity: Vec<u8>,
 }
 
 pub(crate) fn placeholder_info(handle: &OwnedHandle) -> Result<PlaceholderInfoBits, u32> {
@@ -1035,14 +1034,9 @@ pub(crate) fn placeholder_info(handle: &OwnedHandle) -> Result<PlaceholderInfoBi
         )
         .map_err(|e| super::error_code(&e))?;
         let info = &*(buffer.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO);
-        let identity_offset = offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
-        let identity_len = (info.FileIdentityLength as usize)
-            .min(buffer.len().saturating_sub(identity_offset));
-        let identity = buffer[identity_offset..identity_offset + identity_len].to_vec();
         Ok(PlaceholderInfoBits {
             pin_state: info.PinState.0,
             in_sync_state: info.InSyncState.0,
-            identity,
         })
     }
 }
@@ -1092,31 +1086,6 @@ pub(crate) const STATE_IN_SYNC: u32 = 0x8;
 pub(crate) const STATE_PARTIAL: u32 = 0x10;
 /// `CF_PLACEHOLDER_STATE_PARTIALLY_ON_DISK`.
 pub(crate) const STATE_PARTIALLY_ON_DISK: u32 = 0x20;
-
-/// A transfer key obtained by the provider (`CfGetTransferKey`); released
-/// with `CfReleaseTransferKey` exactly once on drop. Keys that arrive in
-/// callbacks are **never** wrapped in this type: they belong to the OS.
-pub(crate) struct ProviderTransferKey {
-    handle: OwnedHandle,
-    key: i64,
-}
-
-pub(crate) fn provider_transfer_key(handle: OwnedHandle) -> Result<ProviderTransferKey, u32> {
-    // SAFETY: handle is live; the key is released exactly once on drop.
-    let key = unsafe { CfGetTransferKey(super::volume::as_handle(&handle)) }
-        .map_err(|e| super::error_code(&e))?;
-    Ok(ProviderTransferKey { handle, key })
-}
-
-impl Drop for ProviderTransferKey {
-    fn drop(&mut self) {
-        // SAFETY: the key came from `CfGetTransferKey` for this exact handle
-        // and has not been released before.
-        unsafe {
-            CfReleaseTransferKey(super::volume::as_handle(&self.handle), &self.key);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // helpers

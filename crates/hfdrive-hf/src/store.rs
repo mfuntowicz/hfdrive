@@ -1119,7 +1119,7 @@ pub(crate) async fn tree_page<T: TokenSource>(
     }
     Ok(TreePage {
         entries,
-        next: next.map(|url| PageCursor(url.into_string())),
+        next: next.map(|url| PageCursor(url.into())),
     })
 }
 

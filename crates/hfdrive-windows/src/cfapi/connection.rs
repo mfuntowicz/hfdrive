@@ -5,8 +5,7 @@
 //! `shutdown` implements the required lifetime order: stop scheduling, mark
 //! cancellation, `CfDisconnectSyncRoot` **while the context is still valid**,
 //! join in-flight callbacks, then free the context. OS callback transfer keys
-//! are never released by the provider; only provider-obtained keys are (see
-//! `crate::ffi::cfapi::provider_transfer_key`).
+//! are never released by the provider.
 
 use std::path::Path;
 use std::sync::Arc;

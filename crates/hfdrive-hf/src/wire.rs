@@ -66,7 +66,6 @@ impl BucketSummaryWire {
 #[derive(Clone, Debug)]
 pub struct BatchResponseWire {
     pub success: bool,
-    pub processed: u64,
     pub succeeded: u64,
     pub failed: Vec<(String, String)>,
 }
@@ -90,7 +89,7 @@ impl BatchResponseWire {
         {
             return Err(NativeError::InvalidResponse);
         }
-        Ok(Self { success, processed, succeeded, failed })
+        Ok(Self { success, succeeded, failed })
     }
 }
 

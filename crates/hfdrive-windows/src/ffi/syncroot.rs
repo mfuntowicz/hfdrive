@@ -166,23 +166,6 @@ pub(crate) fn current_roots() -> Result<Vec<RegisteredRoot>, u32> {
     Ok(out)
 }
 
-/// The folder path of a registered root id, if present.
-pub(crate) fn root_path(id: &str) -> Result<Option<PathBuf>, u32> {
-    let _mta = MtaGuard::enter();
-    match StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id)) {
-        Ok(info) => info_path(&info).map(Some),
-        Err(e) => {
-            let code = super::error_code(&e);
-            // 2 = ERROR_FILE_NOT_FOUND: no such registration id.
-            if code == 2 {
-                Ok(None)
-            } else {
-                Err(code)
-            }
-        }
-    }
-}
-
 fn info_path(info: &StorageProviderSyncRootInfo) -> Result<PathBuf, u32> {
     let folder = info.Path().map_err(|e| super::error_code(&e))?;
     let item: windows::Storage::IStorageItem = folder.cast().map_err(|e| super::error_code(&e))?;

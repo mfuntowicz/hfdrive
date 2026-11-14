@@ -13,12 +13,13 @@ fn range(start: u64, end: u64, size: u64) -> ByteRange {
 
 #[test]
 fn out_of_bounds_ranges_fail_before_any_sdk_use() {
+    // A range captured for a larger file must be rejected against the current EOF.
     assert!(matches!(
-        plan_chunks(range(0, 100, 50), None, 50),
+        plan_chunks(range(0, 100, 100), None, 50),
         Err(CfError::InvalidChunk)
     ));
     assert!(matches!(
-        plan_chunks(range(0, 101, 100), None, 100),
+        plan_chunks(range(0, 101, 101), None, 100),
         Err(CfError::InvalidChunk)
     ));
 }

@@ -26,13 +26,6 @@ pub(crate) struct TokenIdentity {
     pub(crate) session_id: u32,
 }
 
-impl TokenIdentity {
-    /// Whether this token runs at or above the minimum accepted integrity.
-    pub(crate) fn integrity_ok(&self, min_rid: u32) -> bool {
-        self.integrity_rid >= min_rid
-    }
-}
-
 /// Default policy: refuse peers below medium integrity.
 pub(crate) const DEFAULT_MIN_INTEGRITY_RID: u32 = MIN_INTEGRITY_RID;
 

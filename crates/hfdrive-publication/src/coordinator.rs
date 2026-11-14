@@ -425,10 +425,11 @@ impl PublicationStore for S3Transport {
 impl<N: PublicationNative, S: PublicationStore> AncestrySource for PublicationCoordinator<N, S> {
     fn read_commit(
         &self,
-        lease: &NativeLease,
+        _lease: &NativeLease,
         commit: CommitId,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<BoundedRecord, PublicationError>> + Send {
+        // Refresh and revalidate authorization for each read, not the walk's initial lease.
         self.read_metadata(MetadataRecord::Commit(commit), cancel)
     }
 }

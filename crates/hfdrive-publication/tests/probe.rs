@@ -12,7 +12,7 @@ use hfdrive_core::storage::RemotePrefix;
 use hfdrive_hf::wire_budget::{BudgetConfig, WireBudget};
 use hfdrive_protocol::ProbeOutcome;
 use hfdrive_publication::probe::{
-    CapabilityProbe, ProbeJournal, ProbeMode, ProbeRequest, ProbeTransport,
+    CapabilityProbe, ProbeMode, ProbeRequest, ProbeTransport,
 };
 use hfdrive_publication::transport::ProbeKey;
 use hfdrive_publication::PublicationError;

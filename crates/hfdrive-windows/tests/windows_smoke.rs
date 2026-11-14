@@ -27,7 +27,7 @@ use hfdrive_windows::filesystem::{
 };
 use hfdrive_windows::cfapi::{create_placeholders, PlaceholderCreate, PlaceholderRequestOutcome};
 use hfdrive_windows::cfapi::{MetadataSpec, PlaceholderIdentity};
-use hfdrive_core::ids::{ItemId, VersionId, WorkspaceId};
+use hfdrive_core::ids::{ItemId, WorkspaceId};
 
 fn scratch(tag: &str) -> PathBuf {
     let root = std::env::var("HFDRIVE_SMOKE_ROOT")

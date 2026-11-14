@@ -39,26 +39,6 @@ pub(crate) fn read_binding(row: &Row<'_>, offset: usize) -> SResult<DriveBinding
     })
 }
 
-/// Control registry row. Columns: connection_id, then the eight binding
-/// columns, root_path, mode, registered, volume_guid, volume_serial,
-/// sync_root_id, oauth_ref, s3_ref, config_json.
-pub(crate) fn read_control_connection(row: &Row<'_>) -> SResult<ConnectionRecord> {
-    Ok(ConnectionRecord {
-        connection_id: c::connection_id(row.get_ref(0)?)?,
-        account_key: c::account_key(row.get_ref(1)?)?,
-        binding: read_binding(row, 1)?,
-        root_path: c::path(row.get_ref(9)?, "root_path")?,
-        mode: parse_mode(&c::text(row.get_ref(10)?, "mode")?)?,
-        registered: c::boolean(row.get_ref(11)?, "registered")?,
-        volume_guid: c::text_opt(row.get_ref(12)?, "volume_guid")?,
-        volume_serial: c::unsigned_opt(row.get_ref(13)?, "volume_serial")?,
-        sync_root_id: c::text_opt(row.get_ref(14)?, "sync_root_id")?,
-        oauth_ref: c::text_opt(row.get_ref(15)?, "oauth_ref")?.map(CredentialRef),
-        s3_ref: c::text_opt(row.get_ref(16)?, "s3_ref")?.map(CredentialRef),
-        schema_version: 1,
-        config_json: c::json(row.get_ref(17)?, "config_json")?,
-    })
-}
 
 /// Account-local connection row. Columns: connection_id, the eight binding
 /// columns, root_path, volume_guid, volume_serial, sync_root_id, oauth_ref,

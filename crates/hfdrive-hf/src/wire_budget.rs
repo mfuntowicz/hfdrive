@@ -205,10 +205,6 @@ impl DirectionBudget {
         let _ = self.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
-    fn bucket(&self, direction: Direction) -> &DirectionBudget {
-        let _ = direction;
-        self
-    }
 }
 
 /// Shared transfer budget: one token bucket per direction plus the wire and

@@ -192,7 +192,6 @@ enum Side {
 struct LocalView {
     components: Vec<String>,
     display: String,
-    match_key: Vec<u8>,
     invalid_name: bool,
     is_directory: bool,
     size: u64,
@@ -205,7 +204,6 @@ struct LocalView {
 struct RemoteView {
     components: Vec<String>,
     display: String,
-    match_key: Vec<u8>,
     invalid_name: bool,
     item_id: ItemId,
     is_directory: bool,
@@ -845,7 +843,6 @@ async fn remote_plan_entries<T: hfdrive_auth::TokenSource>(
         };
         views.push(RemoteView {
             display: components.join("\\"),
-            match_key: match_key(&components),
             invalid_name,
             item_id: item.item_id,
             is_directory,
@@ -982,7 +979,6 @@ fn local_view(entry: &MetadataEntry) -> LocalView {
     };
     LocalView {
         display: components.join("\\"),
-        match_key: match_key(&components),
         invalid_name,
         is_directory: entry.is_directory,
         size: entry.size,

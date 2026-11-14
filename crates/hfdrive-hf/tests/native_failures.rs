@@ -181,7 +181,7 @@ fn owner(namespace: &str) -> OwnerRef {
     }
 }
 
-fn bucket_binding(account_key: AccountKey, id: &str, namespace: &str, name: &str) -> BucketBinding {
+fn bucket_binding(id: &str, namespace: &str, name: &str) -> BucketBinding {
     BucketBinding {
         bucket_id: BucketId::new(id.to_owned()).unwrap(),
         bucket_name: BucketName::new(name.to_owned()).unwrap(),
@@ -194,7 +194,7 @@ fn bucket_binding(account_key: AccountKey, id: &str, namespace: &str, name: &str
 fn drive(account_key: AccountKey) -> DriveBinding {
     DriveBinding {
         account_key,
-        bucket: bucket_binding(account_key, "64b000000000000000000001", "ns", "b"),
+        bucket: bucket_binding("64b000000000000000000001", "ns", "b"),
         prefix: RemotePrefix::new(String::new()).unwrap(),
         workspace_id: WorkspaceId::new(),
     }
@@ -480,7 +480,7 @@ async fn head_reads_distinguish_absent_unsupported_and_records() {
     let control = NativeControl::new(api, config(format!("http://{}", server.addr)));
     let lease = control.capture_lease().unwrap();
     let cancel = CancellationToken::new();
-    let bucket = bucket_binding(api_account, "64b000000000000000000001", "ns", "b");
+    let bucket = bucket_binding("64b000000000000000000001", "ns", "b");
     let prefix = RemotePrefix::new("hfdrive/demo".to_owned()).unwrap();
 
     let read = control.read_head_record(&lease, &bucket, &prefix, &cancel).await.unwrap();

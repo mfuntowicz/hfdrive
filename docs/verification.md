@@ -88,3 +88,42 @@ provider's storage, preview, collision, and initialization gates are unchanged.
 
 The temporary UI automation and pipe-diagnostic scripts were removed after proof;
 the JSON records and actual-window captures remain.
+
+## Rust warning cleanup — 2026-11-14
+
+- Nullable SQLite ID readers are generated only where nullable columns consume
+  them. The unused control-row reader and column list were removed; strict
+  UUID/blob/null validation and account-local row readers are unchanged.
+- Unused private Windows helpers, stored process IDs, placeholder identity
+  copies, metadata fields, and callback-interest fields were removed after
+  workspace/test consumer checks. Actual PID/token/integrity verification,
+  callback identity validation, transfer cancellation, and handle ownership stay
+  intact. OS-provided callback transfer keys are still never released.
+- Batch `processed` counts remain mandatory and validated against the submitted
+  and successful/failed operation counts; only the redundant stored copy was
+  removed. Pagination now consumes URLs through `Into<String>`.
+- Publication ancestry no longer assigns a discarded completion cursor. The
+  coordinator intentionally obtains and validates fresh authorization for each
+  ancestry read rather than reusing the walk's initial lease.
+- Setup no longer allocates unused full-path collision keys for every local and
+  remote view. Parent/name collision grouping and preview validation are unchanged.
+- No blanket warning suppressions or dummy consumers were introduced.
+
+Passed: `cargo +1.99.1 check --workspace --locked --target x86_64-pc-windows-msvc`
+with the selected v145/SDK 28000 environment, with no compiler warnings.
+The Windows identity test fixtures also now construct a real oversized buffer
+instead of slicing beyond an array and pass the UUID byte slice without an extra
+reference; the unused smoke-test import was removed.
+Transfer-planning rejection fixtures now create ranges against their captured
+size before checking them against a smaller current EOF; invalid test setup no
+longer panics before the planner can reject the request. The native-failure test
+binding helper no longer accepts an unused account argument, and the unused
+probe-test trait import was removed.
+
+Affected verification passed on the pinned Windows x64 toolchain: 235 distinct
+tests across state, Windows, native HF, publication, and provider library targets.
+Thirteen existing scale/manual/live CFAPI cases stayed ignored; no live HF writes
+or sync-root registration were performed. Initial test-only fixture/compiler
+failures were corrected and the affected targets rerun without weakening assertions.
+MSVC still emits informational import-library creation output as `linker_messages`
+while linking some tests; the workspace `cargo check` itself is warning-free.
