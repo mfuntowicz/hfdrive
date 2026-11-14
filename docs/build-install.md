@@ -13,7 +13,7 @@ contract).
 
 | Component | Pin | Source |
 | --- | --- | --- |
-| Rust | 1.99.1, `x86_64-pc-windows-msvc` | `rust-toolchain.toml` |
+| Rust | 1.100.0, `x86_64-pc-windows-msvc` | `rust-toolchain.toml` |
 | Visual Studio Build Tools | 2026, 18.12 feature line (`18.12.12405.243`), x64 MSBuild | discovered by `scripts/Initialize-BuildEnvironment.ps1` (vswhere, BuildTools-only) |
 | MSVC toolset | v145 `14.52.37025` | `Enter-VsDevShell -vcvars_ver=14.52.37025` |
 | Windows SDK (native + packaging) | `10.0.28000.0` (servicing `10.0.28000.2957`) | MakeAppx/MakePri/SignTool from `Windows Kits\10\bin\10.0.28000.0\x64` |

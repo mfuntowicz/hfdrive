@@ -127,3 +127,19 @@ or sync-root registration were performed. Initial test-only fixture/compiler
 failures were corrected and the affected targets rerun without weakening assertions.
 MSVC still emits informational import-library creation output as `linker_messages`
 while linking some tests; the workspace `cargo check` itself is warning-free.
+
+## Rust 1.100.0 toolchain upgrade
+
+The repository toolchain and workspace minimum Rust version are pinned to
+`1.100.0`. The exact named toolchain was installed explicitly; build initialization
+still disables automatic toolchain installation.
+
+Passed: default `rustc --version` and `cargo --version` both select `1.100.0`.
+Passed: `cargo check --workspace --locked --target x86_64-pc-windows-msvc` in the
+pinned Windows build environment, with no warnings or errors.
+
+Cargo 1.100's unused-workspace-dependency lint exposed the unused
+`aws-credential-types` workspace declaration. Only that declaration was removed;
+S3's transitive dependency remains, and no lockfile regeneration was required.
+Earlier Rust 1.99.1 verification records remain historical; tests were not rerun
+for this toolchain-only change.

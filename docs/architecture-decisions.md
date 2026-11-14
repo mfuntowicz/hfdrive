@@ -24,7 +24,7 @@ Secrets are protected with current-user DPAPI, outside sync roots, with restrict
 
 ## ADR 004 — Pinned Windows build stack
 
-Rust 1.99.1 targets MSVC x64. Build Tools 2026's 18.12 line supplies MSVC v145 14.52.37025 and full x64 MSBuild. Native compilation and packaging use Windows SDK 10.0.28000.0. The supported managed API target remains net11.0-windows10.0.26100.0 with projection 10.0.26100.87; minimum OS is Windows 11 22H2 (22621). These version numbers have different purposes. No preview-target validation bypass or fallback to .NET 10/VS2022 is permitted.
+Rust 1.100.0 targets MSVC x64. Build Tools 2026's 18.12 line supplies MSVC v145 14.52.37025 and full x64 MSBuild. Native compilation and packaging use Windows SDK 10.0.28000.0. The supported managed API target remains net11.0-windows10.0.26100.0 with projection 10.0.26100.87; minimum OS is Windows 11 22H2 (22621). These version numbers have different purposes. No preview-target validation bypass or fallback to .NET 10/VS2022 is permitted.
 
 The developer shell's `cl.exe` path is checked against the pinned compiler. Global `CC=cl.exe` lets BLAKE3 select its MSVC/MASM sources; target-specific `CC`/`CXX` retain absolute pinned paths. An absolute global `CC` caused BLAKE3 1.8.7 to select GNU assembly under MSVC.
 
