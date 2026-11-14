@@ -536,7 +536,7 @@ where
         committed: &CasCommitCheckpoint,
         cancel: &CancellationToken,
     ) -> Result<ObjectRef, RemoteError> {
-        let (ingested_stage, ingested) = self.reingest_verified(snapshot, None, cancel).await?;
+        let (ingested_stage, _ingested) = self.reingest_verified(snapshot, None, cancel).await?;
         let (committed_stage, checkpoint) = ingested_stage.commit_cas(cancel).await?;
         if checkpoint.target_key != committed.target_key
             || checkpoint.xet_file_id != committed.xet_file_id

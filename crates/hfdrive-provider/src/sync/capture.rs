@@ -139,7 +139,7 @@ pub async fn capture_local_change(
     }
 
     // 2. Staging admission: bounded staging + always keep minimum free space.
-    let admission = scheduler
+    let _admission = scheduler
         .reserve_staging(
             WorkClass::LocalEdit,
             drive,

@@ -37,7 +37,7 @@ use hfdrive_core::ids::{
     ActionId, CommitId, ConnectionId, DeviceId, GenerationId, ItemId, OperationId, SnapshotId,
     VersionId, WorkspaceId,
 };
-use hfdrive_core::reconcile::{IntentOutcomeKind, ReconcileMode, ReconcilePlan};
+use hfdrive_core::reconcile::{ReconcileMode, ReconcilePlan};
 use hfdrive_core::storage::{ObjectRef, StableSnapshot};
 use hfdrive_publication::coordinator::{InitOutcome, PublicationCandidate, PublishResult};
 use hfdrive_state::{

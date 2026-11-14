@@ -24,7 +24,7 @@ use hfdrive_core::reconcile::{
     CatalogView, ConflictRecord as CoreConflict, IdSource, ItemState, LocalIntent, LocalOrigin,
     OrdinalIgnoreCase, ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
 };
-use hfdrive_core::storage::{ObjectRef, Sha256Digest};
+use hfdrive_core::storage::Sha256Digest;
 use hfdrive_state::{
     AccountStore, ConflictResolution, LocalAction, LocalActionState, OutboxEntry, OutboxState,
 };

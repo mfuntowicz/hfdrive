@@ -21,15 +21,14 @@ use std::path::{Path, PathBuf};
 
 use hfdrive_core::ids::{ActionId, ItemId, VersionId};
 use hfdrive_state::{
-    AccountStore, CompletionOutcome, ConflictResolution, LocalActionState, ObservationFlags,
+    AccountStore, CompletionOutcome, ConflictResolution, LocalActionState,
 };
 use hfdrive_windows::cfapi::ops::{
     FreeSpaceEvidence, GuardOutcome, MetadataSpec, PinOutcome, PinRequest, PlaceholderCreate,
     UpdateSpec,
 };
 use hfdrive_windows::cfapi::identity::PlaceholderIdentity;
-use hfdrive_windows::filesystem::volume::{FileState, query_file_state};
-use tokio_util::sync::CancellationToken;
+use hfdrive_windows::filesystem::volume::FileState;
 
 use crate::sync::observe::EchoTable;
 use crate::sync::outbox::CaptureEvidence;

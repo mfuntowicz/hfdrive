@@ -411,7 +411,7 @@ impl Provider {
                     // Unportable names never match, adopt, or upload; every
                     // affected entry is surfaced for review with complete counts.
                     for &(side, index) in &cluster_members {
-                        let (display, item_id, is_directory, local, remote, size, sha) = match side {
+                        let (display, item_id, _is_directory, local, remote, size, sha) = match side {
                             Side::Local => {
                                 let view = &locals[index];
                                 (view.display.clone(), None, view.is_directory, true, false, Some(view.size), None)

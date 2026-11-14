@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use hfdrive_core::ids::{ConnectionId, ItemId, VersionId, WorkspaceId};
-use hfdrive_core::storage::{ByteRange, ObjectRef};
+use hfdrive_core::storage::ByteRange;
 use hfdrive_windows::cfapi::events::{
     CancelTarget, CompletionEvent, DeleteNotification, FetchFailure, FetchRequest,
     PlaceholdersRequest, RenameNotification, TransferStatus,

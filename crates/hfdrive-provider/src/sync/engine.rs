@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::scheduler::Scheduler;
 use crate::sync::controller::{ConnectionConfig, ConnectionHealth, ConnectionRuntime};
-use crate::sync::publish::{PublishError, initialize_workspace, RoundContext};
+use crate::sync::publish::{PublishError, initialize_workspace};
 use crate::sync::registry::{self, AdmissionError, AdmissionEvidence};
 use crate::sync::remote::RemoteOps;
 
