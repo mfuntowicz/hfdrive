@@ -1,0 +1,25 @@
+[package]
+name = "hfdrive-hf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hfdrive-core.workspace = true
+hfdrive-auth.workspace = true
+hf-hub.workspace = true
+hf-xet.workspace = true
+xet-client.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+eventsource-stream.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+zeroize.workspace = true

@@ -1,0 +1,11 @@
+{
+  "name": "reject_event_method_unknown",
+  "description": "request method used on an event envelope",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "invalid_request",
+    "reason": "request method used on an event envelope"
+  },
+  "frame_hex": "8a0000007b2270726f746f636f6c5f6d616a6f72223a312c2270726f746f636f6c5f6d696e6f72223a302c22726571756573745f6964223a2261303862303633642d646432642d343764612d383764612d303030326265636564383165222c226b696e64223a226576656e74222c226d6574686f64223a226765745f737461747573222c22626f6479223a7b7d7d"
+}

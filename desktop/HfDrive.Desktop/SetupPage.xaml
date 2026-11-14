@@ -1,0 +1,602 @@
+<Page
+    x:Class="HfDrive.Desktop.SetupPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="using:HfDrive.Desktop.ViewModels">
+
+    <Page.Resources>
+        <!-- Neutral rounded card with a thin border; backgrounds come from the
+             native theme dictionaries defined in App.xaml. -->
+        <Style x:Key="CardBorderStyle" TargetType="Border">
+            <Setter Property="Background" Value="{ThemeResource HfCardBackgroundBrush}" />
+            <Setter Property="BorderBrush" Value="{ThemeResource HfCardBorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="Padding" Value="16" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+        </Style>
+        <Style x:Key="StoragePrimaryButtonStyle" TargetType="Button" BasedOn="{StaticResource AccentButtonStyle}">
+            <Setter Property="Background" Value="{ThemeResource HfStorageActionBrush}" />
+            <Setter Property="Foreground" Value="{ThemeResource HfStorageActionForegroundBrush}" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="Padding" Value="20,10" />
+        </Style>
+    </Page.Resources>
+
+    <Grid Background="{ThemeResource HfPageBackgroundBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- ── Brand header: logo, step chips, progress ─────────────────── -->
+        <Grid Grid.Row="0"
+              Background="{ThemeResource HfHeaderBackgroundBrush}"
+              Padding="24,16,24,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Image Grid.Column="0"
+                       Width="44" Height="41"
+                       Stretch="Uniform"
+                       AutomationProperties.Name="Hugging Face">
+                    <Image.Source>
+                        <SvgImageSource UriSource="ms-appx:///Assets/HuggingFace.svg" />
+                    </Image.Source>
+                </Image>
+                <StackPanel Grid.Column="1"
+                            Margin="12,0,0,0"
+                            VerticalAlignment="Center"
+                            Spacing="2">
+                    <TextBlock Text="HF Drive"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                    <TextBlock Text="Hugging Face Storage on your PC"
+                               FontSize="12"
+                               Opacity="0.8"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+                <TextBlock Grid.Column="2"
+                           VerticalAlignment="Center"
+                           FontSize="12"
+                           Opacity="0.8"
+                           Text="{x:Bind ViewModel.StepProgressText, Mode=OneWay}"
+                           Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+            </Grid>
+
+            <!-- Four visible steps; the accent core marks the current step. -->
+            <StackPanel Grid.Row="1"
+                        Orientation="Horizontal"
+                        Spacing="6"
+                        Margin="0,12,0,0"
+                        HorizontalAlignment="Left">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Border Width="20" Height="20" CornerRadius="10"
+                            Background="{ThemeResource HfStorageAccentFillBrush}">
+                        <Ellipse Width="8" Height="8"
+                                 Fill="{ThemeResource HfStorageAccentBrush}"
+                                 Visibility="{x:Bind ViewModel.IsAccountStepVisible, Mode=OneWay}" />
+                    </Border>
+                    <TextBlock Text="Sign in" FontSize="12" VerticalAlignment="Center"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+                <Rectangle Width="12" Height="2" VerticalAlignment="Center"
+                           Fill="{ThemeResource HfCardBorderBrush}" />
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Border Width="20" Height="20" CornerRadius="10"
+                            Background="{ThemeResource HfStorageAccentFillBrush}">
+                        <Ellipse Width="8" Height="8"
+                                 Fill="{ThemeResource HfStorageAccentBrush}"
+                                 Visibility="{x:Bind ViewModel.IsOwnerStepVisible, Mode=OneWay}" />
+                    </Border>
+                    <TextBlock Text="Bucket" FontSize="12" VerticalAlignment="Center"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+                <Rectangle Width="12" Height="2" VerticalAlignment="Center"
+                           Fill="{ThemeResource HfCardBorderBrush}" />
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Border Width="20" Height="20" CornerRadius="10"
+                            Background="{ThemeResource HfStorageAccentFillBrush}">
+                        <Ellipse Width="8" Height="8"
+                                 Fill="{ThemeResource HfStorageAccentBrush}"
+                                 Visibility="{x:Bind ViewModel.IsLocalStepVisible, Mode=OneWay}" />
+                    </Border>
+                    <TextBlock Text="Folder &amp; access" FontSize="12" VerticalAlignment="Center"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+                <Rectangle Width="12" Height="2" VerticalAlignment="Center"
+                           Fill="{ThemeResource HfCardBorderBrush}" />
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Border Width="20" Height="20" CornerRadius="10"
+                            Background="{ThemeResource HfStorageAccentFillBrush}">
+                        <Ellipse Width="8" Height="8"
+                                 Fill="{ThemeResource HfStorageAccentBrush}"
+                                 Visibility="{x:Bind ViewModel.IsReviewStepVisible, Mode=OneWay}" />
+                    </Border>
+                    <TextBlock Text="Review" FontSize="12" VerticalAlignment="Center"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+            </StackPanel>
+
+            <ProgressBar Grid.Row="2"
+                         Margin="0,12,0,0"
+                         Height="3"
+                         Minimum="0" Maximum="100"
+                         Foreground="{ThemeResource HfStorageAccentBrush}"
+                         Value="{x:Bind ViewModel.ProgressValue, Mode=OneWay}" />
+        </Grid>
+
+        <!-- ── Scrollable form body (footer stays fixed) ────────────────── -->
+        <ScrollViewer Grid.Row="1"
+                      Padding="20,16,20,20"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      HorizontalScrollMode="Disabled"
+                      ZoomMode="Disabled">
+            <StackPanel Spacing="16" MaxWidth="620" HorizontalAlignment="Stretch">
+
+                <!-- Global state: error, provider retry, login instructions.
+                     The login panel is deliberately global so the device-code
+                     alternative is available on the Folder &amp; access step too. -->
+                <InfoBar Severity="Error"
+                         IsClosable="False"
+                         IsOpen="{x:Bind ViewModel.HasError, Mode=OneWay}"
+                         Title="Setup needs attention">
+                    <TextBlock Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
+                               TextWrapping="Wrap" />
+                </InfoBar>
+
+
+                <InfoBar Severity="Informational"
+                         IsClosable="False"
+                         IsOpen="{x:Bind ViewModel.Main.IsLoginPending, Mode=OneWay}"
+                         Title="Sign-in in progress">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="{x:Bind ViewModel.Main.LoginInstructions, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   IsTextSelectionEnabled="True" />
+                            <Button Content="Cancel sign-in"
+                                    Command="{x:Bind ViewModel.Main.CancelLoginCommand}" />
+                    </StackPanel>
+                </InfoBar>
+
+                    <!-- Probe outputs: expandable, never normal body. -->
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Visibility="{x:Bind ViewModel.StorageCheckDetailsVisibility, Mode=OneWay}"
+                              Header="Storage check details">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="{x:Bind ViewModel.ProbeStatusText, Mode=OneWay}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="{x:Bind ViewModel.ProbeCapabilityText, Mode=OneWay}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="{x:Bind ViewModel.ProbeRunIdText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="{x:Bind ViewModel.ProbeReportPathText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <ListView ItemsSource="{x:Bind ViewModel.ProbeChecks, Mode=OneWay}"
+                                      SelectionMode="None"
+                                      MaxHeight="280">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:ProbeCheckRow">
+                                        <StackPanel Spacing="2" Margin="0,0,0,8">
+                                            <TextBlock Text="{x:Bind KindDisplay, Mode=OneTime}"
+                                                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                                                       TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind OutcomeDisplay, Mode=OneTime}" />
+                                            <TextBlock Text="{x:Bind ExpectationDisplay, Mode=OneTime}"
+                                                       TextWrapping="Wrap"
+                                                       FontSize="12" />
+                                            <TextBlock Text="{x:Bind ObservationDisplay, Mode=OneTime}"
+                                                       TextWrapping="Wrap"
+                                                       FontSize="12" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                        </StackPanel>
+                    </Expander>
+                <TextBlock Text="{x:Bind ViewModel.BusyText, Mode=OneWay}"
+                           TextWrapping="Wrap" FontSize="12"
+                           AutomationProperties.LiveSetting="Polite" />
+                <!-- Step heading -->
+                <ContentControl IsEnabled="{x:Bind ViewModel.CanEdit, Mode=OneWay}"
+                                HorizontalContentAlignment="Stretch">
+                <StackPanel Spacing="16">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="{x:Bind ViewModel.StepTitle, Mode=OneWay}"
+                               Style="{StaticResource TitleTextBlockStyle}"
+                               TextWrapping="Wrap" />
+                    <TextBlock Text="{x:Bind ViewModel.StepDescription, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Opacity="0.8" />
+                </StackPanel>
+
+                <!-- ══ Step 0: Sign in ═══════════════════════════════════ -->
+                <StackPanel Spacing="12" Visibility="{x:Bind ViewModel.IsAccountStepVisible, Mode=OneWay}">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="{x:Bind ViewModel.AccountSummaryText, Mode=OneWay}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="Sign in securely with Hugging Face to access your buckets."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <TextBlock Text="We'll ask for read access. Write permission is requested only for two-way sync."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                        </StackPanel>
+                    </Border>
+
+                    <HyperlinkButton Content="Use a device code instead"
+                                     Padding="0" HorizontalAlignment="Left"
+                                     Command="{x:Bind ViewModel.UseDeviceLoginCommand}" />
+                </StackPanel>
+
+                <!-- ══ Step 1: Bucket ═══════════════════════════════════ -->
+                <StackPanel Spacing="12" Visibility="{x:Bind ViewModel.IsOwnerStepVisible, Mode=OneWay}">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="{x:Bind ViewModel.OwnersEmptyText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <ComboBox Header="Account or organization"
+                                      HorizontalAlignment="Stretch"
+                                      ItemsSource="{x:Bind ViewModel.Owners, Mode=OneWay}"
+                                      SelectedItem="{x:Bind ViewModel.SelectedOwner, Mode=TwoWay}"
+                                      DisplayMemberPath="HeaderDisplay" />
+                            <StackPanel Orientation="Horizontal" Spacing="8"
+                                        Visibility="{x:Bind ViewModel.OwnerPagingVisibility, Mode=OneWay}">
+                                <Button Content="Load more owners"
+                                        Command="{x:Bind ViewModel.LoadMoreOwnersCommand}" />
+                                <ProgressRing IsActive="{x:Bind ViewModel.IsOwnersLoading, Mode=OneWay}"
+                                              Width="20" Height="20" />
+                            </StackPanel>
+
+                            <TextBlock Text="{x:Bind ViewModel.BucketsEmptyText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <ComboBox Header="Bucket"
+                                      HorizontalAlignment="Stretch"
+                                      ItemsSource="{x:Bind ViewModel.Buckets, Mode=OneWay}"
+                                      SelectedItem="{x:Bind ViewModel.SelectedBucket, Mode=TwoWay}"
+                                      DisplayMemberPath="Name" />
+                            <StackPanel Orientation="Horizontal" Spacing="8"
+                                        Visibility="{x:Bind ViewModel.BucketPagingVisibility, Mode=OneWay}">
+                                <Button Content="Load more buckets"
+                                        Command="{x:Bind ViewModel.LoadMoreBucketsCommand}" />
+                                <ProgressRing IsActive="{x:Bind ViewModel.IsBucketsLoading, Mode=OneWay}"
+                                              Width="20" Height="20" />
+                            </StackPanel>
+                            <ComboBox Header="Drive source"
+                                      HorizontalAlignment="Stretch"
+                                      ItemsSource="{x:Bind ViewModel.SourceChoices, Mode=OneWay}"
+                                      SelectedItem="{x:Bind ViewModel.SelectedSource, Mode=TwoWay}"
+                                      DisplayMemberPath="Display" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Optional bucket creation, collapsed by default. -->
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Header="Create a private bucket (optional)">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Create a private bucket for your drive, or choose an existing one above."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <TextBox Header="New private bucket name"
+                                     HorizontalAlignment="Stretch"
+                                     Text="{x:Bind ViewModel.NewBucketName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <ComboBox Header="Region"
+                                      HorizontalAlignment="Stretch"
+                                      ItemsSource="{x:Bind ViewModel.RegionChoices, Mode=OneWay}"
+                                      SelectedItem="{x:Bind ViewModel.SelectedRegion, Mode=TwoWay}" />
+                            <Button Content="Create private bucket"
+                                    HorizontalAlignment="Left"
+                                    Command="{x:Bind ViewModel.CreateBucketCommand}" />
+                            <TextBlock Text="{x:Bind ViewModel.CreatedBucketText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                        </StackPanel>
+                    </Expander>
+
+                    <!-- Advanced: drive source and prefix. -->
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Header="Drive location &amp; details">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="A new drive uses a separate location inside your bucket. Existing bucket files aren't imported or changed."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <TextBox Header="Managed prefix inside the bucket"
+                                     HorizontalAlignment="Stretch"
+                                     Text="{x:Bind ViewModel.PrefixText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBlock Text="HF Drive manages this prefix; its raw bucket layout differs from your Explorer folders."
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <TextBlock Text="{x:Bind ViewModel.WorkspaceIdText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="Technical identity"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.SelectedOwnerIdentityText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="{x:Bind ViewModel.SelectedBucketIdentityText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                        </StackPanel>
+                    </Expander>
+                </StackPanel>
+
+                <!-- ══ Step 2: Folder & access ══════════════════════════ -->
+                <StackPanel Spacing="12" Visibility="{x:Bind ViewModel.IsLocalStepVisible, Mode=OneWay}">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBox Header="Local folder"
+                                     HorizontalAlignment="Stretch"
+                                     Text="{x:Bind ViewModel.RootPathText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="Browse…"
+                                        AccessKey="R"
+                                        HorizontalAlignment="Left"
+                                        Click="OnBrowseFolderClick" />
+                            </StackPanel>
+                            <TextBlock Text="Choose a local NTFS folder. We'll create it if needed when you continue."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+
+                            <ComboBox Header="Access mode"
+                                      HorizontalAlignment="Stretch"
+                                      ItemsSource="{x:Bind ViewModel.ModeChoices, Mode=OneWay}"
+                                      SelectedItem="{x:Bind ViewModel.SelectedMode, Mode=TwoWay}"
+                                      DisplayMemberPath="Display" />
+                            <TextBlock Text="{x:Bind ViewModel.SelectedMode.Description, Mode=OneWay}"
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <HyperlinkButton Content="Browser unavailable? Use a device code"
+                                             HorizontalAlignment="Left" Padding="0"
+                                             Command="{x:Bind ViewModel.UseDeviceLoginCommand}" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Publication credentials: only for writable connections,
+                         shown once write permission is granted. -->
+                    <Border Style="{StaticResource CardBorderStyle}"
+                            Visibility="{x:Bind ViewModel.IsCredentialsVisible, Mode=OneWay}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Storage access keys"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="Two-way sync needs an S3-compatible access key from Hugging Face. Its permissions may cover the whole bucket."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <HyperlinkButton Content="How to get storage access keys"
+                                             NavigateUri="https://huggingface.co/docs/hub/storage-buckets-s3"
+                                             Padding="0" />
+                            <TextBox Header="Access key ID"
+                                     HorizontalAlignment="Stretch"
+                                     x:Name="S3KeyIdBox" />
+                            <PasswordBox Header="Secret access key"
+                                         HorizontalAlignment="Stretch"
+                                         x:Name="S3SecretKeyBox" />
+                            <TextBlock Text="Protected for your Windows account before sending. The fields are cleared when you continue; leave them blank to keep keys you've already saved."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="What Check &amp; review does"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="Two-way checks upload temporary test data before you review. Failed checks block sync; uncertain test data may be retained for recovery."
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- ══ Step 3: Review / Connected ═══════════════════════ -->
+                <StackPanel Spacing="12" Visibility="{x:Bind ViewModel.IsReviewStepVisible, Mode=OneWay}">
+                    <!-- Visibility-gated: shows only after the provider accepted
+                         the connection. IsSuccessVisible is Visibility, so the
+                         panel itself is wrapped rather than bound to IsOpen. -->
+                    <StackPanel Spacing="0"
+                                Visibility="{x:Bind ViewModel.IsSuccessVisible, Mode=OneWay}">
+                        <InfoBar Severity="Success"
+                                 IsClosable="False"
+                                 IsOpen="True"
+                                 Title="Connected">
+                            <TextBlock Text="Your folder is connected. Open HF Drive to manage it."
+                                       TextWrapping="Wrap" />
+                        </InfoBar>
+                    </StackPanel>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="{x:Bind ViewModel.PreviewSummaryText, Mode=OneWay}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="{x:Bind ViewModel.AccountSummaryText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <Grid ColumnSpacing="16" RowSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Text="Bucket" Opacity="0.7" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind ViewModel.ReviewBucketText, Mode=OneWay}" TextWrapping="Wrap" />
+                                <TextBlock Grid.Row="1" Text="Location" Opacity="0.7" />
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{x:Bind ViewModel.ReviewLocationText, Mode=OneWay}" TextWrapping="Wrap" />
+                                <TextBlock Grid.Row="2" Text="Folder" Opacity="0.7" />
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{x:Bind ViewModel.ReviewFolderText, Mode=OneWay}" TextWrapping="Wrap" />
+                                <TextBlock Grid.Row="3" Text="Access" Opacity="0.7" />
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="{x:Bind ViewModel.ReviewModeText, Mode=OneWay}" TextWrapping="Wrap" />
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Explicit initialization consent for new drives. -->
+                    <Border Style="{StaticResource CardBorderStyle}"
+                            Visibility="{x:Bind ViewModel.IsInitializeVisible, Mode=OneWay}">
+                        <CheckBox IsChecked="{x:Bind ViewModel.InitializeConsent, Mode=TwoWay}" HorizontalAlignment="Stretch">
+                            <TextBlock Text="Create an HF Drive workspace at this bucket location. Existing bucket files stay untouched."
+                                       TextWrapping="Wrap" />
+                        </CheckBox>
+                    </Border>
+
+                    <!-- Explicit collision-handling consent, only when review is required. -->
+                    <Border Style="{StaticResource CardBorderStyle}"
+                            Visibility="{x:Bind ViewModel.IsCollisionReviewVisible, Mode=OneWay}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Collisions and proposed actions"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.CollisionSummaryEmptyText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <ListView ItemsSource="{x:Bind ViewModel.CollisionSummary, Mode=OneWay}"
+                                      SelectionMode="None"
+                                      MaxHeight="180">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:CollisionSummaryRow">
+                                        <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                                   TextWrapping="Wrap" />
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                            <Expander HorizontalAlignment="Stretch"
+                                      IsExpanded="False"
+                                      Header="Sample collisions and proposed actions">
+                                <StackPanel Spacing="8">
+                                    <ListView ItemsSource="{x:Bind ViewModel.Collisions, Mode=OneWay}"
+                                              SelectionMode="None"
+                                              MaxHeight="220">
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:CollisionRow">
+                                                <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                                           TextWrapping="Wrap"
+                                                           FontSize="12" />
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
+                                    <ListView ItemsSource="{x:Bind ViewModel.ProposedActions, Mode=OneWay}"
+                                              SelectionMode="None"
+                                              MaxHeight="220">
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:ProposedActionRow">
+                                                <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                                           TextWrapping="Wrap"
+                                                           FontSize="12" />
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
+                                </StackPanel>
+                            </Expander>
+                            <CheckBox IsChecked="{x:Bind ViewModel.ReviewConsent, Mode=TwoWay}" HorizontalAlignment="Stretch">
+                                <TextBlock Text="I've reviewed the collisions and agree to the proposed actions."
+                                           TextWrapping="Wrap" />
+                            </CheckBox>
+                        </StackPanel>
+                    </Border>
+
+
+                    <!-- Technical IDs and inspected records: expandable details. -->
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Header="Technical details">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="{x:Bind ViewModel.SelectedOwnerIdentityText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="{x:Bind ViewModel.SelectedBucketIdentityText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="{x:Bind ViewModel.WorkspaceIdText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True"
+                                       FontFamily="Consolas"
+                                       FontSize="12" />
+                            <TextBlock Text="{x:Bind ViewModel.InspectItemsEmptyText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.8" />
+                            <ListView ItemsSource="{x:Bind ViewModel.InspectItems, Mode=OneWay}"
+                                      SelectionMode="None"
+                                      MaxHeight="260">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:InspectItemRow">
+                                        <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                                   TextWrapping="Wrap"
+                                                   FontSize="12" />
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                            <Button Content="Load more item records"
+                                    HorizontalAlignment="Left"
+                                    Visibility="{x:Bind ViewModel.InspectPagingVisibility, Mode=OneWay}"
+                                    Command="{x:Bind ViewModel.LoadMoreInspectItemsCommand}" />
+                        </StackPanel>
+                    </Expander>
+                </StackPanel>
+                </StackPanel>
+                </ContentControl>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- ── Fixed footer: back + single primary action ───────────────── -->
+        <Grid Grid.Row="2"
+              Padding="20,12,20,14"
+              Background="{ThemeResource HfCardBackgroundBrush}"
+              BorderBrush="{ThemeResource HfCardBorderBrush}"
+              BorderThickness="0,1,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="0"
+                    Content="Back"
+                    AccessKey="B"
+                    Command="{x:Bind ViewModel.BackCommand}"
+                    IsEnabled="{x:Bind ViewModel.CanGoBack, Mode=OneWay}" />
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="10"
+                        HorizontalAlignment="Right">
+                <ProgressRing IsActive="{x:Bind ViewModel.IsWorking, Mode=OneWay}"
+                              Width="20" Height="20"
+                              VerticalAlignment="Center" />
+                <Button x:Name="PrimaryButton"
+                        Style="{StaticResource StoragePrimaryButtonStyle}"
+                        AccessKey="P"
+                        Content="{x:Bind ViewModel.PrimaryActionText, Mode=OneWay}"
+                        IsEnabled="{x:Bind ViewModel.PrimaryActionEnabled, Mode=OneWay}"
+                        Click="OnPrimaryClick" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Page>

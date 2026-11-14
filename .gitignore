@@ -1,0 +1,15 @@
+/target/
+/artifacts/
+**/bin/
+**/obj/
+.vs/
+*.user
+*.pfx
+*.p12
+.env
+.env.*
+!.env.example
+
+# Local interop reference snippets, not project sources.
+/BOOL.cs
+/GO.cs

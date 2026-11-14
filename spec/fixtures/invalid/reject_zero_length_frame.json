@@ -1,0 +1,11 @@
+{
+  "name": "reject_zero_length_frame",
+  "description": "a zero-length frame is invalid",
+  "class": "invalid",
+  "stage": "frame",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "invalid frame length"
+  },
+  "frame_hex": "00000000"
+}

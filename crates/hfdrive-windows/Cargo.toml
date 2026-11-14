@@ -1,0 +1,46 @@
+[package]
+name = "hfdrive-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Windows adapters for HF Drive: DPAPI-protected credentials, single-provider ownership, and the authenticated local IPC boundary."
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hfdrive-core.workspace = true
+uuid.workspace = true
+windows = { workspace = true, features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
+    "Win32_Globalization",
+    "Win32_Storage_CloudFilters",
+    "Win32_System_Com",
+    "Win32_System_CorrelationVector",
+    "Win32_System_Ioctl",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-future = "=0.3.2"
+
+[dev-dependencies]
+tempfile.workspace = true

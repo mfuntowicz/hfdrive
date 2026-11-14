@@ -1,0 +1,11 @@
+{
+  "name": "reject_raw_control_character",
+  "description": "unescaped control byte inside a string literal is invalid JSON",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "invalid JSON payload"
+  },
+  "frame_hex": "9a0000007b2270726f746f636f6c5f6d616a6f72223a312c2270726f746f636f6c5f6d696e6f72223a302c22726571756573745f6964223a2263306165623339612d326535352d346565662d386565662d303030323730363164643765222c226b696e64223a2272657175657374222c226d6574686f64223a226765745f737461747573222c22626f6479223a7b22637572736f72223a22610162227d7d"
+}

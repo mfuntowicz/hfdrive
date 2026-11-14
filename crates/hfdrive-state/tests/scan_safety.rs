@@ -1,0 +1,152 @@
+//! Scan safety: a disappearance is deletion evidence only after a fully
+//! completed, still-valid metadata scan. Overflow, reset, denial, or an
+//! incomplete enumeration invalidate it.
+
+mod common;
+
+use common::*;
+use hfdrive_core::ids::OperationId;
+use hfdrive_state::{ConnectionMode, SetupDraft, StatePaths, StateStore};
+
+async fn connect(store: &StateStore) -> hfdrive_core::ids::ConnectionId {
+    let key = account_key();
+    store.record_account(account_record(key)).await.unwrap();
+    let draft = SetupDraft {
+        operation_id: OperationId::new(),
+        account_key: key,
+        binding: binding(key),
+        initialize: true,
+    };
+    let reservation = store.reserve_setup(draft).await.unwrap();
+    store
+        .attach_setup_preview(
+            reservation.setup_id,
+            preview_json(std::path::Path::new("C:\\hfdrive-root")),
+            std::path::PathBuf::from("C:\\hfdrive-root"),
+            ConnectionMode::ReadOnly,
+        )
+        .await
+        .unwrap();
+    store.finalize_setup(reservation.setup_id).await.unwrap().connection_id
+}
+
+#[tokio::test]
+async fn deletion_evidence_requires_a_completed_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::open(StatePaths::new(tmp.path().to_path_buf())).await.unwrap();
+    let connection_id = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+
+    let cursor = account
+        .init_event_cursor(connection_id, "volume-1".to_owned(), "journal-1".to_owned())
+        .await
+        .unwrap();
+    assert!(!cursor.may_infer_deletion(), "no scan has completed yet");
+
+    let scanning = account
+        .begin_scan(connection_id, "volume-1".to_owned(), "journal-1".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(scanning.scan_epoch, 1);
+    assert!(!scanning.may_infer_deletion(), "an in-flight scan is not evidence");
+
+    let done = account.complete_scan(connection_id, Some(10_000)).await.unwrap();
+    assert!(done.scan_complete);
+    assert!(done.may_infer_deletion(), "only a fully completed scan may infer deletion");
+    assert_eq!(done.usn_cursor, Some(10_000));
+
+    // A fresh scan supersedes the old evidence while it is running.
+    let next = account.begin_scan(connection_id, "volume-1".to_owned(), "journal-1".to_owned()).await.unwrap();
+    assert_eq!(next.scan_epoch, 2);
+    assert!(!next.may_infer_deletion(), "the new incomplete scan cannot infer deletion");
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalidation_revokes_deletion_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::open(StatePaths::new(tmp.path().to_path_buf())).await.unwrap();
+    let connection_id = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+
+    account
+        .init_event_cursor(connection_id, "volume-1".to_owned(), "journal-1".to_owned())
+        .await
+        .unwrap();
+    account.begin_scan(connection_id, "volume-1".to_owned(), "journal-1".to_owned()).await.unwrap();
+    let done = account.complete_scan(connection_id, Some(5)).await.unwrap();
+    assert!(done.may_infer_deletion());
+
+    // Watcher overflow / USN reset / denied enumeration: evidence is revoked
+    // and the disappearance cannot be treated as deletion.
+    let invalidated = account.invalidate_scan(connection_id).await.unwrap();
+    assert!(invalidated.scan_invalidated);
+    assert!(!invalidated.may_infer_deletion(), "an invalidated scan is never deletion evidence");
+
+    // Only a fresh completed scan restores it.
+    account.begin_scan(connection_id, "volume-2".to_owned(), "journal-2".to_owned()).await.unwrap();
+    let restored = account.complete_scan(connection_id, Some(1)).await.unwrap();
+    assert!(restored.may_infer_deletion());
+    assert_eq!(restored.volume_id, "volume-2");
+    assert_eq!(restored.journal_id, "journal-2");
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn head_invalidation_is_persisted_before_the_cursor_advances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::open(StatePaths::new(tmp.path().to_path_buf())).await.unwrap();
+    let connection_id = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+    account
+        .init_event_cursor(connection_id, "volume-1".to_owned(), "journal-1".to_owned())
+        .await
+        .unwrap();
+
+    // The invalidation and the opaque cursor land together: the cursor never
+    // advances past an unpersisted invalidation.
+    let state = account
+        .record_head_invalidation(connection_id, Some("cursor-1".to_owned()))
+        .await
+        .unwrap();
+    assert!(state.pending_head_refresh);
+    assert_eq!(state.cursor.as_deref(), Some("cursor-1"));
+
+    // The applied head refresh clears the flag only after processing.
+    let state = account.ack_head_refresh(connection_id).await.unwrap();
+    assert!(!state.pending_head_refresh);
+    assert_eq!(state.cursor.as_deref(), Some("cursor-1"), "the cursor is retained for reconnect");
+
+    let state = account
+        .record_head_invalidation(connection_id, Some("cursor-2".to_owned()))
+        .await
+        .unwrap();
+    assert!(state.pending_head_refresh);
+    assert_eq!(state.cursor.as_deref(), Some("cursor-2"));
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn scan_state_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(tmp.path().to_path_buf());
+    let store = StateStore::open(paths.clone()).await.unwrap();
+    let connection_id = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+    account
+        .init_event_cursor(connection_id, "volume-1".to_owned(), "journal-1".to_owned())
+        .await
+        .unwrap();
+    account.begin_scan(connection_id, "volume-1".to_owned(), "journal-1".to_owned()).await.unwrap();
+    account.complete_scan(connection_id, Some(77)).await.unwrap();
+    account.record_head_invalidation(connection_id, Some("cursor-9".to_owned())).await.unwrap();
+    store.close().await.unwrap();
+
+    let store = StateStore::open(paths).await.unwrap();
+    let account = store.open_account(account_key()).await.unwrap();
+    let state = account.scan_state(connection_id).await.unwrap().unwrap();
+    assert!(state.may_infer_deletion(), "completed scan evidence survives restart");
+    assert!(state.pending_head_refresh, "an unacknowledged HEAD refresh survives restart");
+    assert_eq!(state.usn_cursor, Some(77));
+    store.close().await.unwrap();
+}

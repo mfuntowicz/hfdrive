@@ -1,0 +1,11 @@
+{
+  "name": "reject_oversized_frame",
+  "description": "declared frame length exceeds 1 MiB and is rejected before the payload is read",
+  "class": "invalid",
+  "stage": "frame",
+  "expectation": {
+    "error_code": "frame_too_large",
+    "reason": "frame length 1048577 exceeds the maximum"
+  },
+  "frame_hex": "01001000"
+}

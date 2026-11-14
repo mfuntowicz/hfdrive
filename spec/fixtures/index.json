@@ -1,0 +1,393 @@
+{
+  "description": "Cross-language golden frames for HF Drive IPC 1.0. Both the Rust and the C# codecs MUST parse each golden fixture and reproduce payload bytes byte-for-byte from the typed model, and MUST reject each invalid fixture with the listed error code.",
+  "canonical_rules": "see spec/ipc-v1.schema.json description",
+  "golden": [
+    {
+      "name": "hello_request",
+      "file": "golden/hello_request.json",
+      "description": "hello request envelope at protocol 1.0",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "hello_request_from_v2",
+      "file": "golden/hello_request_from_v2.json",
+      "description": "hello request from a future protocol version: normal parse must reject, handshake parse must accept",
+      "expectation": {
+        "parse": "reject:unsupported_protocol",
+        "parse_handshake": "accept"
+      }
+    },
+    {
+      "name": "hello_response_result",
+      "file": "golden/hello_response_result.json",
+      "description": "hello result with provider capabilities",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "get_status_request",
+      "file": "golden/get_status_request.json",
+      "description": "get_status request with empty body",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "get_status_response_result",
+      "file": "golden/get_status_response_result.json",
+      "description": "get_status result carrying one full connection status (u64 decimal strings, nested objects, omitted optionals)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "get_status_response_error",
+      "file": "golden/get_status_response_error.json",
+      "description": "response error shape with retry hint",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "subscribe_status_request",
+      "file": "golden/subscribe_status_request.json",
+      "description": "subscribe_status request with last_sequence",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "status_changed_event",
+      "file": "golden/status_changed_event.json",
+      "description": "status_changed event with a snapshot, one changed connection and one removal",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "activity_changed_event",
+      "file": "golden/activity_changed_event.json",
+      "description": "activity_changed event batch",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "conflicts_changed_event",
+      "file": "golden/conflicts_changed_event.json",
+      "description": "conflicts_changed event batch",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "set_publication_credentials_request",
+      "file": "golden/set_publication_credentials_request.json",
+      "description": "set_publication_credentials request; parsers must accept it and log helpers must never include the protected secret (marker: MARKER-PROTECTED-SECRET-DO-NOT-LOG)",
+      "expectation": {
+        "parse": "accept",
+        "describe_for_log_must_not_contain": "MARKER-PROTECTED-SECRET-DO-NOT-LOG"
+      }
+    },
+    {
+      "name": "cancel_request_request",
+      "file": "golden/cancel_request_request.json",
+      "description": "cancel_request targeting another request id",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "start_login_request_pkce",
+      "file": "golden/start_login_request_pkce.json",
+      "description": "start_login (pkce) with organization_id omitted",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "start_login_request_device",
+      "file": "golden/start_login_request_device.json",
+      "description": "start_login (device) with organization_id present",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "update_settings_request",
+      "file": "golden/update_settings_request.json",
+      "description": "update_settings request with nested settings patch (nested optional omitted)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "preview_connect_request",
+      "file": "golden/preview_connect_request.json",
+      "description": "preview_connect request for a previously reserved binding",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "begin_setup_request",
+      "file": "golden/begin_setup_request.json",
+      "description": "explicit initialization intent before credentials or root registration",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "begin_setup_response_result",
+      "file": "golden/begin_setup_response_result.json",
+      "description": "reserved setup and connection with exact public DPAPI protection context",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "list_history_response_result",
+      "file": "golden/list_history_response_result.json",
+      "description": "list_history result with nested history changes",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "connect_response_result",
+      "file": "golden/connect_response_result.json",
+      "description": "connect result carrying the new connection status",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "prepare_unlink_response_result",
+      "file": "golden/prepare_unlink_response_result.json",
+      "description": "prepare_unlink result with block counts",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "list_owners_response_result",
+      "file": "golden/list_owners_response_result.json",
+      "description": "list_owners result page with next_cursor",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "exit_provider_request",
+      "file": "golden/exit_provider_request.json",
+      "description": "exit_provider request (mutation operation id)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "exit_provider_response_result",
+      "file": "golden/exit_provider_response_result.json",
+      "description": "exit_provider result",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "probe_storage_response_result",
+      "file": "golden/probe_storage_response_result.json",
+      "description": "probe_storage result with per-check expectations and observations",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "set_publication_credentials_response_result",
+      "file": "golden/set_publication_credentials_response_result.json",
+      "description": "set_publication_credentials result (no secret material)",
+      "expectation": {
+        "parse": "accept"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "reject_oversized_frame",
+      "file": "invalid/reject_oversized_frame.json",
+      "stage": "frame",
+      "error_code": "frame_too_large",
+      "description": "declared frame length exceeds 1 MiB and is rejected before the payload is read"
+    },
+    {
+      "name": "reject_zero_length_frame",
+      "file": "invalid/reject_zero_length_frame.json",
+      "stage": "frame",
+      "error_code": "malformed_frame",
+      "description": "a zero-length frame is invalid"
+    },
+    {
+      "name": "reject_truncated_header",
+      "file": "invalid/reject_truncated_header.json",
+      "stage": "frame",
+      "error_code": "unexpected_eof",
+      "description": "stream ends inside the 4-byte length prefix"
+    },
+    {
+      "name": "reject_truncated_payload",
+      "file": "invalid/reject_truncated_payload.json",
+      "stage": "frame",
+      "error_code": "unexpected_eof",
+      "description": "declared payload length is not delivered"
+    },
+    {
+      "name": "reject_not_json",
+      "file": "invalid/reject_not_json.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "payload is not JSON"
+    },
+    {
+      "name": "reject_trailing_garbage",
+      "file": "invalid/reject_trailing_garbage.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "valid JSON followed by trailing bytes"
+    },
+    {
+      "name": "reject_duplicate_key",
+      "file": "invalid/reject_duplicate_key.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "duplicate envelope member name"
+    },
+    {
+      "name": "reject_unknown_envelope_member",
+      "file": "invalid/reject_unknown_envelope_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unknown envelope member"
+    },
+    {
+      "name": "reject_unknown_body_member",
+      "file": "invalid/reject_unknown_body_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unknown body member"
+    },
+    {
+      "name": "reject_missing_body",
+      "file": "invalid/reject_missing_body.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "envelope without body"
+    },
+    {
+      "name": "reject_both_result_and_error",
+      "file": "invalid/reject_both_result_and_error.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "response body with both result and error"
+    },
+    {
+      "name": "reject_neither_result_nor_error",
+      "file": "invalid/reject_neither_result_nor_error.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "response body with neither result nor error"
+    },
+    {
+      "name": "reject_method_unknown",
+      "file": "invalid/reject_method_unknown.json",
+      "stage": "envelope",
+      "error_code": "invalid_request",
+      "description": "unknown method name"
+    },
+    {
+      "name": "reject_event_method_unknown",
+      "file": "invalid/reject_event_method_unknown.json",
+      "stage": "envelope",
+      "error_code": "invalid_request",
+      "description": "request method used on an event envelope"
+    },
+    {
+      "name": "reject_u64_number",
+      "file": "invalid/reject_u64_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "u64 field sent as a JSON number instead of a decimal string"
+    },
+    {
+      "name": "reject_u64_leading_zero",
+      "file": "invalid/reject_u64_leading_zero.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "decimal string with a leading zero"
+    },
+    {
+      "name": "reject_u64_overflow",
+      "file": "invalid/reject_u64_overflow.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "decimal string beyond u64 range"
+    },
+    {
+      "name": "reject_uuid_uppercase",
+      "file": "invalid/reject_uuid_uppercase.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "non-lowercase UUID spelling"
+    },
+    {
+      "name": "reject_uuid_unhyphenated",
+      "file": "invalid/reject_uuid_unhyphenated.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "non-hyphenated UUID spelling"
+    },
+    {
+      "name": "reject_unknown_enum",
+      "file": "invalid/reject_unknown_enum.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unknown enum variant in hello body"
+    },
+    {
+      "name": "reject_version_mismatch",
+      "file": "invalid/reject_version_mismatch.json",
+      "stage": "envelope",
+      "error_code": "unsupported_protocol",
+      "description": "get_status from a foreign protocol version"
+    },
+    {
+      "name": "reject_hello_body_mismatch",
+      "file": "invalid/reject_hello_body_mismatch.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "hello envelope at 1.0 whose body announces another version: body and envelope versions must agree"
+    },
+    {
+      "name": "reject_deep_nesting",
+      "file": "invalid/reject_deep_nesting.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "JSON nesting deeper than the 64 level limit is rejected before typed decode"
+    },
+    {
+      "name": "reject_raw_control_character",
+      "file": "invalid/reject_raw_control_character.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unescaped control byte inside a string literal is invalid JSON"
+    },
+    {
+      "name": "reject_non_utf8_payload",
+      "file": "invalid/reject_non_utf8_payload.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "payload bytes are not valid UTF-8"
+    }
+  ]
+}

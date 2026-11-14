@@ -1,0 +1,35 @@
+{
+  "description": "Frozen portable name-collision vectors for HF Drive remote format v1. The collision key is the UTF-8 bytes of the name after Unicode NFC normalization and Unicode default (non-Turkic) full case folding, stored as lowercase hex in n/<parent-id>/<collision-key-hex>. Spellings with equal keys must never share one parent. The resolved data versions below are part of the format: changing either requires a remote format migration. See spec/remote-v1.md.",
+  "unicode_data_versions": {
+    "unicode_normalization_nfc": [18, 0, 0],
+    "unicode_casefold_default_full": [9, 0, 0]
+  },
+  "vectors": [
+    {"spelling": "Hello", "collision_key_hex": "68656c6c6f"},
+    {"spelling": "HELLO", "collision_key_hex": "68656c6c6f"},
+    {"spelling": "hello.txt", "collision_key_hex": "68656c6c6f2e747874"},
+    {"spelling": "Ä", "collision_key_hex": "c3a4"},
+    {"spelling": "Ä", "collision_key_hex": "c3a4"},
+    {"spelling": "ä", "collision_key_hex": "c3a4"},
+    {"spelling": "ss", "collision_key_hex": "7373"},
+    {"spelling": "ß", "collision_key_hex": "7373"},
+    {"spelling": "ẞ", "collision_key_hex": "7373"},
+    {"spelling": "Straße", "collision_key_hex": "73747261737365"},
+    {"spelling": "STRASSE", "collision_key_hex": "73747261737365"},
+    {"spelling": "İ", "collision_key_hex": "69cc87"},
+    {"spelling": "i̇", "collision_key_hex": "69cc87"},
+    {"spelling": "i", "collision_key_hex": "69"},
+    {"spelling": "I", "collision_key_hex": "69"},
+    {"spelling": "ı", "collision_key_hex": "c4b1"},
+    {"spelling": "Σ", "collision_key_hex": "cf83"},
+    {"spelling": "σ", "collision_key_hex": "cf83"},
+    {"spelling": "ς", "collision_key_hex": "cf83"},
+    {"spelling": "K", "collision_key_hex": "6b"},
+    {"spelling": "K", "collision_key_hex": "6b"},
+    {"spelling": "k", "collision_key_hex": "6b"},
+    {"spelling": "µ", "collision_key_hex": "cebc"},
+    {"spelling": "μ", "collision_key_hex": "cebc"},
+    {"spelling": "ﬁ", "collision_key_hex": "6669"},
+    {"spelling": "fi", "collision_key_hex": "6669"}
+  ]
+}

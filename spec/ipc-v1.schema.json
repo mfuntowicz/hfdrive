@@ -1,0 +1,3346 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://huggingface.co/hfdrive/spec/ipc-v1.schema.json",
+  "title": "HF Drive IPC 1.0",
+  "description": "Normative wire contract for HF Drive provider IPC. Frame: 4-byte little-endian length (1..=1048576) followed by this envelope as UTF-8 JSON. Canonical bytes: members in UTF-8 byte-lexicographic key order (typed serializers emit declaration order, which matches for ASCII keys), compact separators, minimal string escapes (\\\" \\\\ \\b \\t \\n \\f \\r and \\u00xx lowercase for other C0/DEL controls), u64 fields as canonical decimal strings (no leading zeros, no sign), u32 fields as JSON integers, UUIDs lowercase hyphenated, optional fields omitted (a JSON null for an optional field decodes as absent and is never emitted), duplicate member names, unknown members, unknown enum variants, floats, and NaN/Infinity are rejected. Protocol version is exactly 1.0; only a hello request with another version is parsed (so the provider can answer with supported versions and close). List pages return items + next_cursor and accept cursor + limit (<= 200). Every mutation request carries a unique operation_id (operation UUID); reusing it must not duplicate the durable mutation. set_publication_credentials carries a user-scoped DPAPI ciphertext envelope; raw key/secret bytes never appear on the wire and this envelope is never logged.",
+  "$defs": {
+    "error_object": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "unsupported_protocol",
+            "oauth_client_not_configured",
+            "needs_sign_in",
+            "storage_setup_required",
+            "permission_denied",
+            "read_only",
+            "preview_changed",
+            "unsupported_format",
+            "local_root_invalid",
+            "conflict",
+            "disk_full",
+            "remote_content_unavailable",
+            "cancelled",
+            "provider_in_other_session",
+            "busy",
+            "invalid_request",
+            "not_found",
+            "internal",
+            "timeout",
+            "frame_too_large",
+            "malformed_frame",
+            "unexpected_eof",
+            "version_mismatch",
+            "closed"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "description": "canonical decimal u64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "account_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account_key": {
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "granted_scopes": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "account_key",
+        "issuer",
+        "subject",
+        "namespace",
+        "display_name"
+      ]
+    },
+    "login_progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "flow": {
+          "type": "string",
+          "enum": [
+            "pkce",
+            "device"
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "signin",
+            "read_storage",
+            "write_storage",
+            "create_storage"
+          ]
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "completed",
+            "cancelled",
+            "expired",
+            "denied",
+            "failed"
+          ]
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "flow",
+        "purpose",
+        "phase",
+        "expires_at"
+      ]
+    },
+    "account_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "signed_out",
+            "signing_in",
+            "signed_in",
+            "needs_sign_in"
+          ]
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/account_profile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "login": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/login_progress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/error_object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "state"
+      ]
+    },
+    "publication_protection_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "account_key": {
+          "type": "string"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "bucket_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection_id",
+        "account_key",
+        "issuer",
+        "subject",
+        "owner_id",
+        "owner_kind",
+        "bucket_id",
+        "workspace_id",
+        "prefix"
+      ]
+    },
+    "progress_update": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "completed": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "total": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "description": "canonical decimal u64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "completed",
+        "phase"
+      ]
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "restrictions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "can_create": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "owner_kind",
+        "owner_id",
+        "display_name",
+        "restrictions",
+        "can_create"
+      ]
+    },
+    "bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bucket_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "private",
+            "public"
+          ]
+        }
+      },
+      "required": [
+        "bucket_id",
+        "name",
+        "namespace",
+        "visibility"
+      ]
+    },
+    "remote_location": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_namespace": {
+          "type": "string"
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "bucket_id": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner_namespace",
+        "owner_id",
+        "owner_kind",
+        "bucket",
+        "bucket_id",
+        "prefix"
+      ]
+    },
+    "remote_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_namespace": {
+          "type": "string"
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "bucket_id": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "owner_namespace",
+        "owner_id",
+        "owner_kind",
+        "bucket",
+        "bucket_id",
+        "prefix",
+        "workspace_id"
+      ]
+    },
+    "probe_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "native_upload_visible_natively",
+            "native_upload_visible_s3",
+            "get_body_etag_coherence",
+            "guarded_create",
+            "concurrent_same_etag",
+            "stale_overwrite_rejected",
+            "ambiguous_cas_recovery",
+            "xet_range_reads"
+          ]
+        },
+        "expected": {
+          "type": "string"
+        },
+        "observed": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "not_run"
+          ]
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "kind",
+        "expected",
+        "observed",
+        "outcome"
+      ]
+    },
+    "collision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "identical_content",
+            "different_content",
+            "local_only",
+            "remote_only",
+            "case_collision",
+            "name_invalid"
+          ]
+        },
+        "relative_path": {
+          "type": "string"
+        },
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "proposed_action": {
+          "type": "string",
+          "enum": [
+            "adopt_identical",
+            "keep_both",
+            "queue_local",
+            "download_remote",
+            "requires_review"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "relative_path",
+        "proposed_action"
+      ]
+    },
+    "collision_category_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "identical_content",
+            "different_content",
+            "local_only",
+            "remote_only",
+            "case_collision",
+            "name_invalid"
+          ]
+        },
+        "count": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        }
+      },
+      "required": [
+        "kind",
+        "count"
+      ]
+    },
+    "proposed_action_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "adopt_identical",
+            "keep_both",
+            "queue_local",
+            "download_remote",
+            "requires_review"
+          ]
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "description"
+      ]
+    },
+    "history_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "create",
+            "content",
+            "location",
+            "delete"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "item_id",
+        "kind",
+        "name"
+      ]
+    },
+    "history_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commit_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "parent_commit_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "generation": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "device_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/history_change"
+          }
+        }
+      },
+      "required": [
+        "commit_id",
+        "generation",
+        "device_id",
+        "created_at",
+        "changes"
+      ]
+    },
+    "conflict_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "conflict_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "content",
+            "rename",
+            "delete_edit",
+            "case_collision",
+            "move_cycle"
+          ]
+        },
+        "competing_operation_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "revisions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "original_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "detected_at": {
+          "type": "string"
+        },
+        "resolution_state": {
+          "type": "string",
+          "enum": [
+            "unresolved",
+            "keep_local",
+            "keep_remote",
+            "keep_both",
+            "recovered"
+          ]
+        }
+      },
+      "required": [
+        "conflict_id",
+        "item_id",
+        "kind",
+        "competing_operation_ids",
+        "revisions",
+        "original_names",
+        "detected_at",
+        "resolution_state"
+      ]
+    },
+    "activity_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "activity_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "item_name": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "upload",
+            "download",
+            "metadata"
+          ]
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "observed",
+            "snapshot",
+            "uploading",
+            "publishing",
+            "downloading",
+            "completed",
+            "failed",
+            "conflict"
+          ]
+        },
+        "bytes_completed": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "bytes_total": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "description": "canonical decimal u64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/error_object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "activity_id",
+        "connection_id",
+        "item_name",
+        "direction",
+        "phase",
+        "bytes_completed",
+        "started_at"
+      ]
+    },
+    "connection_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "workspace_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "owner": {
+          "$ref": "#/$defs/owner"
+        },
+        "bucket": {
+          "$ref": "#/$defs/bucket"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "root_path": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "writable"
+          ]
+        },
+        "capability": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "storage_setup_required",
+            "write_sync_paused",
+            "writable"
+          ]
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "up_to_date",
+            "pending_upload",
+            "uploading",
+            "publishing_changes",
+            "downloading",
+            "offline",
+            "needs_sign_in",
+            "storage_setup_required",
+            "permission_denied",
+            "conflict",
+            "disk_full",
+            "write_sync_paused"
+          ]
+        },
+        "pin": {
+          "type": "string",
+          "enum": [
+            "unpinned",
+            "pinned",
+            "partial"
+          ]
+        },
+        "hydration": {
+          "type": "string",
+          "enum": [
+            "full",
+            "partial",
+            "online_only"
+          ]
+        },
+        "observed_commit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "published_commit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "applied_commit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "observed_generation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "description": "canonical decimal u64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "pending_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "dirty_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "conflict_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "online_only_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "pinned_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "pending_upload_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "local_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "staging_used_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "range_cache_used_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "transfer_memory_used_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/error_object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection_id",
+        "workspace_id",
+        "owner",
+        "bucket",
+        "prefix",
+        "root_path",
+        "mode",
+        "capability",
+        "state",
+        "pin",
+        "hydration",
+        "pending_files",
+        "dirty_files",
+        "conflict_files",
+        "online_only_files",
+        "pinned_files",
+        "pending_upload_bytes",
+        "local_bytes",
+        "staging_used_bytes",
+        "range_cache_used_bytes",
+        "transfer_memory_used_bytes",
+        "updated_at"
+      ]
+    },
+    "status_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "account": {
+          "$ref": "#/$defs/account_status"
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/connection_status"
+          }
+        }
+      },
+      "required": [
+        "sequence",
+        "account",
+        "connections"
+      ]
+    },
+    "settings_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "value_json": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "key"
+      ]
+    },
+    "settings_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "value_json": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "value_json"
+      ]
+    },
+    "inspect_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "directory"
+          ]
+        },
+        "item_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "content_version_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "item_id",
+        "name",
+        "kind",
+        "item_revision"
+      ]
+    },
+    "status_changed_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "snapshot": {
+          "type": "boolean"
+        },
+        "account": {
+          "$ref": "#/$defs/account_status"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/connection_status"
+          }
+        },
+        "removed_connection_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "sequence",
+        "snapshot",
+        "account",
+        "changes",
+        "removed_connection_ids"
+      ],
+      "description": "body of the \"status_changed\" event"
+    },
+    "activity_changed_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activity_record"
+          }
+        }
+      },
+      "required": [
+        "sequence",
+        "changes"
+      ],
+      "description": "body of the \"activity_changed\" event"
+    },
+    "conflicts_changed_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conflict_record"
+          }
+        },
+        "removed_conflict_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "sequence",
+        "changes",
+        "removed_conflict_ids"
+      ],
+      "description": "body of the \"conflicts_changed\" event"
+    },
+    "client_role": {
+      "type": "string",
+      "enum": [
+        "desktop",
+        "cli"
+      ]
+    },
+    "login_flow": {
+      "type": "string",
+      "enum": [
+        "pkce",
+        "device"
+      ]
+    },
+    "login_purpose": {
+      "type": "string",
+      "enum": [
+        "signin",
+        "read_storage",
+        "write_storage",
+        "create_storage"
+      ]
+    },
+    "authentication_state": {
+      "type": "string",
+      "enum": [
+        "signed_out",
+        "signing_in",
+        "signed_in",
+        "needs_sign_in"
+      ]
+    },
+    "login_phase": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "completed",
+        "cancelled",
+        "expired",
+        "denied",
+        "failed"
+      ]
+    },
+    "owner_kind": {
+      "type": "string",
+      "enum": [
+        "personal",
+        "organization"
+      ]
+    },
+    "visibility": {
+      "type": "string",
+      "enum": [
+        "private",
+        "public"
+      ]
+    },
+    "connection_mode": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "writable"
+      ]
+    },
+    "capability_state": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "storage_setup_required",
+        "write_sync_paused",
+        "writable"
+      ]
+    },
+    "connection_state": {
+      "type": "string",
+      "enum": [
+        "up_to_date",
+        "pending_upload",
+        "uploading",
+        "publishing_changes",
+        "downloading",
+        "offline",
+        "needs_sign_in",
+        "storage_setup_required",
+        "permission_denied",
+        "conflict",
+        "disk_full",
+        "write_sync_paused"
+      ]
+    },
+    "pin_state": {
+      "type": "string",
+      "enum": [
+        "unpinned",
+        "pinned",
+        "partial"
+      ]
+    },
+    "hydration_state": {
+      "type": "string",
+      "enum": [
+        "full",
+        "partial",
+        "online_only"
+      ]
+    },
+    "pin_mode": {
+      "type": "string",
+      "enum": [
+        "pin",
+        "unpin"
+      ]
+    },
+    "free_space_mode": {
+      "type": "string",
+      "enum": [
+        "all",
+        "except_pinned"
+      ]
+    },
+    "item_kind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "directory"
+      ]
+    },
+    "activity_direction": {
+      "type": "string",
+      "enum": [
+        "upload",
+        "download",
+        "metadata"
+      ]
+    },
+    "activity_phase": {
+      "type": "string",
+      "enum": [
+        "observed",
+        "snapshot",
+        "uploading",
+        "publishing",
+        "downloading",
+        "completed",
+        "failed",
+        "conflict"
+      ]
+    },
+    "collision_kind": {
+      "type": "string",
+      "enum": [
+        "identical_content",
+        "different_content",
+        "local_only",
+        "remote_only",
+        "case_collision",
+        "name_invalid"
+      ]
+    },
+    "proposed_action": {
+      "type": "string",
+      "enum": [
+        "adopt_identical",
+        "keep_both",
+        "queue_local",
+        "download_remote",
+        "requires_review"
+      ]
+    },
+    "history_change_kind": {
+      "type": "string",
+      "enum": [
+        "create",
+        "content",
+        "location",
+        "delete"
+      ]
+    },
+    "conflict_kind": {
+      "type": "string",
+      "enum": [
+        "content",
+        "rename",
+        "delete_edit",
+        "case_collision",
+        "move_cycle"
+      ]
+    },
+    "conflict_resolution": {
+      "type": "string",
+      "enum": [
+        "unresolved",
+        "keep_local",
+        "keep_remote",
+        "keep_both",
+        "recovered"
+      ]
+    },
+    "unlink_mode": {
+      "type": "string",
+      "enum": [
+        "safe_remove",
+        "disconnect_keep_registration"
+      ]
+    },
+    "probe_check_kind": {
+      "type": "string",
+      "enum": [
+        "native_upload_visible_natively",
+        "native_upload_visible_s3",
+        "get_body_etag_coherence",
+        "guarded_create",
+        "concurrent_same_etag",
+        "stale_overwrite_rejected",
+        "ambiguous_cas_recovery",
+        "xet_range_reads"
+      ]
+    },
+    "probe_outcome": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "not_run"
+      ]
+    },
+    "protocol_error_code": {
+      "type": "string",
+      "enum": [
+        "unsupported_protocol",
+        "oauth_client_not_configured",
+        "needs_sign_in",
+        "storage_setup_required",
+        "permission_denied",
+        "read_only",
+        "preview_changed",
+        "unsupported_format",
+        "local_root_invalid",
+        "conflict",
+        "disk_full",
+        "remote_content_unavailable",
+        "cancelled",
+        "provider_in_other_session",
+        "busy",
+        "invalid_request",
+        "not_found",
+        "internal",
+        "timeout",
+        "frame_too_large",
+        "malformed_frame",
+        "unexpected_eof",
+        "version_mismatch",
+        "closed"
+      ]
+    },
+    "hello_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "protocol_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "desktop",
+            "cli"
+          ]
+        },
+        "build_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_major",
+        "protocol_minor",
+        "role",
+        "build_version"
+      ],
+      "description": "body of a \"hello\" request"
+    },
+    "hello_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "protocol_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "provider_version": {
+          "type": "string"
+        },
+        "supported_features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "supported_min_protocol_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "protocol_major",
+        "protocol_minor",
+        "provider_version",
+        "supported_features",
+        "supported_min_protocol_minor"
+      ],
+      "description": "body.result of a \"hello\" response"
+    },
+    "get_status_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "description": "body of a \"get_status\" request"
+    },
+    "get_status_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "event_sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "account": {
+          "$ref": "#/$defs/account_status"
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/connection_status"
+          }
+        }
+      },
+      "required": [
+        "event_sequence",
+        "account",
+        "connections"
+      ],
+      "description": "body.result of a \"get_status\" response"
+    },
+    "subscribe_status_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "last_sequence": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,19})$",
+              "description": "canonical decimal u64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [],
+      "description": "body of a \"subscribe_status\" request"
+    },
+    "subscribe_status_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "subscribed": {
+          "type": "boolean"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/status_snapshot"
+        }
+      },
+      "required": [
+        "subscribed",
+        "snapshot"
+      ],
+      "description": "body.result of a \"subscribe_status\" response"
+    },
+    "cancel_request_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target_request_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "target_request_id"
+      ],
+      "description": "body of a \"cancel_request\" request"
+    },
+    "cancel_request_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "description": "body.result of a \"cancel_request\" response"
+    },
+    "start_login_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "flow": {
+          "type": "string",
+          "enum": [
+            "pkce",
+            "device"
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "enum": [
+            "signin",
+            "read_storage",
+            "write_storage",
+            "create_storage"
+          ]
+        },
+        "organization_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id",
+        "flow",
+        "purpose"
+      ],
+      "description": "body of a \"start_login\" request"
+    },
+    "start_login_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "authorization_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "user_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "verification_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "expires_at"
+      ],
+      "description": "body.result of a \"start_login\" response"
+    },
+    "cancel_login_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id",
+        "session_id"
+      ],
+      "description": "body of a \"cancel_login\" request"
+    },
+    "cancel_login_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cancelled"
+      ],
+      "description": "body.result of a \"cancel_login\" response"
+    },
+    "sign_out_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "description": "body of a \"sign_out\" request"
+    },
+    "sign_out_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "signed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "signed_out"
+      ],
+      "description": "body.result of a \"sign_out\" response"
+    },
+    "list_owners_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "limit"
+      ],
+      "description": "body of a \"list_owners\" request"
+    },
+    "list_owners_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/owner"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "description": "body.result of a \"list_owners\" response"
+    },
+    "list_buckets_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_namespace": {
+          "type": "string"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "owner_namespace",
+        "limit"
+      ],
+      "description": "body of a \"list_buckets\" request"
+    },
+    "list_buckets_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bucket"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "description": "body.result of a \"list_buckets\" response"
+    },
+    "create_bucket_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "owner_namespace": {
+          "type": "string"
+        },
+        "bucket_name": {
+          "type": "string"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id",
+        "owner_id",
+        "owner_kind",
+        "owner_namespace",
+        "bucket_name"
+      ],
+      "description": "body of a \"create_bucket\" request"
+    },
+    "create_bucket_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bucket": {
+          "$ref": "#/$defs/bucket"
+        },
+        "completed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bucket",
+        "completed"
+      ],
+      "description": "body.result of a \"create_bucket\" response"
+    },
+    "inspect_drive_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/remote_location"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "limit"
+      ],
+      "description": "body of a \"inspect_drive\" request"
+    },
+    "inspect_drive_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/remote_binding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "head_generation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "is_managed_drive": {
+          "type": "boolean"
+        },
+        "prefix_empty": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inspect_item"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "is_managed_drive",
+        "prefix_empty",
+        "items"
+      ],
+      "description": "body.result of a \"inspect_drive\" response"
+    },
+    "begin_setup_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "account_key": {
+          "type": "string"
+        },
+        "binding": {
+          "$ref": "#/$defs/remote_binding"
+        },
+        "initialize": {
+          "type": "boolean"
+        },
+        "bucket_creation_operation_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id",
+        "account_key",
+        "binding",
+        "initialize"
+      ],
+      "description": "body of a \"begin_setup\" request"
+    },
+    "begin_setup_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "setup_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "binding": {
+          "$ref": "#/$defs/remote_binding"
+        },
+        "protection_context": {
+          "$ref": "#/$defs/publication_protection_context"
+        }
+      },
+      "required": [
+        "setup_id",
+        "connection_id",
+        "binding",
+        "protection_context"
+      ],
+      "description": "body.result of a \"begin_setup\" response"
+    },
+    "set_publication_credentials_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "protected_credentials": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "protected_credentials"
+      ],
+      "description": "body of a \"set_publication_credentials\" request"
+    },
+    "set_publication_credentials_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stored": {
+          "type": "boolean"
+        },
+        "capability": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "storage_setup_required",
+            "write_sync_paused",
+            "writable"
+          ]
+        }
+      },
+      "required": [
+        "stored",
+        "capability"
+      ],
+      "description": "body.result of a \"set_publication_credentials\" response"
+    },
+    "probe_storage_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "run_id"
+      ],
+      "description": "body of a \"probe_storage\" request"
+    },
+    "probe_storage_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "capability": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "storage_setup_required",
+            "write_sync_paused",
+            "writable"
+          ]
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/probe_check"
+          }
+        },
+        "report_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "run_id",
+        "capability",
+        "checks"
+      ],
+      "description": "body.result of a \"probe_storage\" response"
+    },
+    "preview_connect_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "root_path": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "writable"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "root_path",
+        "mode"
+      ],
+      "description": "body of a \"preview_connect\" request"
+    },
+    "preview_connect_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preview_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "binding": {
+          "$ref": "#/$defs/remote_binding"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "private",
+            "public"
+          ]
+        },
+        "head_generation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "local_scan_generation": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "collision_summary": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/collision_category_summary"
+          }
+        },
+        "collisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/collision"
+          }
+        },
+        "proposed_action_count": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "proposed_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proposed_action_record"
+          }
+        },
+        "requires_review": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "preview_id",
+        "connection_id",
+        "binding",
+        "visibility",
+        "local_scan_generation",
+        "collision_summary",
+        "collisions",
+        "proposed_action_count",
+        "proposed_actions",
+        "requires_review"
+      ],
+      "description": "body.result of a \"preview_connect\" response"
+    },
+    "connect_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "preview_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id",
+        "preview_id"
+      ],
+      "description": "body of a \"connect\" request"
+    },
+    "connect_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "status": {
+          "$ref": "#/$defs/connection_status"
+        }
+      },
+      "required": [
+        "connection_id",
+        "status"
+      ],
+      "description": "body.result of a \"connect\" response"
+    },
+    "pause_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "description": "body of a \"pause\" request"
+    },
+    "pause_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paused_connection_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "paused_connection_ids"
+      ],
+      "description": "body.result of a \"pause\" response"
+    },
+    "resume_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "description": "body of a \"resume\" request"
+    },
+    "resume_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resumed_connection_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "resumed_connection_ids"
+      ],
+      "description": "body.result of a \"resume\" response"
+    },
+    "set_pin_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "pin",
+            "unpin"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "mode"
+      ],
+      "description": "body of a \"set_pin\" request"
+    },
+    "set_pin_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pin_state": {
+          "type": "string",
+          "enum": [
+            "unpinned",
+            "pinned",
+            "partial"
+          ]
+        },
+        "pinned_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "pin_state",
+        "pinned_files"
+      ],
+      "description": "body.result of a \"set_pin\" response"
+    },
+    "free_space_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "all",
+            "except_pinned"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "mode"
+      ],
+      "description": "body of a \"free_space\" request"
+    },
+    "free_space_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "freed_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "dehydrated_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "freed_bytes",
+        "dehydrated_files"
+      ],
+      "description": "body.result of a \"free_space\" response"
+    },
+    "set_selective_sync_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "exclude_item_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "exclude_item_ids"
+      ],
+      "description": "body of a \"set_selective_sync\" request"
+    },
+    "set_selective_sync_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "excluded_item_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "retained_dirty_item_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        }
+      },
+      "required": [
+        "excluded_item_ids",
+        "retained_dirty_item_ids"
+      ],
+      "description": "body.result of a \"set_selective_sync\" response"
+    },
+    "update_settings_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "scope_id": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "settings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/settings_patch"
+          }
+        }
+      },
+      "required": [
+        "operation_id",
+        "scope_id",
+        "expected_revision",
+        "settings"
+      ],
+      "description": "body of a \"update_settings\" request"
+    },
+    "update_settings_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "settings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/settings_entry"
+          }
+        }
+      },
+      "required": [
+        "revision",
+        "settings"
+      ],
+      "description": "body.result of a \"update_settings\" response"
+    },
+    "list_history_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "connection_id",
+        "limit"
+      ],
+      "description": "body of a \"list_history\" request"
+    },
+    "list_history_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/history_record"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "description": "body.result of a \"list_history\" response"
+    },
+    "restore_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "item_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "version_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "item_id",
+        "version_id"
+      ],
+      "description": "body of a \"restore\" request"
+    },
+    "restore_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "status": {
+          "$ref": "#/$defs/connection_status"
+        }
+      },
+      "required": [
+        "operation_id",
+        "status"
+      ],
+      "description": "body.result of a \"restore\" response"
+    },
+    "list_conflicts_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "connection_id",
+        "limit"
+      ],
+      "description": "body of a \"list_conflicts\" request"
+    },
+    "list_conflicts_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conflict_record"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "description": "body.result of a \"list_conflicts\" response"
+    },
+    "resolve_conflict_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "conflict_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "resolution": {
+          "type": "string",
+          "enum": [
+            "unresolved",
+            "keep_local",
+            "keep_remote",
+            "keep_both",
+            "recovered"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "conflict_id",
+        "resolution"
+      ],
+      "description": "body of a \"resolve_conflict\" request"
+    },
+    "resolve_conflict_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "conflict_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "resolution_state": {
+          "type": "string",
+          "enum": [
+            "unresolved",
+            "keep_local",
+            "keep_remote",
+            "keep_both",
+            "recovered"
+          ]
+        }
+      },
+      "required": [
+        "conflict_id",
+        "resolution_state"
+      ],
+      "description": "body.result of a \"resolve_conflict\" response"
+    },
+    "export_diagnostics_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "destination_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "destination_path"
+      ],
+      "description": "body of a \"export_diagnostics\" request"
+    },
+    "export_diagnostics_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "archive_path": {
+          "type": "string"
+        },
+        "redacted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "archive_path",
+        "redacted"
+      ],
+      "description": "body.result of a \"export_diagnostics\" response"
+    },
+    "prepare_unlink_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "safe_remove",
+            "disconnect_keep_registration"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "mode"
+      ],
+      "description": "body of a \"prepare_unlink\" request"
+    },
+    "prepare_unlink_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "safe_to_unlink": {
+          "type": "boolean"
+        },
+        "online_only_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "partial_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "dirty_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "conflict_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "required_export_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "blocking_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "safe_to_unlink",
+        "online_only_files",
+        "partial_files",
+        "dirty_files",
+        "conflict_files",
+        "required_export_bytes",
+        "blocking_reasons"
+      ],
+      "description": "body.result of a \"prepare_unlink\" response"
+    },
+    "unlink_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "safe_remove",
+            "disconnect_keep_registration"
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "mode"
+      ],
+      "description": "body of a \"unlink\" request"
+    },
+    "unlink_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "unregistered": {
+          "type": "boolean"
+        },
+        "retained_for_recovery": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "connection_id",
+        "unregistered",
+        "retained_for_recovery"
+      ],
+      "description": "body.result of a \"unlink\" response"
+    },
+    "prepare_upgrade_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "description": "body of a \"prepare_upgrade\" request"
+    },
+    "prepare_upgrade_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "checkpointed": {
+          "type": "boolean"
+        },
+        "pending_operations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "checkpointed",
+        "pending_operations"
+      ],
+      "description": "body.result of a \"prepare_upgrade\" response"
+    },
+    "exit_provider_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "description": "body of a \"exit_provider\" request"
+    },
+    "exit_provider_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "description": "body.result of a \"exit_provider\" response"
+    },
+    "response_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "result": {
+              "type": "object",
+              "description": "typed result body matching the response method (#/$defs/<method>_result)"
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        {
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/error_object"
+            }
+          },
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "description": "exactly one of result or error"
+    },
+    "envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_major": {
+          "type": "integer",
+          "const": 1
+        },
+        "protocol_minor": {
+          "type": "integer",
+          "const": 0
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "request",
+            "response",
+            "event"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "description": "snake_case method or event name; must agree with kind and body"
+        },
+        "body": {
+          "description": "typed body selected by kind+method (see body map below); never raw dispatch JSON",
+          "type": "object"
+        }
+      },
+      "required": [
+        "protocol_major",
+        "protocol_minor",
+        "request_id",
+        "kind",
+        "method",
+        "body"
+      ]
+    },
+    "body_map": {
+      "description": "kind=request  -> body matches #/$defs/<method>_request; kind=response -> body matches #/$defs/response_body whose result matches #/$defs/<method>_result; kind=event    -> body matches #/$defs/<method>_event (method is one of status_changed, activity_changed, conflicts_changed).",
+      "request_methods": [
+        "begin_setup",
+        "cancel_login",
+        "cancel_request",
+        "connect",
+        "create_bucket",
+        "exit_provider",
+        "export_diagnostics",
+        "free_space",
+        "get_status",
+        "hello",
+        "inspect_drive",
+        "list_buckets",
+        "list_conflicts",
+        "list_history",
+        "list_owners",
+        "pause",
+        "prepare_unlink",
+        "prepare_upgrade",
+        "preview_connect",
+        "probe_storage",
+        "resolve_conflict",
+        "restore",
+        "resume",
+        "set_pin",
+        "set_publication_credentials",
+        "set_selective_sync",
+        "sign_out",
+        "start_login",
+        "subscribe_status",
+        "unlink",
+        "update_settings"
+      ],
+      "event_methods": [
+        "activity_changed",
+        "conflicts_changed",
+        "status_changed"
+      ]
+    }
+  }
+}

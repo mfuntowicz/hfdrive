@@ -1,0 +1,50 @@
+// CsWin32 API surface for provider peer verification, current-user credential protection and tray.
+// Generated from official Windows SDK metadata by Microsoft.Windows.CsWin32 —
+// no handwritten ABI copies. Keep this list minimal and sorted.
+// Call sites use raw extern shapes only (HANDLE / pointer parameters, BOOL and
+// WIN32_ERROR results), so every call resolves deterministically to the
+// generated extern regardless of which friendly overloads the generator also
+// emits.
+AppendMenu
+CloseHandle
+CreatePopupMenu
+CryptProtectData
+CRYPTPROTECT_UI_FORBIDDEN
+DefSubclassProc
+DestroyIcon
+DestroyMenu
+EqualSid
+FindWindow
+GdipCreateBitmapFromFile
+GdipCreateHICONFromBitmap
+GdipDisposeImage
+GdiplusShutdown
+GdiplusStartup
+GetCurrentPackageFamilyName
+GetCurrentPackageFullName
+GetCurrentProcessId
+GetMessagePos
+GetNamedPipeServerProcessId
+GetPackageFamilyName
+GetPackageFullName
+GetPackagePathByFullName
+GetSidSubAuthority
+GetSidSubAuthorityCount
+GetTokenInformation
+LoadIcon
+LocalFree
+OpenProcessToken
+ProcessIdToSessionId
+RemoveWindowSubclass
+SE_GROUP_LOGON_ID
+SetForegroundWindow
+SetWindowSubclass
+Shell_NotifyIcon
+TOKEN_ACCESS_MASK
+TOKEN_GROUPS
+TOKEN_INFORMATION_CLASS
+TOKEN_MANDATORY_LABEL
+TOKEN_USER
+TrackPopupMenu
+WaitNamedPipe
+WIN32_ERROR

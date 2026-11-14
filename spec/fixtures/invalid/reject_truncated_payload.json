@@ -1,0 +1,11 @@
+{
+  "name": "reject_truncated_payload",
+  "description": "declared payload length is not delivered",
+  "class": "invalid",
+  "stage": "frame",
+  "expectation": {
+    "error_code": "unexpected_eof",
+    "reason": "unexpected end of stream"
+  },
+  "frame_hex": "0a0000007b226122"
+}

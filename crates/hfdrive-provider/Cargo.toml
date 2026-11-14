@@ -1,0 +1,44 @@
+[package]
+name = "hfdrive-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hfdrive-provider"
+path = "src/main.rs"
+
+[features]
+default = []
+fault-injection = []
+provider-test-support = ["dep:tempfile"]
+
+[dependencies]
+hfdrive-core.workspace = true
+hfdrive-protocol.workspace = true
+hfdrive-windows.workspace = true
+hfdrive-auth.workspace = true
+hfdrive-state.workspace = true
+hfdrive-hf.workspace = true
+hfdrive-publication.workspace = true
+base64.workspace = true
+hex.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tempfile = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hfdrive-provider = { path = ".", features = ["provider-test-support"] }

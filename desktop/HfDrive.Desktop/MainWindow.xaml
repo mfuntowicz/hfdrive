@@ -1,0 +1,64 @@
+<Window
+    x:Class="HfDrive.Desktop.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="HF Drive">
+
+    <!--
+      Lifecycle shell. The window starts in the compact onboarding layout (the
+      shared SetupPage, no navigation pane) while authenticating/loading state,
+      and switches to the full navigation shell only when an accepted provider
+      status shows a configured connection or the user finishes setup. The
+      content host receives either the single page frame (compact) or the
+      navigation shell (configured) from code-behind.
+    -->
+    <Grid x:Name="RootLayout">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Visible retry surface for bounded provider startup failures. -->
+        <Grid
+            x:Name="StartupErrorBanner"
+            Grid.Row="0"
+            Visibility="Collapsed"
+            Padding="12,8"
+            BorderThickness="0,0,0,1"
+            BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock
+                x:Name="StartupErrorText"
+                Grid.Column="0"
+                VerticalAlignment="Center"
+                TextWrapping="Wrap"
+                IsTextSelectionEnabled="True" />
+            <Button
+                x:Name="StartupRetryButton"
+                Grid.Column="1"
+                Margin="12,0,0,0"
+                VerticalAlignment="Center"
+                Content="Retry"
+                Click="OnStartupRetryClick" />
+        </Grid>
+
+        <!-- Compact-flow header: a way back to the normal shell once one exists. -->
+        <Grid
+            x:Name="CompactHeader"
+            Grid.Row="1"
+            Visibility="Collapsed"
+            Padding="12,8,12,0">
+            <Button
+                x:Name="BackToShellButton"
+                HorizontalAlignment="Left"
+                Content="Back to HF Drive"
+                Click="OnBackToShellClick" />
+        </Grid>
+
+        <Grid x:Name="ShellHost" Grid.Row="2" />
+    </Grid>
+</Window>

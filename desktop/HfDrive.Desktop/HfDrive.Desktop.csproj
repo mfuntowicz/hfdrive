@@ -1,0 +1,85 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    HF Drive desktop/tray application (WinUI 3).
+
+    Toolchain pins (approved plan; do not change silently):
+      - .NET SDK 11.0.100 (global.json, roll-forward disabled)
+      - TFM net11.0-windows10.0.26100.0 with the managed 26100 projection
+        (WindowsSdkPackageVersion 10.0.26100.87) — the .NET 11 SDK managed
+        platform map ends at 26100; the native 10.0.28000.0 SDK is used for
+        Rust/tooling/packaging only (see scripts/Initialize-BuildEnvironment.ps1).
+      - SupportedOSPlatformVersion / TargetPlatformMinVersion: Windows 11 22H2+ (10.0.22621.0).
+      - RuntimeFrameworkVersion 11.0.0 for self-contained desktop publishing.
+      - Windows App SDK 2.6.5 (WinUI 3), CommunityToolkit.Mvvm, CsWin32 — versions
+        pinned centrally in Directory.Packages.props (no Version attributes here).
+
+    Do NOT set TargetPlatformVersionSupported, UseWindowsSDKPreview or a 28000
+    managed TFM here; that would bypass .NET SDK target validation.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.22621.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.22621.0</SupportedOSPlatformVersion>
+    <WindowsSdkPackageVersion>10.0.26100.87</WindowsSdkPackageVersion>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <SelfContained>false</SelfContained>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>HfDrive.Desktop</RootNamespace>
+    <AssemblyName>HfDrive.Desktop</AssemblyName>
+    <Version>0.1.0</Version>
+    <Product>HF Drive</Product>
+    <!-- Packaging posture: publish must stay self-contained without NativeAOT,
+         trimming or single-file packaging (approved plan). -->
+    <PublishAot>false</PublishAot>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishSingleFile>false</PublishSingleFile>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" />
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+    <!-- Source generator only: nothing is shipped from this package. -->
+    <PackageReference Include="Microsoft.Windows.CsWin32" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HfDrive.Protocol\HfDrive.Protocol.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>HFDriveDevelopmentRoot</_Parameter1>
+      <_Parameter2>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\packaging\assets\Square44x44Logo.png">
+      <Link>assets\Square44x44Logo.png</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Official Hugging Face logo mark (huggingface_logo-noborder.svg), used
+         by the setup header. -->
+    <Content Include="Assets\HuggingFace.svg">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- A global RuntimeFrameworkVersion also overrides the Windows projection pack. -->
+  <Target Name="PinDotNetRuntime" BeforeTargets="ProcessFrameworkReferences">
+    <ItemGroup>
+      <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="11.0.0" />
+    </ItemGroup>
+  </Target>
+
+</Project>

@@ -1,0 +1,25 @@
+<Project>
+  <!--
+    HF Drive shared MSBuild configuration.
+
+    Central package management: every PackageReference in this repository omits its
+    Version attribute; exact versions live in Directory.Packages.props. Release
+    restores run with RestoreLockedMode (see scripts/build.ps1) against the checked-in
+    packages.lock.json files.
+
+    Windows targeting stays deliberately split per the approved plan:
+      - native Rust tools use the Windows SDK 10.0.28000.0 installation,
+      - managed projects target the supported SDK-11.0.100 platform map (26100)
+        and pin the projection via WindowsSdkPackageVersion in the desktop project.
+    Do NOT set TargetPlatformVersionSupported, UseWindowsSDKPreview, or a 28000
+    managed TFM here; that would bypass .NET SDK validation.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+    <!-- Deterministic toolchain posture; Rust and .NET versions are pinned by
+         rust-toolchain.toml and global.json at the repository root. -->
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>

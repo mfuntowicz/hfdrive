@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HF Drive per-user MSIX manifest (single multi-executable package).
+
+  Fixed identities (never change after release):
+    - Identity Name:      HFDrive
+    - Application IDs:    HFDrive (desktop/tray), Provider (hfdrive-provider.exe),
+                          Cli (hfdrive.exe + hfdrive.exe execution alias)
+    - Startup task ID:    HFDrive.Provider (disabled by default)
+
+  Tokens (rendered by scripts/package.ps1; never left in a packed manifest):
+    - {{HFDRIVE_PACKAGE_PUBLISHER}}  Development: "CN=HFDrive Development".
+      Production: $env:HFDRIVE_PACKAGE_PUBLISHER, which must exactly match the
+      Subject of the real signing certificate. The Publisher must continue to
+      match the signing certificate for every future package.
+    - {{HFDRIVE_PACKAGE_VERSION}}    Four-part version (major.minor.patch.build),
+      each part 0..65535, validated and monotonically increasing across upgrades.
+
+  Runtime declarations are deliberately split (see docs/build-install.md):
+    - TargetDeviceFamily MinVersion 10.0.22621.0 (Windows 11 22H2, the supported
+      minimum OS), MaxVersionTested 10.0.26100.0. This is a runtime
+      compatibility declaration, NOT a claim that the package was tested on a
+      newer OS; the native build/package toolchain uses Windows SDK 10.0.28000.0
+      and the managed target is 10.0.26100.0.
+
+  State lives at $(KnownFolder:LocalAppData)\HFDrive and is excluded from MSIX
+  write virtualization so it physically survives package removal. There is no
+  global virtualization opt-out; everything else stays virtualized/removed on
+  uninstall per standard MSIX behavior.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+  IgnorableNamespaces="uap uap5 uap10 rescap virtualization">
+
+  <Identity
+    Name="HFDrive"
+    Publisher="{{HFDRIVE_PACKAGE_PUBLISHER}}"
+    Version="{{HFDRIVE_PACKAGE_VERSION}}"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>HF Drive</DisplayName>
+    <PublisherDisplayName>HF Drive</PublisherDisplayName>
+    <Description>HF Drive — synchronized Hugging Face storage</Description>
+    <Logo>assets\StoreLogo.png</Logo>
+    <!--
+      Fine-grained write-virtualization exclusion (Windows 11): provider state,
+      snapshots and recovery data must physically survive MSIX removal. Only
+      this single directory is excluded; no desktop6 global opt-out is declared.
+    -->
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:LocalAppData)\HFDrive</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22621.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <!-- Desktop/tray UI. The only Start menu entry of this package. -->
+    <Application
+      Id="HFDrive"
+      Executable="HfDrive.Desktop.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        DisplayName="HF Drive"
+        Description="HF Drive — synchronized Hugging Face storage"
+        BackgroundColor="transparent"
+        Square150x150Logo="assets\Square150x150Logo.png"
+        Square44x44Logo="assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="assets\Wide310x150Logo.png" />
+        <uap:SplashScreen Image="assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+
+    <!--
+      Synchronization provider. Activatable by AUMID <package-family>!Provider
+      (and by the startup task below) but hidden from Start (AppListEntry="none").
+    -->
+    <Application
+      Id="Provider"
+      Executable="provider\hfdrive-provider.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        DisplayName="HF Drive Provider"
+        Description="HF Drive synchronization provider"
+        BackgroundColor="transparent"
+        Square150x150Logo="assets\Square150x150Logo.png"
+        Square44x44Logo="assets\Square44x44Logo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <!--
+          Start-at-logon for the provider, DISABLED by default. The supported
+          Windows.ApplicationModel.StartupTask enable flow runs from the desktop
+          UI's explicit preference and reflects DisabledByUser/DisabledByPolicy;
+          no Run-key or service workaround is used. Tray startup is a separate
+          UI preference and is never required for provider operation.
+        -->
+        <uap5:Extension
+          Category="windows.startupTask"
+          Executable="provider\hfdrive-provider.exe"
+          uap10:RuntimeBehavior="packagedClassicApp"
+          uap10:TrustLevel="mediumIL">
+          <uap5:StartupTask
+            TaskId="HFDrive.Provider"
+            Enabled="false"
+            DisplayName="HF Drive Provider" />
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+
+    <!--
+      CLI. Activatable by AUMID <package-family>!Cli and by the "hfdrive.exe"
+      console execution alias; hidden from Start (AppListEntry="none").
+    -->
+    <Application
+      Id="Cli"
+      Executable="cli\hfdrive.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL"
+      uap10:Subsystem="console"
+      uap10:SupportsMultipleInstances="true">
+      <uap:VisualElements
+        DisplayName="HF Drive CLI"
+        Description="HF Drive command line"
+        BackgroundColor="transparent"
+        Square150x150Logo="assets\Square150x150Logo.png"
+        Square44x44Logo="assets\Square44x44Logo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <uap5:Extension
+          Category="windows.appExecutionAlias"
+          Executable="cli\hfdrive.exe"
+          uap10:RuntimeBehavior="packagedClassicApp"
+          uap10:TrustLevel="mediumIL">
+          <uap5:AppExecutionAlias uap10:Subsystem="console">
+            <uap5:ExecutionAlias Alias="hfdrive.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

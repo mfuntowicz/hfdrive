@@ -1,0 +1,11 @@
+{
+  "name": "reject_trailing_garbage",
+  "description": "valid JSON followed by trailing bytes",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "valid JSON followed by trailing bytes"
+  },
+  "frame_hex": "150000007b2270726f746f636f6c5f6d616a6f72223a317d78"
+}

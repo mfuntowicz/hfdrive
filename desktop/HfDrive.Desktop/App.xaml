@@ -1,0 +1,64 @@
+<Application
+    x:Class="HfDrive.Desktop.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- Native WinUI control styles and their built-in theme values. -->
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+
+                <!--
+                    HF Drive brand and semantic brushes. Every key is defined in
+                    the native Light, Dark and HighContrast theme dictionaries so
+                    the UI follows the system contrast theme; pages reference
+                    these keys with ThemeResource so theme switches apply live.
+                    The palette is recognizably Hugging Face (yellow logo, dark
+                    slate cards) with the restrained Storage blue accent from
+                    https://huggingface.co/storage.
+                -->
+                <ResourceDictionary>
+                    <ResourceDictionary.ThemeDictionaries>
+                        <ResourceDictionary x:Key="Light">
+                            <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="#F8FAFC" />
+                            <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="HfHeaderForegroundBrush" Color="#111827" />
+                            <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#E3E5E9" />
+                            <SolidColorBrush x:Key="HfStorageAccentBrush" Color="#2563EB" />
+                            <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="#EFF6FF" />
+                            <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="#2563EB" />
+                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="#2563EB" />
+                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="#FFFFFF" />
+                        </ResourceDictionary>
+                        <ResourceDictionary x:Key="Dark">
+                            <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="#0B0F19" />
+                            <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="#0B0F19" />
+                            <SolidColorBrush x:Key="HfHeaderForegroundBrush" Color="#F3F4F6" />
+                            <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="#111827" />
+                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#273244" />
+                            <SolidColorBrush x:Key="HfStorageAccentBrush" Color="#60A5FA" />
+                            <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="#172554" />
+                            <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="#93C5FD" />
+                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="#2563EB" />
+                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="#FFFFFF" />
+                        </ResourceDictionary>
+                        <ResourceDictionary x:Key="HighContrast">
+                            <!-- Pure system palette: no decorative fills survive a contrast theme. -->
+                            <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                            <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                            <SolidColorBrush x:Key="HfHeaderForegroundBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                            <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                            <SolidColorBrush x:Key="HfStorageAccentBrush" Color="{ThemeResource SystemColorHotlightColor}" />
+                            <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                            <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                        </ResourceDictionary>
+                    </ResourceDictionary.ThemeDictionaries>
+                </ResourceDictionary>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

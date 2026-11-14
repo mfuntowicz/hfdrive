@@ -1,0 +1,11 @@
+{
+  "name": "reject_non_utf8_payload",
+  "description": "payload bytes are not valid UTF-8",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "payload is not UTF-8"
+  },
+  "frame_hex": "0400000022c32822"
+}

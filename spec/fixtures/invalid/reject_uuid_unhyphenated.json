@@ -1,0 +1,11 @@
+{
+  "name": "reject_uuid_unhyphenated",
+  "description": "non-hyphenated UUID spelling",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "non-hyphenated UUID spelling"
+  },
+  "frame_hex": "880000007b2270726f746f636f6c5f6d616a6f72223a312c2270726f746f636f6c5f6d696e6f72223a302c22726571756573745f6964223a226330616562333961326535353465656638656566303030323730363164643765222c226b696e64223a2272657175657374222c226d6574686f64223a226765745f737461747573222c22626f6479223a7b7d7d"
+}

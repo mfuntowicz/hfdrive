@@ -1,0 +1,11 @@
+{
+  "name": "reject_not_json",
+  "description": "payload is not JSON",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "payload is not JSON"
+  },
+  "frame_hex": "040000007b226122"
+}

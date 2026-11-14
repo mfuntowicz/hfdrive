@@ -1,0 +1,11 @@
+{
+  "name": "reject_hello_body_mismatch",
+  "description": "hello envelope at 1.0 whose body announces another version: body and envelope versions must agree",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "hello envelope at 1.0 whose body announces another version: body and envelope versions must agree"
+  },
+  "frame_hex": "cd0000007b2270726f746f636f6c5f6d616a6f72223a312c2270726f746f636f6c5f6d696e6f72223a302c22726571756573745f6964223a2263306165623339612d326535352d346565662d386565662d303030323730363164643765222c226b696e64223a2272657175657374222c226d6574686f64223a2268656c6c6f222c22626f6479223a7b2270726f746f636f6c5f6d616a6f72223a322c2270726f746f636f6c5f6d696e6f72223a302c22726f6c65223a22636c69222c226275696c645f76657273696f6e223a2231227d7d"
+}
