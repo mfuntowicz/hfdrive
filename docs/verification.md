@@ -896,8 +896,11 @@ verification.
   launches. Evidence: `artifacts/tests/oauth-fixed-callback-auth-tests.log`,
   `oauth-fixed-callback-browser-tests.log`, and
   `oauth-fixed-callback-build.log`.
-- **not_run** — successful HF authorization after registering the exact callback
-  is not claimed. HF rejected the old random-port URI; the user has not
-  confirmed adding `http://127.0.0.1:53643/oauth/callback` to the client
-  registration. The rejected attempt was cancelled by provider restart and the
-  fixed-callback provider is running. No consent or token exchange was completed.
+- **passed** — the exact callback was registered and
+  `hfdrive login --purpose read-storage` completed real PKCE authorization in
+  5.95 seconds. The provider reports `signed_in` for `mfuntowicz`, login phase
+  `completed`, and granted scopes `openid`, `profile`, `read-memberships`, and
+  `read-repos`, with no account error. Evidence:
+  `artifacts/tests/oauth-fixed-callback-login.log` and
+  `artifacts/tests/oauth-fixed-callback-status.log`. No tokens, authorization
+  codes, callback queries, or credential envelopes are included in those logs.
