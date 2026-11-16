@@ -13,6 +13,11 @@ CRYPTPROTECT_UI_FORBIDDEN
 DefSubclassProc
 DestroyIcon
 DestroyMenu
+DWMNCRENDERINGPOLICY
+DWMWA_COLOR_DEFAULT
+DWMWA_COLOR_NONE
+DWM_WINDOW_CORNER_PREFERENCE
+DwmSetWindowAttribute
 EqualSid
 FindWindow
 GdipCreateBitmapFromFile
@@ -23,6 +28,7 @@ GdiplusStartup
 GetCurrentPackageFamilyName
 GetCurrentPackageFullName
 GetCurrentProcessId
+GetCursorPos
 GetMessagePos
 GetNamedPipeServerProcessId
 GetPackageFamilyName
@@ -31,15 +37,21 @@ GetPackagePathByFullName
 GetSidSubAuthority
 GetSidSubAuthorityCount
 GetTokenInformation
+GetWindowLongPtr
 LoadIcon
 LocalFree
 OpenProcessToken
+PostMessage
 ProcessIdToSessionId
+RegisterWindowMessage
 RemoveWindowSubclass
 SE_GROUP_LOGON_ID
 SetForegroundWindow
+SetWindowLongPtr
+SetWindowPos
 SetWindowSubclass
 Shell_NotifyIcon
+Shell_NotifyIconGetRect
 TOKEN_ACCESS_MASK
 TOKEN_GROUPS
 TOKEN_INFORMATION_CLASS
@@ -48,3 +60,5 @@ TOKEN_USER
 TrackPopupMenu
 WaitNamedPipe
 WIN32_ERROR
+WINDOW_EX_STYLE
+WM_CLOSE

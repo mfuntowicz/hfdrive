@@ -1150,7 +1150,9 @@ fn apply_intents(
                     MissingRef::Item { item_id: intent.item_id },
                 ]))?;
                 if state.deleted {
-                    return Err(ReconcileError::InconsistentIntent("double delete"));
+                    // Watcher replay and parent/child removal notifications
+                    // can describe an already-applied deletion.
+                    continue;
                 }
                 let is_directory = state.kind == ItemKind::Directory;
                 let mut subtree: Vec<ItemId> = vec![intent.item_id];

@@ -6,7 +6,7 @@ use hfdrive_core::format::{DisplayMetadata, ItemKind};
 use hfdrive_core::ids::{ItemId, OperationId, UploadId, VersionId, WorkspaceId};
 use hfdrive_core::reconcile::{
     conflict_identity, conflict_name, reconcile, CatalogView, ConflictKind, ConflictNames,
-    ConflictOutcome, DeterministicIds, IdSource, IntentOutcomeKind, ItemState, LocalActionKind,
+    ConflictOutcome, DeterministicIds, IntentOutcomeKind, ItemState, LocalActionKind,
     LocalChange, LocalIntent, LocalOrigin, MissingRef, NewContent, NtfsNameCompare, OrdinalIgnoreCase,
     ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
 };
@@ -928,4 +928,50 @@ fn conflict_names_respect_the_utf16_component_limit() {
     // The marker is preserved even when the stem must be truncated.
     let short_stem = conflict_name("\u{1f600}.txt", ident.conflict_id);
     assert!(short_stem.encode_utf16().count() <= 255);
+}
+
+#[test]
+fn repeated_delete_observations_publish_once_and_converge_on_replay() {
+    let file = file_state(uid(ITEM_A), uid(ROOT), "f.txt", ver("v0"), digest(0), 10, op(0x2000));
+    let base = view(vec![root_state(), file.clone()]);
+    let mut repeated = edit(op(0x0002), uid(ITEM_A), LocalChange::Delete);
+    repeated.observed_generation = 2;
+    let local = vec![edit(op(0x0001), uid(ITEM_A), LocalChange::Delete), repeated];
+    let plan = run(ReconcileMode::Writable, &base, &local, &base);
+    assert_eq!(op_count(&plan, uid(ITEM_A)), 1);
+    let deleted = &plan.remote_ops[0].record;
+    assert!(deleted.deleted);
+    assert_eq!(deleted.deletion_operation, Some(op(0x0001)));
+    assert_eq!(outcome_of(&plan, op(0x0001)), IntentOutcomeKind::Published);
+    assert_eq!(outcome_of(&plan, op(0x0002)), IntentOutcomeKind::Superseded);
+    assert!(plan.conflicts.is_empty());
+
+    let committed = view(vec![root_state(), tombstone(&file, op(0x0001))]);
+    let replay = run(ReconcileMode::Writable, &committed, &local, &committed);
+    assert!(replay.remote_ops.is_empty());
+    assert!(replay.local_actions.is_empty());
+    for operation in [op(0x0001), op(0x0002)] {
+        assert_eq!(outcome_of(&replay, operation), IntentOutcomeKind::Converged);
+    }
+}
+
+#[test]
+fn parent_and_child_delete_observations_preserve_one_subtree_deletion() {
+    let directory = dir_state(uid(ITEM_A), uid(ROOT), "folder", op(0x2000));
+    let child = file_state(uid(ITEM_B), uid(ITEM_A), "child.txt", ver("child-v0"), digest(1), 10, op(0x2001));
+    let base = view(vec![root_state(), directory, child]);
+    let local = vec![
+        edit(op(0x0001), uid(ITEM_A), LocalChange::Delete),
+        edit(op(0x0002), uid(ITEM_B), LocalChange::Delete),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &base);
+    let deleted: std::collections::BTreeSet<_> = plan.remote_ops.iter().map(|operation| {
+        assert!(operation.record.deleted);
+        assert_eq!(operation.record.deletion_operation, Some(op(0x0001)));
+        operation.record.item_id
+    }).collect();
+    assert_eq!(deleted, std::collections::BTreeSet::from([uid(ITEM_A), uid(ITEM_B)]));
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(outcome_of(&plan, op(0x0001)), IntentOutcomeKind::Published);
+    assert_eq!(outcome_of(&plan, op(0x0002)), IntentOutcomeKind::Superseded);
 }

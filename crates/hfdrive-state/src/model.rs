@@ -302,6 +302,9 @@ pub struct SnapshotRecord {
     /// `None` while a capture is in flight; always set for `Ready` rows.
     pub sha256: Option<Sha256Digest>,
     pub status: SnapshotStatus,
+    /// The outbox operation this capture serves, when bound at capture time.
+    /// Lets the activity projection prove a capture is actually in flight.
+    pub operation_id: Option<OperationId>,
 }
 
 /// A draft setup reservation request: account + exact binding + explicit,
@@ -583,6 +586,71 @@ pub struct ProbeKeyRecord {
     pub setup_id: Option<SetupId>,
     pub key: String,
     pub state: ProbeKeyState,
+}
+
+/// A read-only keyset paging position over one durable work table: strictly
+/// after the `(created_at_ms, work id)` tuple in `(created_at_ms, native UUID
+/// blob)` order. It is a pure ordered position, not an authority: it need not
+/// name a stored row (projection derives `nil`/`max` UUID sentinels for merged
+/// source ranks), and deletion of the row it was derived from does not change
+/// the page boundary. Providers own page truncation, the next cursor, and
+/// wire-cursor validation against their connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkPageCursor {
+    pub created_at_ms: u64,
+    pub work_id: uuid::Uuid,
+}
+
+/// An outbox entry with its durable creation timestamp. The timestamp is the
+/// activity start evidence: written when the intent was first persisted (a
+/// real observed time), never synthesized at projection time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxWorkRow {
+    pub entry: OutboxEntry,
+    pub created_at_ms: u64,
+}
+
+/// A journaled local action with its durable creation timestamp (the activity
+/// start evidence of the apply step).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionWorkRow {
+    pub action: LocalAction,
+    pub created_at_ms: u64,
+}
+
+/// A transfer journal row with its durable creation timestamp (the activity
+/// start evidence of a live download transfer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferWorkRow {
+    pub transfer: TransferRecord,
+    pub created_at_ms: u64,
+}
+
+/// Which durable work table one [`WorkErrorRow`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkErrorKind {
+    /// An outbox operation (`work_id` is its operation UUID).
+    Outbox,
+    /// A journaled local action (`work_id` is its action UUID).
+    Action,
+    /// A transfer journal row (`work_id` is its transfer UUID).
+    Transfer,
+}
+
+/// One recorded work failure: the classification and text captured at the
+/// failure site. The row is deleted when the work item advances, so its
+/// presence means the work is still unfinished and currently failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkErrorRow {
+    pub connection_id: ConnectionId,
+    pub kind: WorkErrorKind,
+    pub work_id: uuid::Uuid,
+    pub error_code: String,
+    pub error_detail: String,
+    /// When the failure site recorded (or last overwrote) this row. A real
+    /// recorded time, never synthesized at projection time.
+    pub updated_at_ms: u64,
 }
 
 /// Uniqueness/parent/case-folding components are computed by the core catalog;

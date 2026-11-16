@@ -156,6 +156,7 @@ pub(crate) fn read_snapshot(row: &Row<'_>) -> SResult<SnapshotRecord> {
         size: c::unsigned_opt(row.get_ref(3)?, "size")?,
         sha256: c::digest_opt(row.get_ref(4)?, "sha256")?,
         status: parse_snapshot_status(&c::text(row.get_ref(5)?, "status")?)?,
+        operation_id: c::operation_id_opt(row.get_ref(6)?)?,
     })
 }
 
@@ -217,6 +218,17 @@ pub(crate) fn read_conflict(row: &Row<'_>) -> SResult<ConflictRecord> {
         original_names: c::from_json("original_names_json", &names)?,
         resolution_state: parse_resolution(&c::text(row.get_ref(6)?, "resolution_state")?)?,
         detected_at_ms: Some(c::unsigned(row.get_ref(7)?, "conflict.created_at_ms")?),
+    })
+}
+
+pub(crate) fn read_work_error(row: &Row<'_>) -> SResult<WorkErrorRow> {
+    Ok(WorkErrorRow {
+        connection_id: c::connection_id(row.get_ref(0)?)?,
+        kind: parse_work_error_kind(&c::text(row.get_ref(1)?, "work_errors.work_kind")?)?,
+        work_id: c::uuid_from(row.get_ref(2)?, "work_errors.work_id")?,
+        error_code: c::text(row.get_ref(3)?, "work_errors.error_code")?,
+        error_detail: c::text(row.get_ref(4)?, "work_errors.error_detail")?,
+        updated_at_ms: c::unsigned(row.get_ref(5)?, "work_errors.updated_at_ms")?,
     })
 }
 
@@ -322,6 +334,16 @@ parse_enum!(parse_outbox_state, OutboxState, "OutboxState",
     (LocalApplyPending, "local_apply_pending"), (Complete, "complete"));
 parse_enum!(parse_retry_class, RetryClass, "RetryClass",
     (None, "none"), (Backoff, "backoff"), (NeedsUser, "needs_user"), (NeedsAuth, "needs_auth"));
+parse_enum!(parse_work_error_kind, WorkErrorKind, "WorkErrorKind",
+    (Outbox, "outbox"), (Action, "action"), (Transfer, "transfer"));
+
+pub(crate) fn work_error_kind_text(value: WorkErrorKind) -> &'static str {
+    match value {
+        WorkErrorKind::Outbox => "outbox",
+        WorkErrorKind::Action => "action",
+        WorkErrorKind::Transfer => "transfer",
+    }
+}
 parse_enum!(parse_snapshot_status, SnapshotStatus, "SnapshotStatus",
     (Capturing, "capturing"), (Ready, "ready"), (Consumed, "consumed"), (Released, "released"));
 parse_enum!(parse_direction, TransferDirection, "TransferDirection",

@@ -78,9 +78,10 @@ use hfdrive_core::storage::{
     BucketBinding, BucketId, BucketName, ByteRange, DriveBinding, ImmutableKey, Namespace, ObjectRef,
     OwnerId, OwnerKind, RemotePrefix, Sha256Digest, StableSnapshot,
 };
+use hfdrive_hf::wire_budget::WireBudget;
 use hfdrive_hf::{
     HeadFormat, HeadRead, NativeApi, NativeBucketStore, NativeConfig, NativeControl, NativeError,
-    OwnerLocator, WireBudget,
+    OwnerLocator,
 };
 use hfdrive_provider::scheduler::Scheduler;
 use hfdrive_provider::sync::remote::LiveRemote;
@@ -88,11 +89,11 @@ use hfdrive_provider::sync::{
     registry, ConnectionConfig, ConnectionServices, EngineConfig, SyncEngine,
 };
 use hfdrive_publication::coordinator::{
-    InitOutcome, PublicationCandidate, PublicationCoordinator, PublicationStore,
+    HeadVersion, InitOutcome, PublicationCandidate, PublicationCoordinator, PublicationStore,
 };
 use hfdrive_publication::transport::{MetadataRecord, ProbeNamespace};
 use hfdrive_publication::{
-    AccountIdentity, BoundedRecord, HeadVersion, OpaqueEtag, ProbeKey, ProbeRecord,
+    AccountIdentity, BoundedRecord, OpaqueEtag, ProbeKey, ProbeRecord,
     PublicationBinding, PublicationError, PublishOutcome, S3Transport, SupplementalCredentialRecord,
 };
 use hfdrive_state::{ConnectionMode, StatePaths, StateStore};
@@ -116,7 +117,6 @@ const PLACEHOLDER_WAIT: Duration = Duration::from_secs(120);
 
 type LiveResult<T> = Result<T, String>;
 type ProbeRemote = LiveRemote<AuthManager, ProbeStore>;
-type ProbeCoordinator = PublicationCoordinator<NativeBucketStore<AuthManager>, ProbeStore>;
 
 fn err(context: &str, detail: impl std::fmt::Display) -> String {
     format!("{context}: {detail}")
@@ -161,7 +161,6 @@ async fn native_xet_file_hydrates_through_cfapi() {
 // ---------------------------------------------------------------------------
 
 struct Cleanup {
-    run_id: uuid::Uuid,
     probe_prefix: RemotePrefix,
     engine: Option<Arc<SyncEngine<ProbeRemote>>>,
     connection: Option<ConnectionId>,
@@ -177,7 +176,6 @@ struct Cleanup {
 impl Cleanup {
     fn new(run_id: uuid::Uuid) -> Self {
         Self {
-            run_id,
             probe_prefix: RemotePrefix::new(format!("hfdrive-probe/{run_id}"))
                 .expect("run-scoped probe prefix is valid"),
             engine: None,
@@ -328,7 +326,7 @@ impl PublicationStore for ProbeStore {
         let bytes = format::to_head_bytes(head);
         async move {
             let key = key?;
-            let bytes = bytes?;
+            let bytes = bytes.map_err(|_| PublicationError::UnsupportedFormat)?;
             namespace
                 .create(lease, &key, ProbeRecord::new(bytes)?, cancel)
                 .await
@@ -347,7 +345,7 @@ impl PublicationStore for ProbeStore {
         let bytes = format::to_head_bytes(head);
         async move {
             let key = key?;
-            let bytes = bytes?;
+            let bytes = bytes.map_err(|_| PublicationError::UnsupportedFormat)?;
             namespace
                 .replace(lease, &key, expected, ProbeRecord::new(bytes)?, cancel)
                 .await
@@ -409,7 +407,7 @@ async fn live_run(client_id: &str, run_id: uuid::Uuid, cleanup: &mut Cleanup) ->
 
     // ---- 2. native control over the authorized development fixture ----
 
-    let budget = WireBudget::default();
+    let budget = WireBudget::new(Default::default());
     let xet_cache = std::env::temp_dir().join(format!("hfdrive-live-xet-{run_id}"));
     std::fs::create_dir_all(&xet_cache).map_err(|failure| err("temp Xet cache creation failed", failure))?;
     cleanup.temp_dirs.push(xet_cache.clone());
@@ -1010,8 +1008,6 @@ async fn live_run(client_id: &str, run_id: uuid::Uuid, cleanup: &mut Cleanup) ->
 
 /// Native HEAD read through `NativeControl`'s bounded managed-record path.
 ///
-/// SEAM(parent): `read_head_record`/`HeadRead`/`HeadFormat` spelling follows
-/// `hfdrive_hf::wire`; adjust only names, not behavior.
 async fn read_native_head(
     control: &NativeControl<AuthManager>,
     lease: &hfdrive_hf::NativeLease,
@@ -1024,8 +1020,8 @@ async fn read_native_head(
         .map_err(|failure| err("native HEAD record read failed", failure))?
     {
         HeadRead::Record(record) => Ok(record),
-        HeadRead::TooLarge => Err("the native HEAD record exceeds the format bound".to_owned()),
-        HeadRead::Absent => Err("the native HEAD record is absent after publication".to_owned()),
+        HeadRead::TooLarge { .. } => Err("the native HEAD record exceeds the format bound".to_owned()),
+        HeadRead::Missing => Err("the native HEAD record is absent after publication".to_owned()),
     }
 }
 

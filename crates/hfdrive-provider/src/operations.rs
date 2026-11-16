@@ -136,6 +136,7 @@ impl Provider {
             Request::StartLogin(_)
             | Request::CreateBucket(_)
             | Request::ProbeStorage(_)
+            | Request::RepairStorage(_)
             | Request::Restore(_)
             | Request::ResolveConflict(_)
             | Request::Connect(_) => EffectClass::External,

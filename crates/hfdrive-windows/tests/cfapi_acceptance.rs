@@ -31,7 +31,7 @@ fn cfapi_register_create_guard_shutdown_and_unregister() {
     let validated = validate_sync_root(&root, &RootContext {
         state_dir: root.join("_state"),
         configured_roots: Vec::new(),
-        ignored_existing_root: None,
+        existing_sync_root_id: None,
     }).expect("validated disposable NTFS root");
     eprintln!("existing sync roots: {:?}", hfdrive_windows::cfapi::registered_sync_roots().unwrap());
     let registration = register_sync_root(&validated, &user_sid, &RegistrationInfo {

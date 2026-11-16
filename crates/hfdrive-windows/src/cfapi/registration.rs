@@ -12,6 +12,7 @@
 //!   hard links `None`. The single-variant enums make the intended policy the
 //!   only expressible one.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use hfdrive_core::ids::ConnectionId;
@@ -144,7 +145,7 @@ pub fn register_sync_root(
     }
     crate::ffi::syncroot::register(&crate::ffi::syncroot::RegistrationRequest {
         id,
-        path: registration_path(&root.final_path),
+        path: registration_path(&root.final_path).into_owned(),
         provider_guid: HFDRIVE_PROVIDER_GUID,
         display: crate::ffi::syncroot::RootDisplay {
             display_name: info.display_name.clone(),
@@ -195,18 +196,22 @@ pub fn registered_sync_roots() -> CfResult<Vec<RegisteredRoot>> {
 /// `StorageFolder.GetFolderFromPathAsync` rejects extended `\\?\` paths.
 /// Keep the validated extended path for identity/CFAPI, but register the
 /// equivalent ordinary DOS or UNC path through WinRT.
-fn registration_path(path: &std::path::Path) -> std::path::PathBuf {
-    let text = path.as_os_str().to_string_lossy();
+fn registration_path(path: &std::path::Path) -> Cow<'_, std::path::Path> {
+    let Some(text) = path.to_str() else {
+        return Cow::Borrowed(path);
+    };
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return std::path::PathBuf::from(format!(r"\\{rest}"));
+        return Cow::Owned(std::path::PathBuf::from(format!(r"\\{rest}")));
     }
     if let Some(rest) = text.strip_prefix(r"\\?\") {
-        return std::path::PathBuf::from(rest);
+        return Cow::Borrowed(std::path::Path::new(rest));
     }
-    path.to_path_buf()
+    Cow::Borrowed(path)
 }
 
 fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a = registration_path(a);
+    let b = registration_path(b);
     let a_owned = a.to_string_lossy();
     let b_owned = b.to_string_lossy();
     let a = a_owned.trim_end_matches(['\\', '/']);
@@ -255,8 +260,30 @@ mod tests {
 
     #[test]
     fn registration_path_uses_winrt_compatible_dos_and_unc_paths() {
-        assert_eq!(registration_path(std::path::Path::new(r"\\?\F:\Data\Root")), std::path::PathBuf::from(r"F:\Data\Root"));
-        assert_eq!(registration_path(std::path::Path::new(r"\\?\UNC\server\share\Root")), std::path::PathBuf::from(r"\\server\share\Root"));
-        assert_eq!(registration_path(std::path::Path::new(r"F:\Data\Root")), std::path::PathBuf::from(r"F:\Data\Root"));
+        assert_eq!(registration_path(std::path::Path::new(r"\\?\F:\Data\Root")).as_ref(), std::path::Path::new(r"F:\Data\Root"));
+        assert_eq!(registration_path(std::path::Path::new(r"\\?\UNC\server\share\Root")).as_ref(), std::path::Path::new(r"\\server\share\Root"));
+        assert_eq!(registration_path(std::path::Path::new(r"F:\Data\Root")).as_ref(), std::path::Path::new(r"F:\Data\Root"));
+    }
+
+    #[test]
+    fn reconnect_adopts_the_same_dos_or_unc_root_without_re_registering() {
+        for (registered, candidate) in [
+            (r"F:\Data\Root", r"\\?\F:\Data\Root"),
+            (r"f:\data\ROOT\", r"\\?\F:\Data\Root"),
+            (r"\\server\share\Root", r"\\?\UNC\server\share\Root"),
+        ] {
+            assert!(same_path(
+                std::path::Path::new(registered),
+                std::path::Path::new(candidate),
+            ));
+        }
+        assert!(!same_path(
+            std::path::Path::new(r"F:\Data\Root2"),
+            std::path::Path::new(r"\\?\F:\Data\Root"),
+        ));
+        assert!(!same_path(
+            std::path::Path::new(r"\\server\other\Root"),
+            std::path::Path::new(r"\\?\UNC\server\share\Root"),
+        ));
     }
 }

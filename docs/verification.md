@@ -143,3 +143,322 @@ Cargo 1.100's unused-workspace-dependency lint exposed the unused
 S3's transitive dependency remains, and no lockfile regeneration was required.
 Earlier Rust 1.99.1 verification records remain historical; tests were not rerun
 for this toolchain-only change.
+
+## Probe namespace isolation
+
+The saved failing probe report and its durable setup binding confirmed a namespace
+mismatch: native payload/catalog/commit uploads used the managed-drive prefix,
+while S3 reads and cleanup addressed `hfdrive-probe/<run-id>/`. This caused both
+the missing S3 payload and unavailable ancestry records despite successful
+conditional-write checks.
+
+Probes now open a separate native store at the request's run-scoped prefix while
+keeping supplemental credentials bound to the original setup. A mismatched native
+prefix is rejected before journaling, uploads, or interrupted-run cleanup.
+
+Passed on Rust 1.100.0 in the pinned Windows environment:
+`cargo test -p hfdrive-publication --test probe --locked --target x86_64-pc-windows-msvc`
+(5 tests) and
+`cargo test -p hfdrive-provider --lib --locked --target x86_64-pc-windows-msvc`
+(44 tests). The regression protects existing workspace and foreign-run content.
+MSVC informational import-library messages remain during linking.
+
+No live probe was rerun and no bucket objects were deleted during investigation.
+Older faulty probes may have left native records under the managed prefix; their
+S3 cleanup reports do not prove those differently addressed records were removed.
+
+The subsequent user-initiated full probe
+`84394b5c-765d-4648-bf24-d38833a446ad` passed all eight checks, including native
+upload visibility through S3 and ambiguous-CAS ancestry recovery. Its persisted
+report was read from `%LOCALAPPDATA%\HFDrive\capabilities` during the
+2026-11-15 Explorer investigation; that investigation did not rerun the probe.
+The later disconnected CFAPI root is a separate local lifecycle failure.
+
+## Activity state and tray readiness evidence
+
+Passed: `cargo test -p hfdrive-state --locked --target x86_64-pc-windows-msvc`
+on Rust 1.100.0 (40 tests). Coverage includes the account v2-to-v3 migration with
+an online v2 backup, preserved rows, durable snapshot/operation bindings,
+persisted work errors and transactional error clearing, and bounded
+connection-scoped keyset pages that tolerate deleted anchors and sentinel positions.
+These checks used temporary state, not the user's database.
+
+Passed: 33 tray-readiness regressions compiling the exact shipped pure evaluator
+against protocol DTOs in an isolated .NET 11 test project. Read-only and
+remote-device commits may be up to date without a matching local publication;
+missing, failed, stale, paged-away or other-drive work blocks celebration.
+The temporary project was removed; TRX evidence remains under
+`artifacts/tests/tray-readiness-isolated/`.
+
+### Activity wire compatibility
+
+`list_activity` is an additive, typed, read-only IPC query. Its normative model
+generates the schema and the two new golden frames; generated fixtures retain
+canonical cross-language bytes. The Rust protocol gate passed **31 tests** and
+the managed protocol gate passed **70 tests** (including the 33 readiness cases
+above), with no failures or skips. Evidence: `artifacts/tests/activity-wire.json`
+and `artifacts/tests/tray-protocol/tray-protocol.trx`.
+
+### Setup celebration gate
+
+The built desktop's `SetupViewModel.IsSetupWorking` getter passed ten isolated
+checks: accepted writable/browse-only setup, initial synchronization, preview-only
+state, disconnected/stale sessions, failed permission/capability, conflicts, and
+no drive. Evidence: `artifacts/tests/setup-celebration.json`. No production UI
+status was injected. The temporary getter harness and its build output were
+removed. A successful connected-root GIF run still requires a configured drive;
+the local acceptance account has none.
+
+### Scoped tray issue selection
+
+Seven isolated checks against the compiled operations view model passed:
+the requested conflict is selected by its real id rather than row position,
+late-page arrival is handled, missing ids never select another row, and later
+manual selection is not overwritten after navigation completes. Evidence:
+`artifacts/tests/tray-conflict-selection.json`. These checks do not inject state
+into the production UI or perform a conflict resolution.
+
+### Final Rust integration
+
+Rust 1.100.0 passed locked, offline `cargo check --workspace --all-targets`
+for `x86_64-pc-windows-msvc` with zero warnings/errors. The ignored live-acceptance
+adapter now compiles against the current budget, publication, and HEAD APIs;
+its explicit consent/ignore gates remain intact and it was not executed.
+
+The relevant suites passed 275 tests: auth 40, protocol 31, provider 89,
+publication 49, state 40, and core history/reconciliation 26. One live HF/CFAPI
+acceptance test remained ignored. The provider binary built successfully.
+Evidence: `artifacts/tests/tray-rust.json` and `tray-all-targets.json`.
+
+The existing durability regression also exposed a real FILETIME display bug:
+100-nanosecond ticks were divided as if they were nanoseconds, compressing dates
+toward 1970. Whole-second conversion now uses 10,000,000 ticks per second;
+`display_timestamps_are_canonical_whole_seconds` passes without changing its
+expected date. No live HF writes or root registration ran during these gates.
+
+### Native desktop and tray acceptance
+
+The complete Debug/x64 WinUI solution built with the pinned Build Tools and
+Windows SDK; managed protocol/readiness verification passed 70 tests. Evidence:
+`artifacts/tests/tray-managed.json` and the retained TRX.
+
+The actual desktop and Shell notification icon passed the native scenario:
+CatchingHuggy rendering, compact onboarding, native close-to-tray without process
+exit, a real notification-area mouse click opening the bottom-right panel,
+hover not opening it, Escape dismissal, reopen, and outside/taskbar dismissal.
+The 620-DIP preferred viewport shows the complete SuperHuggy illustration and
+setup action; irrelevant pause/resume is absent without configured drives.
+Native MSAA activated the real **Exit HF Drive** menu item and the provider
+remained running. Evidence: `artifacts/acceptance/huggy-tray-ui.json`,
+`tray-exit-ui.json`, and `huggy-desktop.png` / `huggy-tray.png` /
+`huggy-tray-reopened.png`. Capture temporarily raised only the test process's
+windows and restored their prior topmost flag; no provider data was injected.
+
+The account had no configured drives, so activity/history/issues tabs were
+correctly hidden and the all-synced GIF was absent. Positive HF-backed transfer,
+history/conflict rows and successful-setup/all-synced animations remain live
+fixture gates, not claims made by these screenshots. Their projection,
+readiness and targeting rules have the isolated regression evidence above.
+No storage probe, remote write or root registration was run. Throwaway UI and
+selection/getter harness sources were removed after proof.
+
+## Provider restart and Fluent window chrome
+
+- **passed** — 43 state tests on the pinned Windows x64 toolchain, including
+  first-invalidation bookkeeping, repair of a connected connection missing
+  event state, and preservation of existing cursor/scan evidence.
+  Evidence: `artifacts/tests/provider-reconnect-state.json` and the two
+  `provider-reconnect-state*.log` files.
+- **passed** — current Debug/x64 WinUI build and 85 managed protocol/view-model
+  tests, including tray authorization failures, independent error clearing,
+  same-session out-of-order responses, and existing-drive issue navigation.
+  Evidence: `artifacts/tests/window-chrome-final-build.log` and
+  `artifacts/tests/storage-repair-managed/storage-repair-tray.trx`.
+- **passed** — 75 Windows library tests, including exact registered cloud-root
+  admission, DOS/extended-path registration adoption, callback path boundaries,
+  and empty placeholder completion. Evidence:
+  `artifacts/tests/provider-callback-paths-windows.log`.
+- **passed** — 83 provider library tests, including startup failure publication,
+  watcher-local cancellation, runtime liveness, and resumable paused-error
+  status. Evidence: `artifacts/tests/provider-reconnect-provider.log`.
+- **passed** — 31 Rust protocol tests, including typed storage-repair request/
+  result fixtures, complete method coverage, and credential redaction.
+  Evidence: `artifacts/tests/storage-repair-protocol.log`.
+- **passed** — actual WinUI setup/tray acceptance with real mouse/keyboard
+  input and the native tray menu: 660×760 setup and 400×620 tray have no visible
+  nonclient border, use native rounded corners, and keep the provider alive.
+  Setup dragging, custom close, preserving setup on reopen, normal caption
+  restoration, and tray close/reopen/Escape/deactivation passed. Evidence:
+  `artifacts/acceptance/window-fluent-chrome.json`,
+  `setup-fluent-chrome.png`, `tray-fluent-chrome.png`, and
+  `normal-fluent-restored.png` in that acceptance directory.
+- **passed** — the real tray displays the existing connection's authorization
+  failures under Issues, not “No sync issues”, and explains that an empty queue
+  is blocked. Evidence: `artifacts/acceptance/tray-issues-before-repair.json`
+  and the matching screenshot.
+- **observed** — the existing registered HF Drive directory carries Windows
+  cloud reparse tag `0x9000101a`, not a junction. Its disconnected root identity
+  was recorded before recovery; no registration or user files were removed.
+- **identified** — the former startup restore-error path held a status-watch
+  read guard while taking its write lock, before binding IPC. Root restoration
+  also rejected its own registered cloud root. Live recovery and final native
+  frame acceptance are separate from the build/test results above.
+
+### Setup folder collision feedback
+
+The user-reported `LocalRootInvalid` message discarded the filesystem rejection
+twice: admission replaced it with “root validation failed”, then the protocol
+mapping replaced that again. The root admission detail now reaches the UI;
+ownership, overlap, NTFS and reparse checks are unchanged.
+
+Passed: the compiled `SetupPage` suggestion method preserves an unused path,
+avoids existing directories and files, leaves their content unchanged, and
+does not create the proposed folder. The proof used isolated temporary fixtures
+and the actual desktop assembly, not a copy of the implementation.
+Evidence: `artifacts/acceptance/local-root-suggestion-proof.json` and
+`artifacts/tests/local-root-suggestion-build.log`. Throwaway harness sources
+were removed. The alternate build output avoided replacing the user's running
+desktop.
+
+The subsequent user-initiated full probe
+`0e9d4c8c-5c84-401a-afae-874a1550edd5` also passed all eight checks for the same
+bucket identity. It was read, not rerun. This does not authorize replacing the
+existing connection's registration or assuming that its older supplemental
+credentials have the same current authorization.
+
+### Existing root binding recovery
+
+Passed: authenticated provider status and native CFAPI reconnection report
+Windows provider status `1`; sync-root file ID `003D00000003D6C3` is unchanged.
+No registration, local file or credential was removed. Evidence:
+`artifacts/acceptance/provider-binding-restored.json`.
+
+Passed: directory enumeration and actual Explorer navigation to that same
+existing root after the callback-path repair. Evidence:
+`artifacts/acceptance/existing-root-enumeration.json` and
+`artifacts/acceptance/existing-root-explorer.json`. No new workspace, registration
+reset, file deletion, or storage probe was used.
+
+Passed: connection-scoped CLI pause/resume restored the original unpaused
+intent while preserving its root and workspace. Evidence:
+`artifacts/acceptance/existing-drive-scoped-recovery.json`.
+
+The desktop alone launched the exact trusted provider; authenticated status
+was available in 5,714 ms and the desktop rendered its signed-in account.
+Evidence: `artifacts/acceptance/desktop-provider-autolaunch.json`. The development
+provider must be built with `Initialize-HfDriveBuildEnvironment` so the exact
+desktop executable is present in its peer allowlist.
+
+The original stored supplemental credentials returned HTTP 403 on S3 reads,
+although the native bucket precheck succeeded. Evidence:
+`artifacts/acceptance/desktop-autostart.out.log`. Only operation and HTTP status
+are logged, never credentials, response bodies, or signed URLs. The read
+classification regression passed (`artifacts/tests/publication-denial-diagnostics.log`).
+
+### Existing-connection credential repair
+
+The approved live `repair-storage` operation succeeded against the original
+workspace. Target probe `63e24ef4-87ce-4e2a-a4a8-44be2eb0e78a` passed all eight
+checks; the connection reports writable capability and no authorization error.
+The original root file ID, workspace, configuration, and registration were
+preserved. The source setup and protected credential record have unchanged hashes.
+Evidence: `artifacts/acceptance/storage-repair-live.log`,
+`storage-repair-preservation.json`, and `storage-repair-root-verified.json`.
+
+Focused gates passed: 92 provider library tests, 24 publication library tests,
+and three state repair-transaction tests. A further provider regression passed
+after reproducing an account commit followed by control-mirror failure: the
+adopted protected credential record must survive that partial commit.
+Evidence: `artifacts/tests/storage-repair-provider-publication.log`,
+`storage-repair-state.log`, and `storage-repair-commit-boundary-after.log`.
+
+Storage checks and directory enumeration do not prove file creation. The first
+approved real copy into the empty connected root failed with Windows
+`0x80070781` (“The name of the file cannot be resolved by the system”), matching
+the user's Explorer report. No user file was altered or reported as uploaded.
+
+### Native copy and notification defects
+
+The populated-directory completion now sends Windows' terminal
+`DISABLE_ON_DEMAND_POPULATION` flag after the complete authoritative listing.
+The same-root copy then returned successfully without registration changes.
+The upload wait exposed a separate loss: no observation, item, or outbox row
+was created. Evidence: `artifacts/acceptance/file-copy-native-failure.json`,
+`native-population-root-verified.json`, and `file-copy-observation-failure.json`.
+
+The native decoder read each name at byte 14 instead of the documented byte 12,
+discarding single-record batches. Ten focused watcher tests passed, including
+actual root and nested file creation in an isolated ordinary temporary folder.
+The independent wire fixtures cover the flexible-array padding boundary.
+Evidence: `artifacts/tests/native-file-observation-windows.log`.
+
+A guarded published-file binding regression also passed: mismatched capture
+identity preserves the current file's bytes and leaves it unconverted.
+Evidence: `artifacts/tests/published-file-guard-windows.log`.
+
+The provider library gate passed all 100 tests, including startup discovery of
+an existing local file, atomic observation/outbox rollback, and quiet-HEAD
+observation without falsely advancing Applied or Published.
+Evidence: `artifacts/tests/file-sync-recovery-provider.log`.
+
+The committed-payload resume regression passed against an isolated local HTTP
+fixture: a durable CAS checkpoint binds the exact payload without rereading or
+reingesting the staged source, and a different target is rejected.
+Evidence: `artifacts/tests/committed-payload-resume.log`.
+
+The real workspace prefix exposed a second upload defect: binding succeeded,
+but `BoundObject::payload_ref` parsed the full bucket key as a relative payload
+key. The regression reproduced `InvalidResponse`, then passed with exact
+prefix stripping and sibling-prefix rejection.
+Evidence: `artifacts/tests/prefixed-payload-reference-before.log` and
+`prefixed-payload-reference-after.log`.
+
+Passed: the original 78-byte copied fixture recovered without rewriting after
+restart and published commit `85b7f9be-4f4c-401d-ae32-2380091c5957`.
+Observed, Published, and Applied converged with no pending, dirty, or conflicted
+files. Native Cloud Files tag `0x9000601a` and a post-publication SHA-256 check
+confirmed the local placeholder retained the source bytes. Exact-item remote
+history reports its real Create under the original root item.
+Evidence: `artifacts/acceptance/recovered-file-upload.json`,
+`published-file-native-verified.json`, and `file-copy-item-history.log`.
+
+The cleanup attempt exposed historical common-base records being combined into
+one namespace: the root item appeared under both the initial and uploaded
+commits, producing `InvalidView("duplicate item id")`. Planning now selects the
+exact Applied commit in SQL while retaining all historical records.
+The focused regression passed with distinct old, Applied, and merely Observed
+namespaces, and refuses to borrow a namespace when no Applied commit exists.
+Evidence: `artifacts/tests/applied-common-base-selection.log`.
+
+Repeated removal observations then exposed `InconsistentIntent("double delete")`.
+Two focused core regressions passed for repeated file deletion, committed
+replay, and parent/child subtree removal: one tombstone effect, preserved
+provenance, and converged replay without recreation.
+Evidence: `artifacts/tests/delete-observation-replay.log`.
+
+Passed: the recovered fixture's real Delete appears in committed history
+`93a1f43d-cd9c-470b-93c1-e4d6e4469146`; its own temporary source was removed.
+Observed, Published, and Applied converge with zero pending, dirty, or
+conflicted files. Native Windows provider status is `1`, the original root
+file ID `003D00000003D6C3` is unchanged, and actual Explorer navigation succeeds.
+No user file, registration, or original workspace was removed.
+Evidence: `artifacts/acceptance/recovered-file-roundtrip.json`,
+`file-copy-item-history-after-cleanup.log`, and `file-roundtrip-root-verified.json`.
+
+A second fresh live copy reached `PayloadReady`, then exposed missing
+tombstone digests (`InvalidView("file without content binding")`). The resolver
+now retains deleted files' bindings and caches by immutable version rather
+than item. Its focused regression passed for tombstones and distinct revisions.
+Evidence: `artifacts/tests/tombstone-version-digests.log`.
+
+Passed: that fresh 78-byte fixture completed upload
+`9ec29ecc-107f-469a-a358-d6a4d93d53c5` and synced deletion
+`963053c8-405f-4c2c-8709-9ccd1f45e525`. Post-publication native placeholder
+and SHA-256 checks passed; exact-item remote history contains Create and Delete.
+All three cursors agree with zero pending, dirty, or conflicted files.
+The original native root identity and actual Explorer access remain intact;
+both test fixtures and their temporary sources were removed, not user files.
+Evidence: `artifacts/acceptance/file-copy-roundtrip.json`,
+`fresh-published-file-native-verified.json`, `fresh-file-item-history.log`, and
+`final-file-sync-root-verified.json`. The three temporary native QA scripts
+were removed after verification.

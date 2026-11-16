@@ -1,9 +1,11 @@
 using System.ComponentModel;
 using HfDrive.Desktop.ViewModels;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Navigation;
 using Windows.Storage.Pickers;
+using Windows.UI.ViewManagement;
 
 namespace HfDrive.Desktop;
 
@@ -18,10 +20,16 @@ namespace HfDrive.Desktop;
 public sealed partial class SetupPage : Page
 {
     private string? _suggestedRootPath;
+    private string? _suggestedBucketName;
+    private readonly UISettings _animationSettings = new();
+    private AppWindow? _appWindow;
+    private bool _celebrationPlaying;
 
     public SetupPage()
     {
         InitializeComponent();
+        Loaded += OnPageLoaded;
+        Unloaded += OnPageUnloaded;
     }
 
     public SetupViewModel ViewModel { get; private set; } = null!;
@@ -44,6 +52,8 @@ public sealed partial class SetupPage : Page
         ClearCredentialFields();
         if (ViewModel is not null)
             ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        SetupCelebrationSource.Stop();
+        _celebrationPlaying = false;
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -61,12 +71,55 @@ public sealed partial class SetupPage : Page
                     ClearCredentialFields();
                 break;
         }
+        UpdateCompletionAnimation();
+    }
+
+    private void OnPageLoaded(object sender, RoutedEventArgs args)
+    {
+        _appWindow = ((App)Application.Current).DesktopWindow?.AppWindow;
+        if (_appWindow is not null) _appWindow.Changed += OnAppWindowChanged;
+        _animationSettings.AnimationsEnabledChanged += OnAnimationsEnabledChanged;
+        UpdateCompletionAnimation();
+    }
+
+    private void OnPageUnloaded(object sender, RoutedEventArgs args)
+    {
+        if (_appWindow is not null) _appWindow.Changed -= OnAppWindowChanged;
+        _appWindow = null;
+        _animationSettings.AnimationsEnabledChanged -= OnAnimationsEnabledChanged;
+        SetupCelebrationSource.Stop();
+        _celebrationPlaying = false;
+    }
+
+    private void OnAppWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
+    {
+        if (args.DidVisibilityChange) UpdateCompletionAnimation();
+    }
+
+    private void OnAnimationsEnabledChanged(UISettings sender, object args) =>
+        DispatcherQueue.TryEnqueue(UpdateCompletionAnimation);
+
+    private void OnSetupCelebrationOpened(object sender, RoutedEventArgs args)
+    {
+        _celebrationPlaying = false;
+        UpdateCompletionAnimation();
+    }
+
+    private void UpdateCompletionAnimation()
+    {
+        bool ready = ViewModel?.IsSetupWorking == true;
+        SetupCelebration.Visibility = ready ? Visibility.Visible : Visibility.Collapsed;
+        bool play = ready && IsLoaded && _appWindow?.IsVisible == true && _animationSettings.AnimationsEnabled;
+        if (play == _celebrationPlaying) return;
+        _celebrationPlaying = play;
+        if (play) SetupCelebrationSource.Play();
+        else SetupCelebrationSource.Stop();
     }
 
     /// <summary>
-    /// Suggests %USERPROFILE%\HF Drive\&lt;bucket&gt; for the local root. The
-    /// suggestion never overwrites an entered path; if the user has not edited
-    /// the previous suggestion, it follows a changed bucket selection.
+    /// Suggests an unused %USERPROFILE%\HF Drive\&lt;bucket&gt; folder.
+    /// Keeps entered paths and the same bucket's previous suggestion, including
+    /// after setup creates that folder; only a changed bucket gets a new default.
     /// </summary>
     private void ApplySuggestedRootPath()
     {
@@ -81,12 +134,23 @@ public sealed partial class SetupPage : Page
         string? bucketName = ViewModel.SelectedBucket?.Name;
         if (string.IsNullOrWhiteSpace(bucketName))
             return;
+        if (current == _suggestedRootPath && bucketName == _suggestedBucketName)
+            return;
 
         string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string safeName = MakePathSafe(bucketName);
-        string suggestion = Path.Combine(userProfile, "HF Drive", safeName);
+        string suggestion = SuggestAvailableRootPath(Path.Combine(userProfile, "HF Drive", safeName));
         _suggestedRootPath = suggestion;
+        _suggestedBucketName = bucketName;
         ViewModel.RootPathText = suggestion;
+    }
+
+    private static string SuggestAvailableRootPath(string basePath)
+    {
+        string suggestion = basePath;
+        for (int suffix = 2; Path.Exists(suggestion); suffix++)
+            suggestion = $"{basePath} ({suffix})";
+        return suggestion;
     }
 
     private static string MakePathSafe(string name)

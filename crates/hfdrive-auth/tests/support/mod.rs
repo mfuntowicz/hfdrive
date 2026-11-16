@@ -324,12 +324,9 @@ async fn handle(
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or("").to_owned();
     let target = parts.next().unwrap_or("").to_owned();
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_owned(), q.to_owned()),
-        None => (target, String::new()),
-    };
+    let path = target.split_once('?').map_or(target.as_str(), |(path, _)| path);
 
-    let response_body = match (method.as_str(), path.as_str()) {
+    let response_body = match (method.as_str(), path) {
         ("GET", "/.well-known/openid-configuration") => {
             let device_endpoint = format!("{}/device", issuer);
             json!({

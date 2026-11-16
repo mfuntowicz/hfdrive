@@ -31,7 +31,8 @@ use windows::Win32::Storage::CloudFilters::{
     CF_HYDRATE_FLAG_NONE, CF_IN_SYNC_STATE_IN_SYNC, CF_OPEN_FILE_FLAG_EXCLUSIVE,
     CF_OPEN_FILE_FLAG_FOREGROUND, CF_OPEN_FILE_FLAG_WRITE_ACCESS, CF_OPERATION_ACK_DELETE_FLAG_NONE,
     CF_OPERATION_ACK_RENAME_FLAG_NONE, CF_OPERATION_INFO, CF_OPERATION_PARAMETERS,
-    CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+    CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+    CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
     CF_OPERATION_TYPE, CF_OPERATION_TYPE_ACK_DELETE, CF_OPERATION_TYPE_ACK_RENAME,
     CF_OPERATION_TYPE_TRANSFER_DATA, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
     CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAGS, CF_PLACEHOLDER_CREATE_INFO,
@@ -75,15 +76,20 @@ static CALLBACK_CONTEXTS: LazyLock<Mutex<HashMap<usize, Arc<CallbackContext>>>> 
 /// until a successful disconnect; in-flight callbacks own additional `Arc`s.
 pub(crate) struct CallbackContext {
     workspace: WorkspaceId,
+    /// The sync root's volume-relative prefix, captured once at connect;
+    /// every callback path (absolute from the volume root) is converted
+    /// against it before it becomes a typed event.
+    root: RootPrefix,
     sink: Box<dyn EventSink>,
     inflight: AtomicUsize,
     closed: AtomicBool,
 }
 
 impl CallbackContext {
-    fn new(workspace: WorkspaceId, sink: Box<dyn EventSink>) -> Arc<Self> {
+    fn new(workspace: WorkspaceId, root: RootPrefix, sink: Box<dyn EventSink>) -> Arc<Self> {
         Arc::new(CallbackContext {
             workspace,
+            root,
             sink,
             inflight: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -92,6 +98,18 @@ impl CallbackContext {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The callback path as its sync-root-relative event spelling (`""` is
+    /// the sync root directory itself), or `None` when the path is not under
+    /// this root or is not a well-formed absolute path. Foreign and
+    /// malformed spellings are never reinterpreted as root-relative.
+    fn owned_path(&self, path: windows::core::PCWSTR) -> Option<String> {
+        if path.is_null() {
+            return None;
+        }
+        // SAFETY: the OS-provided path is valid for the callback.
+        owned_relative(&self.root, unsafe { path.as_wide() })
     }
 }
 
@@ -331,6 +349,7 @@ fn handle_fetch_placeholders(
             TransferStatus::Failed(FetchFailure::ProviderStopping),
             0,
             &[],
+            false,
         );
         return;
     }
@@ -338,9 +357,25 @@ fn handle_fetch_placeholders(
         // SAFETY: the OS-provided pattern string is valid for the callback.
         .then(|| unsafe { fetch.Pattern.to_string().ok() })
         .flatten();
+    let normalized_path = match ctx.owned_path(info.NormalizedPath) {
+        Some(path) => path,
+        None => {
+            // The subject is not under this sync root (or is malformed):
+            // fail the population request truthfully instead of resolving a
+            // foreign spelling as a root-relative path.
+            let _ = transfer_placeholders(
+                ack,
+                TransferStatus::Failed(FetchFailure::InvalidRequest),
+                0,
+                &[],
+                false,
+            );
+            return;
+        }
+    };
     ctx.sink.on_fetch_placeholders(PlaceholdersRequest {
         ack,
-        normalized_path: normalized_path(info),
+        normalized_path,
         pattern,
     });
 }
@@ -368,27 +403,41 @@ fn handle_notify_rename(
     let ack = ack_token(info);
     // SAFETY: `Rename` is the active union member here.
     let rename = unsafe { params.Anonymous.Rename };
-    let notification = RenameNotification {
-        ack,
-        normalized_path: normalized_path(info),
-        target_path: (!rename.TargetPath.is_null())
-            // SAFETY: the OS-provided target path is valid for the callback.
-            .then(|| unsafe { rename.TargetPath.to_string().unwrap_or_default() })
-            .unwrap_or_default(),
-        is_directory: rename
-            .Flags
-            .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY),
-        source_in_scope: rename
-            .Flags
-            .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE),
-        target_in_scope: rename
-            .Flags
-            .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE),
-    };
     if ctx.is_closed() {
         let _ = ack_rename(ack, TransferStatus::Failed(FetchFailure::ProviderStopping));
         return;
     }
+    let source_in_scope = rename
+        .Flags
+        .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE);
+    let target_in_scope = rename
+        .Flags
+        .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE);
+    let spellings = rename_spellings(
+        ctx.owned_path(info.NormalizedPath),
+        os_path_string(info.NormalizedPath),
+        source_in_scope,
+        ctx.owned_path(rename.TargetPath),
+        os_path_string(rename.TargetPath),
+        target_in_scope,
+    );
+    let Some((normalized_path, target_path)) = spellings else {
+        // A side the OS reports in scope is not under this root (or has no
+        // usable spelling): veto the rename instead of reinterpreting or
+        // truncating a foreign path.
+        let _ = ack_rename(ack, TransferStatus::Failed(FetchFailure::InvalidRequest));
+        return;
+    };
+    let notification = RenameNotification {
+        ack,
+        normalized_path,
+        target_path,
+        is_directory: rename
+            .Flags
+            .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY),
+        source_in_scope,
+        target_in_scope,
+    };
     ctx.sink.on_rename(notification);
 }
 
@@ -403,10 +452,11 @@ fn handle_notify_rename_completion(
         return;
     }
     ctx.sink.on_rename_completion(RenameCompletion {
-        source_path: (!completion.SourcePath.is_null())
-            // SAFETY: the OS-provided source path is valid for the callback.
-            .then(|| unsafe { completion.SourcePath.to_string().unwrap_or_default() })
-            .unwrap_or_default(),
+        // Post-facto outcome: an in-root source becomes sync-root-relative,
+        // a source that moved in from outside keeps its OS spelling.
+        source_path: ctx
+            .owned_path(completion.SourcePath)
+            .unwrap_or_else(|| os_path_string(completion.SourcePath)),
     });
 }
 
@@ -418,9 +468,22 @@ fn handle_notify_delete(
     let ack = ack_token(info);
     // SAFETY: `Delete` is the active union member here.
     let delete = unsafe { params.Anonymous.Delete };
+    if ctx.is_closed() {
+        let _ = ack_delete(ack, TransferStatus::Failed(FetchFailure::ProviderStopping));
+        return;
+    }
+    let normalized_path = match ctx.owned_path(info.NormalizedPath) {
+        Some(path) => path,
+        None => {
+            // Not under this sync root (or malformed): veto instead of
+            // acknowledging a deletion that cannot be observed.
+            let _ = ack_delete(ack, TransferStatus::Failed(FetchFailure::InvalidRequest));
+            return;
+        }
+    };
     let notification = DeleteNotification {
         ack,
-        normalized_path: normalized_path(info),
+        normalized_path,
         is_directory: delete
             .Flags
             .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY),
@@ -428,10 +491,6 @@ fn handle_notify_delete(
             .Flags
             .contains(windows::Win32::Storage::CloudFilters::CF_CALLBACK_DELETE_FLAG_IS_UNDELETE),
     };
-    if ctx.is_closed() {
-        let _ = ack_delete(ack, TransferStatus::Failed(FetchFailure::ProviderStopping));
-        return;
-    }
     ctx.sink.on_delete(notification);
 }
 
@@ -477,11 +536,409 @@ fn copy_identity(info: &CF_CALLBACK_INFO) -> Vec<u8> {
     }
 }
 
-fn normalized_path(info: &CF_CALLBACK_INFO) -> String {
-    (!info.NormalizedPath.is_null())
-        // SAFETY: the OS-provided normalized path is valid for the callback.
-        .then(|| unsafe { info.NormalizedPath.to_string().unwrap_or_default() })
+/// The OS's raw spelling of a callback path, kept unchanged for sides that
+/// live outside the sync root; empty when the pointer is null or the text is
+/// not valid UTF-16.
+fn os_path_string(path: windows::core::PCWSTR) -> String {
+    (!path.is_null())
+        // SAFETY: the OS-provided path is valid for the callback.
+        .then(|| unsafe { path.to_string().ok() })
+        .flatten()
         .unwrap_or_default()
+}
+
+/// Decide a rename notification's event spellings from the converted paths:
+/// owned sides become sync-root-relative (`""` is the sync root itself),
+/// outside sides keep the OS spelling so moves into/out of the root stay
+/// meaningful. `None` vetoes the notification — a side the OS reports in
+/// scope must actually be owned by this root and is never reinterpreted.
+fn rename_spellings(
+    source_owned: Option<String>,
+    source_raw: String,
+    source_in_scope: bool,
+    target_owned: Option<String>,
+    target_raw: String,
+    target_in_scope: bool,
+) -> Option<(String, String)> {
+    if (source_in_scope && source_owned.is_none()) || (target_in_scope && target_owned.is_none()) {
+        return None;
+    }
+    Some((
+        source_owned.unwrap_or(source_raw),
+        target_owned.unwrap_or(target_raw),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Sync-root-relative callback paths
+// ---------------------------------------------------------------------------
+//
+// `CF_CALLBACK_INFO.NormalizedPath` is the callback subject's ABSOLUTE path
+// on its volume ("It starts from the root directory of the volume") — never
+// sync-root relative. Every in-scope path crossing into the typed events is
+// converted here against the root prefix captured at connect: the sync root
+// directory itself becomes the empty spelling, descendants keep their
+// spelling below the root. Matching is per path component with
+// case-insensitive component boundaries — never a string-prefix strip — so a
+// sibling like `drive-dev2` can never borrow `drive-dev`'s root. Traversal
+// (`.`/`..`), empty and otherwise malformed components are never resolved or
+// reinterpreted (a mount point/junction subject arrives already resolved by
+// the OS to its real location and simply fails the match if it is foreign).
+
+/// The separator the OS uses inside normalized callback paths.
+const PATH_SEPARATOR: u16 = b'\\' as u16;
+
+/// How a path spelling names its volume. Same-shape designators are compared
+/// case-insensitively; different namespaces (drive letter vs NT device name
+/// vs volume GUID) are not comparable as strings and defer to the OS
+/// connection binding, while an unmarked (`\...`) spelling carries none.
+#[derive(Clone, Copy)]
+enum VolumeDesignator<'a> {
+    Unmarked,
+    /// Drive designator (`C:`, also inside `\\?\C:\...`).
+    Dos(&'a [u16]),
+    /// `Volume{GUID}` designator (inside `\\?\Volume{...}`).
+    VolumeGuid(&'a [u16]),
+    /// NT device designator (`\Device\HarddiskVolumeN`).
+    Device(&'a [u16]),
+}
+
+impl<'a> VolumeDesignator<'a> {
+    /// `other` borrows an independent spelling, so it never shares `'a`;
+    /// the explicit variant paths keep the two borrows decoupled.
+    fn compatible<'b>(self, other: VolumeDesignator<'b>) -> bool {
+        match (self, other) {
+            (Self::Unmarked, _) | (_, VolumeDesignator::Unmarked) => true,
+            (Self::Dos(a), VolumeDesignator::Dos(b))
+            | (Self::VolumeGuid(a), VolumeDesignator::VolumeGuid(b))
+            | (Self::Device(a), VolumeDesignator::Device(b)) => {
+                super::nls::equal_ordinal_ignore_case(a, b)
+            }
+            _ => true,
+        }
+    }
+
+    fn kind(self) -> DesignatorKind {
+        match self {
+            Self::Unmarked => DesignatorKind::Unmarked,
+            Self::Dos(_) => DesignatorKind::Dos,
+            Self::VolumeGuid(_) => DesignatorKind::VolumeGuid,
+            Self::Device(_) => DesignatorKind::Device,
+        }
+    }
+
+    fn span(self) -> &'a [u16] {
+        match self {
+            Self::Unmarked => &[],
+            Self::Dos(span) | Self::VolumeGuid(span) | Self::Device(span) => span,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DesignatorKind {
+    Unmarked,
+    Dos,
+    VolumeGuid,
+    Device,
+}
+
+/// The connected sync root's volume-relative prefix, parsed once from the
+/// validated absolute root and reused (borrowed) by every callback.
+struct RootPrefix {
+    kind: DesignatorKind,
+    designator: Vec<u16>,
+    /// Volume-root-relative components, wide and NUL-free.
+    segments: Vec<Vec<u16>>,
+}
+
+impl RootPrefix {
+    /// Parse a validated absolute local root (`C:\a\b`, `\\?\C:\a\b`, ...)
+    /// into its volume-relative segments. `None` means unparseable; such a
+    /// root must never connect, because its paths could only be fabricated.
+    fn parse(path: &Path) -> Option<RootPrefix> {
+        let wide = wide(path);
+        let spelling = wide.strip_suffix(&[0]).unwrap_or(&wide);
+        for candidate in candidate_starts(spelling) {
+            let Some((designator, start)) = candidate else {
+                continue;
+            };
+            if let Some(segments) = validate_segments(spelling, start) {
+                return Some(RootPrefix {
+                    kind: designator.kind(),
+                    designator: designator.span().to_vec(),
+                    segments: segments.iter().map(|segment| segment.to_vec()).collect(),
+                });
+            }
+        }
+        None
+    }
+
+    fn designator(&self) -> VolumeDesignator<'_> {
+        match self.kind {
+            DesignatorKind::Unmarked => VolumeDesignator::Unmarked,
+            DesignatorKind::Dos => VolumeDesignator::Dos(&self.designator),
+            DesignatorKind::VolumeGuid => VolumeDesignator::VolumeGuid(&self.designator),
+            DesignatorKind::Device => VolumeDesignator::Device(&self.designator),
+        }
+    }
+}
+
+/// Convert one OS callback path to its sync-root-relative event spelling:
+/// `""` for the sync root directory itself, the child spelling below it, and
+/// `None` for anything outside this root or not a well-formed absolute path
+/// (never reinterpreted, never the root).
+fn owned_relative(root: &RootPrefix, path: &[u16]) -> Option<String> {
+    for candidate in candidate_starts(path) {
+        let Some((designator, start)) = candidate else {
+            continue;
+        };
+        if !root.designator().compatible(designator) {
+            continue;
+        }
+        if let Some((rel_start, rel_end)) = match_candidate(root, path, start) {
+            if let Ok(relative) = String::from_utf16(&path[rel_start..rel_end]) {
+                return Some(relative);
+            }
+            // Not valid UTF-16: this spelling is unusable; try the next
+            // interpretation instead of fabricating replacement text.
+        }
+    }
+    None
+}
+
+/// The interpretation candidates for one absolute path spelling, in
+/// preference order: extended device namespace + designator, drive
+/// designator, NT `\Device\HarddiskVolumeN` designator, then bare
+/// volume-root relative. Each yields where the volume-relative segments
+/// begin together with the designator it stripped.
+fn candidate_starts(path: &[u16]) -> [Option<(VolumeDesignator<'_>, usize)>; 4] {
+    [
+        extended_designator(path),
+        drive_designator(path),
+        device_designator(path),
+        bare_volume_relative(path),
+    ]
+}
+
+/// `\\?\`, `\\.\` or `\??\` namespace prefix length.
+fn extended_namespace(path: &[u16]) -> Option<usize> {
+    const FORMS: [[u16; 4]; 3] = [
+        [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16],
+        [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16],
+        [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16],
+    ];
+    (path.len() >= 4 && FORMS.iter().any(|form| &path[..4] == &form[..])).then_some(4)
+}
+
+/// The region right after one volume designator (its end and the path end).
+fn designator_start(path: &[u16], end: usize) -> Option<usize> {
+    if end == path.len() {
+        // `\\?\C:` / `\\?\Volume{...}` name the volume root absolutely.
+        Some(end)
+    } else if path[end] == PATH_SEPARATOR {
+        Some(end + 1)
+    } else {
+        None
+    }
+}
+
+fn extended_designator(path: &[u16]) -> Option<(VolumeDesignator<'_>, usize)> {
+    let after_namespace = extended_namespace(path)?;
+    let end = path[after_namespace..]
+        .iter()
+        .position(|&unit| unit == PATH_SEPARATOR)
+        .map(|position| after_namespace + position)
+        .unwrap_or(path.len());
+    let designator = classify_designator(&path[after_namespace..end])?;
+    Some((designator, designator_start(path, end)?))
+}
+
+/// ASCII letter in a wide path component (`u16` carries no `is_ascii_*`
+/// predicates; ranges are spelled directly).
+fn is_ascii_letter(unit: u16) -> bool {
+    matches!(unit, 0x41..=0x5A | 0x61..=0x7A)
+}
+
+fn is_ascii_digit(unit: u16) -> bool {
+    matches!(unit, 0x30..=0x39)
+}
+
+fn drive_designator(path: &[u16]) -> Option<(VolumeDesignator<'_>, usize)> {
+    // `X:\...`: a bare `X:` is drive-relative (the drive's current
+    // directory), not an absolute volume path, so it is never accepted here;
+    // the extended `\\?\X:` form is absolute and handled above.
+    if path.len() < 3
+        || !is_ascii_letter(path[0])
+        || path[1] != b':' as u16
+        || path[2] != PATH_SEPARATOR
+    {
+        return None;
+    }
+    Some((VolumeDesignator::Dos(&path[0..2]), 3))
+}
+
+fn device_designator(path: &[u16]) -> Option<(VolumeDesignator<'_>, usize)> {
+    const PREFIX: [u16; 8] = [
+        b'\\' as u16,
+        b'D' as u16,
+        b'e' as u16,
+        b'v' as u16,
+        b'i' as u16,
+        b'c' as u16,
+        b'e' as u16,
+        b'\\' as u16,
+    ];
+    if path.len() < PREFIX.len()
+        || !super::nls::equal_ordinal_ignore_case(&path[..PREFIX.len()], &PREFIX)
+    {
+        return None;
+    }
+    let end = path[PREFIX.len()..]
+        .iter()
+        .position(|&unit| unit == PATH_SEPARATOR)
+        .map(|position| PREFIX.len() + position)
+        .unwrap_or(path.len());
+    let volume = &path[PREFIX.len()..end];
+    if !is_harddisk_volume(volume) {
+        return None;
+    }
+    Some((VolumeDesignator::Device(volume), designator_start(path, end)?))
+}
+
+fn bare_volume_relative(path: &[u16]) -> Option<(VolumeDesignator<'_>, usize)> {
+    (path.first() == Some(&PATH_SEPARATOR)).then_some((VolumeDesignator::Unmarked, 1))
+}
+
+fn classify_designator(span: &[u16]) -> Option<VolumeDesignator<'_>> {
+    if span.len() == 2 && is_ascii_letter(span[0]) && span[1] == b':' as u16 {
+        return Some(VolumeDesignator::Dos(span));
+    }
+    const VOLUME: [u16; 7] = [
+        b'V' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'u' as u16,
+        b'm' as u16,
+        b'e' as u16,
+        b'{' as u16,
+    ];
+    if span.len() > VOLUME.len() + 1
+        && super::nls::equal_ordinal_ignore_case(&span[..VOLUME.len()], &VOLUME)
+        && span.last() == Some(&(b'}' as u16))
+    {
+        return Some(VolumeDesignator::VolumeGuid(span));
+    }
+    None
+}
+
+fn is_harddisk_volume(span: &[u16]) -> bool {
+    const VOLUME: [u16; 14] = [
+        b'H' as u16,
+        b'a' as u16,
+        b'r' as u16,
+        b'd' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b's' as u16,
+        b'k' as u16,
+        b'V' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'u' as u16,
+        b'm' as u16,
+        b'e' as u16,
+    ];
+    span.len() > VOLUME.len()
+        && super::nls::equal_ordinal_ignore_case(&span[..VOLUME.len()], &VOLUME)
+        && span[VOLUME.len()..].iter().all(|&unit| is_ascii_digit(unit))
+}
+
+/// A component is a real name: non-empty, not `.`/`..`, and free of the
+/// separators/ADS/NUL that cannot occur in an owned namespace spelling.
+fn valid_segment(segment: &[u16]) -> bool {
+    const DOT: &[u16] = &[b'.' as u16];
+    const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
+    !segment.is_empty()
+        && segment != DOT
+        && segment != DOTDOT
+        && !segment
+            .iter()
+            .any(|&unit| unit == 0 || unit == b'/' as u16 || unit == b':' as u16)
+}
+
+/// Component spans of the volume-relative region, or `None` when it is
+/// malformed (empty components, traversal). One optional trailing separator
+/// terminates the last component and changes nothing.
+fn validate_segments(path: &[u16], start: usize) -> Option<Vec<&[u16]>> {
+    let mut segments = Vec::new();
+    let mut at = start;
+    while at < path.len() {
+        if path[at] == PATH_SEPARATOR {
+            return None;
+        }
+        let end = path[at..]
+            .iter()
+            .position(|&unit| unit == PATH_SEPARATOR)
+            .map(|position| at + position)
+            .unwrap_or(path.len());
+        if !valid_segment(&path[at..end]) {
+            return None;
+        }
+        segments.push(&path[at..end]);
+        at = end;
+        if at < path.len() {
+            at += 1; // the component's terminating separator
+        }
+    }
+    Some(segments)
+}
+
+/// Match one interpretation's segments against the root prefix. Returns the
+/// span of the sync-root-relative remainder (empty span = the root itself).
+/// `None` = shorter than the root, a case-insensitive component mismatch or
+/// a malformed component — never the root.
+fn match_candidate(root: &RootPrefix, path: &[u16], start: usize) -> Option<(usize, usize)> {
+    let mut at = start;
+    let mut matched = 0;
+    let mut rel_start = start;
+    while at < path.len() {
+        if path[at] == PATH_SEPARATOR {
+            return None;
+        }
+        let end = path[at..]
+            .iter()
+            .position(|&unit| unit == PATH_SEPARATOR)
+            .map(|position| at + position)
+            .unwrap_or(path.len());
+        if !valid_segment(&path[at..end]) {
+            return None;
+        }
+        if matched < root.segments.len() {
+            if !super::nls::equal_ordinal_ignore_case(&path[at..end], &root.segments[matched]) {
+                return None;
+            }
+            matched += 1;
+            if matched == root.segments.len() {
+                // The remainder starts after the separator following the
+                // last root component — never mid-component.
+                rel_start = if end < path.len() { end + 1 } else { end };
+            }
+        }
+        at = end;
+        if at < path.len() {
+            at += 1;
+        }
+    }
+    if matched < root.segments.len() {
+        return None;
+    }
+    let rel_end = if path.last() == Some(&PATH_SEPARATOR) {
+        path.len() - 1
+    } else {
+        path.len()
+    };
+    Some((rel_start, rel_end.max(rel_start)))
 }
 
 fn checked_range(
@@ -520,8 +977,15 @@ pub(crate) fn connect(
     workspace: WorkspaceId,
     sink: Box<dyn EventSink>,
 ) -> Result<Connected, u32> {
+    // Capture the root's volume-relative prefix once: every callback path is
+    // absolute from the volume root and is converted against it at this
+    // boundary. A root that cannot be parsed never connects — its callback
+    // paths could only be fabricated, never converted.
+    let Some(root_prefix) = RootPrefix::parse(root) else {
+        return Err(windows::Win32::Foundation::ERROR_INVALID_NAME.0);
+    };
     let w = wide(root);
-    let context = CallbackContext::new(workspace, sink);
+    let context = CallbackContext::new(workspace, root_prefix, sink);
     let context_key = Arc::as_ptr(&context) as usize;
     CALLBACK_CONTEXTS
         .lock()
@@ -660,13 +1124,25 @@ pub(crate) struct EntryResult {
     pub create_usn: i64,
 }
 
-/// Complete one `FETCH_PLACEHOLDERS` request with a batch of entries and
-/// return every per-entry result.
+/// `E_FAIL` for an entry the OS did not process: reported as a failure, never
+/// as a fabricated success.
+const UNPROCESSED_ENTRY_HRESULT: i32 = 0x8000_4005u32 as i32;
+
+/// Transfer a bounded batch for one `FETCH_PLACEHOLDERS` request.
+///
+/// `total_count` covers the whole request; `EntriesProcessed` is per call.
+/// Only the terminal call may mark a complete authoritative listing populated,
+/// after every prior entry was processed and left present. Windows otherwise
+/// repeats on-demand population, including for empty directories.
+///
+/// Contract: https://learn.microsoft.com/windows/win32/api/cfapi/ne-cfapi-cf_operation_transfer_placeholders_flags
+/// Every per-entry result is returned; unprocessed entries remain failures.
 pub(crate) fn transfer_placeholders(
     ack: AckToken,
     status: TransferStatus,
     total_count: i64,
     entries: &[PendingCreate],
+    mark_populated: bool,
 ) -> Result<Vec<EntryResult>, u32> {
     let mut wide_names: Vec<Vec<u16>> = entries.iter().map(|e| e.name.clone()).collect();
     let identities: Vec<Vec<u8>> = entries.iter().map(|e| e.identity.clone()).collect();
@@ -678,26 +1154,107 @@ pub(crate) fn transfer_placeholders(
     let mut parameters = default_operation_parameters();
     parameters.ParamSize = operation_param_size::<windows::Win32::Storage::CloudFilters::CF_OPERATION_PARAMETERS_0_4>();
     // Writing the active union member is safe; the name/identity arrays stay
-    // alive until `execute` returns.
+    // alive until `execute` returns. `PlaceholderArray` is NULL for an empty
+    // batch (a dangling non-null pointer is not a valid buffer) and
+    // `EntriesProcessed` is an `CfExecute` OUTPUT: it starts at 0 and is
+    // filled by the OS.
     parameters.Anonymous.TransferPlaceholders =
         windows::Win32::Storage::CloudFilters::CF_OPERATION_PARAMETERS_0_4 {
-            Flags: CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+            Flags: if mark_populated {
+                CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
+            } else {
+                CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE
+            },
             CompletionStatus: ntstatus(status),
             PlaceholderTotalCount: total_count,
-            PlaceholderArray: array.as_mut_ptr(),
+            PlaceholderArray: if array.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                array.as_mut_ptr()
+            },
             PlaceholderCount: array.len() as u32,
-            EntriesProcessed: array.len() as u32,
+            EntriesProcessed: 0,
         };
     execute(ack, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS, &mut parameters)?;
-    Ok(entry_results(&array))
+    // SAFETY: reading the output member back after `CfExecute` returned.
+    let processed = unsafe { parameters.Anonymous.TransferPlaceholders.EntriesProcessed };
+    Ok(entry_results(&array, processed))
 }
 
-fn entry_results(array: &[CF_PLACEHOLDER_CREATE_INFO]) -> Vec<EntryResult> {
+/// The completion calls of one `FETCH_PLACEHOLDERS` request: bounded data
+/// calls (every planned entry lands in exactly one of them — a directory
+/// larger than [`POPULATION_BATCH_MAX`] completes across several calls of the
+/// same request, never truncated) followed by the request's **terminal**
+/// call, the always-empty last range. A genuinely empty directory therefore
+/// completes with exactly one empty call. Every call reports the same true
+/// `PlaceholderTotalCount`; only the terminal call may carry the
+/// fully-populated mark, decided from the observed per-entry outcomes by
+/// [`directory_populated_mark`].
+pub(crate) fn population_calls(
+    entry_count: usize,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..entry_count)
+        .step_by(POPULATION_BATCH_MAX)
+        .map(move |start| start..entry_count.min(start + POPULATION_BATCH_MAX))
+        .chain(std::iter::once(entry_count..entry_count))
+}
+
+/// Entries per `TRANSFER_PLACEHOLDERS` data call: the same bound as
+/// `CfCreatePlaceholders` batches, so one call stays bounded no matter how
+/// large the directory is.
+pub(crate) const POPULATION_BATCH_MAX: usize = 1000;
+
+/// Per-entry failure codes that still mean the name is **present** in the
+/// directory: `HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)`,
+/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` and
+/// `STATUS_OBJECT_NAME_COLLISION`. The platform leaves an occupied name
+/// untouched (never overwritten) and the provider reconciles that local
+/// file/placeholder separately.
+const ENTRY_OCCUPIED_HRESULTS: [i32; 3] = [
+    0x8007_0050u32 as i32,
+    0x8007_00B7u32 as i32,
+    0xC000_0035u32 as i32,
+];
+
+/// True when one entry's outcome means its name is present in the directory:
+/// freshly created (success, including the `STATUS_OBJECT_NAME_EXISTS`
+/// success warning) or already occupied by an untouched local entry. Anything
+/// else — including [`UNPROCESSED_ENTRY_HRESULT`] for entries the OS never
+/// processed — means the name is missing.
+pub(crate) fn entry_present(result: i32) -> bool {
+    result >= 0 || ENTRY_OCCUPIED_HRESULTS.contains(&result)
+}
+
+/// Decide the request's fully-populated mark: only a **complete
+/// authoritative** delivery (`complete_directory`) that left **every** entry
+/// present. The empty-directory case falls out naturally: zero entries are
+/// all present, so a genuinely empty directory is marked complete, while an
+/// empty *subset* delivery (`complete_directory == false`, e.g. children that
+/// cannot become placeholders) is not. A missing name must never be declared
+/// part of a full listing — that is what leaves it unresolvable — and an
+/// honestly partial delivery stays unmarked so the platform may re-fetch.
+pub(crate) fn directory_populated_mark(complete_directory: bool, results: &[EntryResult]) -> bool {
+    complete_directory && results.iter().all(|result| entry_present(result.result))
+}
+
+/// Per-entry outcomes of a create/transfer batch. `processed` is the count
+/// the OS actually processed (its output); entries past it never became
+/// placeholders and are reported as failures instead of fabricated successes
+/// left over from the pre-call initialization.
+fn entry_results(array: &[CF_PLACEHOLDER_CREATE_INFO], processed: u32) -> Vec<EntryResult> {
     array
         .iter()
-        .map(|e| EntryResult {
-            result: e.Result.0,
-            create_usn: e.CreateUsn,
+        .enumerate()
+        .map(|(i, entry)| {
+            let handled = (i as u32) < processed;
+            EntryResult {
+                result: if handled {
+                    entry.Result.0
+                } else {
+                    UNPROCESSED_ENTRY_HRESULT
+                },
+                create_usn: if handled { entry.CreateUsn } else { 0 },
+            }
         })
         .collect()
 }
@@ -854,6 +1411,7 @@ pub(crate) fn create_placeholders(
     let mut processed = 0u32;
     // SAFETY: `w` and the arrays are valid for the call; every entry's
     // `Result` is inspected afterwards regardless of the batch HRESULT.
+    // `processed` is the API's output count of handled entries.
     unsafe {
         CfCreatePlaceholders(
             windows::core::PCWSTR(w.as_ptr()),
@@ -863,18 +1421,19 @@ pub(crate) fn create_placeholders(
         )
         .map_err(|e| super::error_code(&e))?;
     }
-    Ok(entry_results(&array))
+    Ok(entry_results(&array, processed))
 }
 
-/// Update a placeholder to a new immutable version: new metadata, new
-/// identity and invalidated old ranges, with `VERIFY_IN_SYNC | MARK_IN_SYNC`.
-/// Returns the USN the update landed at. The safe layer has already verified
-/// the expected USN/generation and drained old-version requests.
+/// Update placeholder identity and optional metadata/ranges atomically against
+/// the caller's expected USN. Remote replacement verifies in-sync state;
+/// publication of captured local bytes marks in-sync without invalidating data.
 pub(crate) fn update_placeholder(
     handle: &OwnedHandle,
-    metadata: &MetadataBytes,
+    metadata: Option<&MetadataBytes>,
     identity: &[u8],
     invalidate: &[(i64, i64)],
+    expected_usn: i64,
+    verify_in_sync: bool,
 ) -> Result<i64, u32> {
     let ranges: Vec<CF_FILE_RANGE> = invalidate
         .iter()
@@ -883,17 +1442,22 @@ pub(crate) fn update_placeholder(
             Length: length,
         })
         .collect();
-    let mut usn = 0i64;
+    let metadata = metadata.map(fs_metadata);
+    let mut usn = expected_usn;
     // SAFETY: `metadata`, `identity` and `ranges` are owned by this frame and
     // outlive the synchronous call.
     unsafe {
         CfUpdatePlaceholder(
             super::volume::as_handle(handle),
-            Some(&fs_metadata(metadata)),
+            metadata.as_ref().map(|metadata| metadata as *const CF_FS_METADATA),
             Some(identity.as_ptr() as *const c_void),
             identity.len() as u32,
-            Some(&ranges),
-            CF_UPDATE_FLAG_VERIFY_IN_SYNC | CF_UPDATE_FLAG_MARK_IN_SYNC,
+            if ranges.is_empty() { None } else { Some(ranges.as_slice()) },
+            if verify_in_sync {
+                CF_UPDATE_FLAG_VERIFY_IN_SYNC | CF_UPDATE_FLAG_MARK_IN_SYNC
+            } else {
+                CF_UPDATE_FLAG_MARK_IN_SYNC
+            },
             Some(&mut usn),
             None,
         )
@@ -1107,11 +1671,45 @@ use ProviderEvent as _EVENT_CONTRACT;
 
 #[cfg(test)]
 mod tests {
-    use super::operation_param_size;
-    use windows::Win32::Storage::CloudFilters::{
-        CF_OPERATION_PARAMETERS_0_0, CF_OPERATION_PARAMETERS_0_4,
-        CF_OPERATION_PARAMETERS_0_6, CF_OPERATION_PARAMETERS_0_7,
+    use super::{
+        entry_results, handle_fetch_placeholders, handle_notify_rename, operation_param_size,
+        owned_relative, rename_spellings, CallbackContext, EventSink, RootPrefix,
+        UNPROCESSED_ENTRY_HRESULT,
     };
+    use std::sync::{Arc, Mutex};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::CloudFilters::{
+        CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_PARAMETERS_0,
+        CF_CALLBACK_PARAMETERS_0_10, CF_CALLBACK_PARAMETERS_0_3,
+        CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY, CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE,
+        CF_OPERATION_PARAMETERS_0_0, CF_OPERATION_PARAMETERS_0_4, CF_OPERATION_PARAMETERS_0_6,
+        CF_OPERATION_PARAMETERS_0_7, CF_PLACEHOLDER_CREATE_INFO,
+    };
+    use windows::core::HRESULT;
+
+    /// The live sync root of the acceptance drive.
+    const ROOT: &str = "C:\\Users\\momo-\\HF Drive\\drive-dev";
+    /// The same directory as the OS spells it in `NormalizedPath`.
+    const ROOT_CALLBACK: &str = "\\Users\\momo-\\HF Drive\\drive-dev";
+
+    fn root(path: &str) -> RootPrefix {
+        RootPrefix::parse(std::path::Path::new(path)).expect("root parses")
+    }
+
+    /// PCWSTR-contract buffer: NUL-terminated wide spelling, exactly like
+    /// the production `wide` helper and the OS. `PCWSTR::as_wide`/`to_string`
+    /// scan to the first NUL, so an unterminated fixture buffer over-reads
+    /// into adjacent heap instead of producing its spelling.
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn owned(root_path: &str, callback: &str) -> Option<String> {
+        // Hand the converter the spelling exactly as `as_wide()` yields it:
+        // the NUL-terminated buffer's data without the trailing 0.
+        let spelling = wide(callback);
+        owned_relative(&root(root_path), &spelling[..spelling.len() - 1])
+    }
 
     #[test]
     fn operation_sizes_include_the_union_offset_and_active_member() {
@@ -1119,5 +1717,401 @@ mod tests {
         assert_eq!(operation_param_size::<CF_OPERATION_PARAMETERS_0_4>(), 40);
         assert_eq!(operation_param_size::<CF_OPERATION_PARAMETERS_0_6>(), 16);
         assert_eq!(operation_param_size::<CF_OPERATION_PARAMETERS_0_7>(), 16);
+    }
+
+    // -- production path conversion -------------------------------------
+
+    #[test]
+    fn volume_root_callback_path_is_the_empty_spelling() {
+        assert_eq!(owned(ROOT, ROOT_CALLBACK), Some(String::new()));
+    }
+
+    #[test]
+    fn nested_child_is_sync_root_relative() {
+        assert_eq!(
+            owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\docs\\a.txt"),
+            Some("docs\\a.txt".to_owned())
+        );
+    }
+
+    #[test]
+    fn case_equivalent_prefix_keeps_the_child_spelling() {
+        assert_eq!(
+            owned(ROOT, "\\users\\MOMO-\\hf drive\\DRIVE-DEV\\Docs\\A.TXT"),
+            Some("Docs\\A.TXT".to_owned())
+        );
+    }
+
+    #[test]
+    fn sibling_prefix_and_ancestors_are_not_owned() {
+        // String-prefix neighbours of the root never borrow its ownership.
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev2\\x"), None);
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev-old\\x"), None);
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev2"), None);
+        // The root's ancestors are outside the root.
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive"), None);
+    }
+
+    #[test]
+    fn other_volume_with_the_same_tail_is_not_owned() {
+        assert_eq!(owned(ROOT, "D:\\Users\\momo-\\HF Drive\\drive-dev\\x"), None);
+    }
+
+    #[test]
+    fn extended_and_device_spellings_convert_to_the_same_relative_path() {
+        assert_eq!(
+            owned(ROOT, "\\\\?\\C:\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            Some("a".to_owned())
+        );
+        assert_eq!(
+            owned(ROOT, "\\Device\\HarddiskVolume7\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            Some("a".to_owned())
+        );
+        // The root itself may be spelled extended while the callback is not.
+        assert_eq!(
+            owned("\\\\?\\C:\\Users\\momo-\\HF Drive\\drive-dev", "C:\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            Some("a".to_owned())
+        );
+    }
+
+    #[test]
+    fn same_shape_volume_guid_mismatch_is_not_owned() {
+        let guid_root = "\\\\?\\Volume{1234}\\Users\\momo-\\HF Drive\\drive-dev";
+        assert_eq!(
+            owned(guid_root, "\\\\?\\Volume{1234}\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            Some("a".to_owned())
+        );
+        assert_eq!(
+            owned(guid_root, "\\\\?\\Volume{9999}\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            None
+        );
+    }
+
+    #[test]
+    fn same_shape_device_mismatch_is_not_owned() {
+        let device_root = "\\Device\\HarddiskVolume1\\Users\\momo-\\HF Drive\\drive-dev";
+        assert_eq!(
+            owned(device_root, "\\Device\\HarddiskVolume1\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            Some("a".to_owned())
+        );
+        assert_eq!(
+            owned(device_root, "\\Device\\HarddiskVolume2\\Users\\momo-\\HF Drive\\drive-dev\\a"),
+            None
+        );
+    }
+
+    #[test]
+    fn traversal_and_malformed_paths_never_become_root_or_child() {
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\..\\..\\secret"), None);
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\.\\x"), None);
+        assert_eq!(owned(ROOT, "\\..\\Users\\momo-\\HF Drive\\drive-dev"), None);
+        assert_eq!(owned(ROOT, ""), None);
+        assert_eq!(owned(ROOT, "\\"), None);
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\a:b"), None);
+        assert_eq!(owned(ROOT, "\\\\server\\share\\x"), None);
+        assert_eq!(owned(ROOT, "\\Users\\\\momo-"), None);
+    }
+
+    #[test]
+    fn one_trailing_separator_is_the_same_subject() {
+        assert_eq!(owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\"), Some(String::new()));
+        assert_eq!(
+            owned(ROOT, "\\Users\\momo-\\HF Drive\\drive-dev\\docs\\"),
+            Some("docs".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_sync_root_on_the_volume_root_maps_only_absolute_children() {
+        assert_eq!(owned("C:\\", "\\"), Some(String::new()));
+        assert_eq!(owned("C:\\", "\\x\\y"), Some("x\\y".to_owned()));
+        assert_eq!(owned("C:\\", ""), None);
+        assert_eq!(owned("C:\\", "\\\\"), None);
+    }
+
+    // -- rename spelling decision --------------------------------------
+
+    #[test]
+    fn rename_outside_source_and_inside_target_keep_both_meaningful() {
+        assert_eq!(
+            rename_spellings(
+                None,
+                "E:\\other\\old".to_owned(),
+                false,
+                Some("new".to_owned()),
+                "E:\\other\\new".to_owned(),
+                true,
+            ),
+            Some(("E:\\other\\old".to_owned(), "new".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rename_move_out_keeps_the_outside_target() {
+        assert_eq!(
+            rename_spellings(
+                Some("old".to_owned()),
+                "C:\\Users\\momo-\\HF Drive\\drive-dev\\old".to_owned(),
+                true,
+                None,
+                "E:\\other\\new".to_owned(),
+                false,
+            ),
+            Some(("old".to_owned(), "E:\\other\\new".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rename_an_in_scope_side_must_be_owned() {
+        assert_eq!(
+            rename_spellings(
+                None,
+                "E:\\other\\old".to_owned(),
+                true,
+                Some("new".to_owned()),
+                String::new(),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            rename_spellings(
+                Some("old".to_owned()),
+                String::new(),
+                true,
+                None,
+                "E:\\other\\new".to_owned(),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rename_of_the_root_itself_uses_the_empty_spelling() {
+        assert_eq!(
+            rename_spellings(
+                Some(String::new()),
+                String::new(),
+                true,
+                Some("renamed".to_owned()),
+                String::new(),
+                true,
+            ),
+            Some((String::new(), "renamed".to_owned()))
+        );
+    }
+
+    // -- native completion ABI edges ------------------------------------
+
+    #[test]
+    fn unprocessed_entries_are_reported_as_failures() {
+        let entries = [
+            CF_PLACEHOLDER_CREATE_INFO {
+                Result: HRESULT(0),
+                CreateUsn: 7,
+                ..Default::default()
+            },
+            CF_PLACEHOLDER_CREATE_INFO {
+                Result: HRESULT(0),
+                CreateUsn: 9,
+                ..Default::default()
+            },
+        ];
+        let results = entry_results(&entries, 1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].result, 0);
+        assert_eq!(results[0].create_usn, 7);
+        assert_eq!(results[1].result, UNPROCESSED_ENTRY_HRESULT);
+        assert_eq!(results[1].create_usn, 0);
+        let results = entry_results(&entries, 2);
+        assert_eq!(results[0].create_usn, 7);
+        assert_eq!(results[1].create_usn, 9);
+        assert!(entry_results(&[], 0).is_empty());
+    }
+
+    // -- population completion contract --------------------------------
+
+    fn entry(result: i32) -> super::EntryResult {
+        super::EntryResult {
+            result,
+            create_usn: 0,
+        }
+    }
+
+    #[test]
+    fn population_calls_are_bounded_and_never_truncate() {
+        let calls: Vec<_> = super::population_calls(2500).collect();
+        assert_eq!(calls, vec![0..1000, 1000..2000, 2000..2500, 2500..2500]);
+        assert_eq!(super::population_calls(1).collect::<Vec<_>>(), vec![0..1, 1..1]);
+        assert_eq!(
+            super::population_calls(1000).collect::<Vec<_>>(),
+            vec![0..1000, 1000..1000]
+        );
+        assert!(calls.iter().all(|call| call.len() <= super::POPULATION_BATCH_MAX));
+    }
+
+    #[test]
+    fn empty_directory_completes_but_empty_subset_never_claims_complete() {
+        // The empty delivery shape: the terminal call with zero entries.
+        assert_eq!(super::population_calls(0).collect::<Vec<_>>(), vec![0..0]);
+        // A genuinely empty directory IS fully populated (all zero of its
+        // entries are present) — the old always-`FLAG_NONE` completion left
+        // this directory endlessly re-fetching.
+        assert!(super::directory_populated_mark(true, &[]));
+        // An empty delivery that is NOT the complete listing (children that
+        // cannot become placeholders were dropped) must never claim to be.
+        assert!(!super::directory_populated_mark(false, &[]));
+    }
+
+    #[test]
+    fn only_complete_deliveries_with_every_entry_present_are_marked() {
+        let all_created = [entry(0), entry(0)];
+        assert!(super::directory_populated_mark(true, &all_created));
+        // The OS not processing an entry (batch tail) is a missing name.
+        assert!(!super::directory_populated_mark(true, &[
+            entry(0),
+            entry(UNPROCESSED_ENTRY_HRESULT),
+        ]));
+        // A real per-entry failure is a missing name too.
+        assert!(!super::directory_populated_mark(true, &[
+            entry(0),
+            entry(0x8007_0070u32 as i32), // HRESULT_FROM_WIN32(ERROR_DISK_FULL)
+        ]));
+        // A subset delivery is never complete, however clean its entries.
+        assert!(!super::directory_populated_mark(false, &all_created));
+    }
+
+    #[test]
+    fn occupied_names_count_as_present_and_missing_names_do_not() {
+        // Created (0 and the STATUS_OBJECT_NAME_EXISTS success warning) and
+        // the untouched-occupied name codes mean the name is resolvable.
+        assert!(super::entry_present(0));
+        assert!(super::entry_present(0x4000_0000u32 as i32));
+        assert!(super::entry_present(0x8007_0050u32 as i32)); // ERROR_FILE_EXISTS
+        assert!(super::entry_present(0x8007_00B7u32 as i32)); // ERROR_ALREADY_EXISTS
+        assert!(super::entry_present(0xC000_0035u32 as i32)); // STATUS_OBJECT_NAME_COLLISION
+        // Anything else leaves the name missing.
+        assert!(!super::entry_present(UNPROCESSED_ENTRY_HRESULT));
+        assert!(!super::entry_present(0x8007_0781u32 as i32)); // ERROR_CANT_RESOLVE_FILENAME
+        assert!(!super::entry_present(0x8007_0005u32 as i32)); // E_ACCESSDENIED
+        // A complete delivery whose entries are all occupied names is still
+        // a complete listing (occupied names are preserved, never overwritten).
+        assert!(super::directory_populated_mark(true, &[
+            entry(0),
+            entry(0xC000_0035u32 as i32),
+        ]));
+    }
+
+    // -- production handlers with fabricated callback structs -----------
+
+    struct CaptureSink(Arc<Mutex<Vec<crate::cfapi::events::ProviderEvent>>>);
+
+    impl EventSink for CaptureSink {
+        fn on_fetch_data(&self, request: crate::cfapi::events::FetchRequest) {
+            let _ = request;
+        }
+        fn on_cancel_fetch_data(&self, cancel: crate::cfapi::events::CancelRanges) {
+            let _ = cancel;
+        }
+        fn on_fetch_placeholders(&self, request: crate::cfapi::events::PlaceholdersRequest) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::cfapi::events::ProviderEvent::FetchPlaceholders(request));
+        }
+        fn on_cancel_fetch_placeholders(&self, cancel: crate::cfapi::events::CancelRanges) {
+            let _ = cancel;
+        }
+        fn on_rename(&self, notification: crate::cfapi::events::RenameNotification) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::cfapi::events::ProviderEvent::NotifyRename(notification));
+        }
+        fn on_delete(&self, notification: crate::cfapi::events::DeleteNotification) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::cfapi::events::ProviderEvent::NotifyDelete(notification));
+        }
+        fn on_rename_completion(&self, completion: crate::cfapi::events::RenameCompletion) {
+            let _ = completion;
+        }
+        fn on_delete_completion(&self, completion: crate::cfapi::events::DeleteCompletion) {
+            let _ = completion;
+        }
+    }
+
+    fn context(events: Arc<Mutex<Vec<crate::cfapi::events::ProviderEvent>>>) -> Arc<CallbackContext> {
+        CallbackContext::new(
+            hfdrive_core::ids::WorkspaceId::new(),
+            root(ROOT),
+            Box::new(CaptureSink(events)),
+        )
+    }
+
+    #[test]
+    fn fetch_placeholders_on_the_root_emits_the_empty_spelling() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let context = context(events.clone());
+        let path = wide(ROOT_CALLBACK);
+        let info = CF_CALLBACK_INFO {
+            NormalizedPath: PCWSTR(path.as_ptr()),
+            ..Default::default()
+        };
+        let params = CF_CALLBACK_PARAMETERS {
+            ParamSize: 0,
+            Anonymous: CF_CALLBACK_PARAMETERS_0 {
+                FetchPlaceholders: CF_CALLBACK_PARAMETERS_0_3 {
+                    Flags: Default::default(),
+                    Pattern: PCWSTR::null(),
+                },
+            },
+        };
+        handle_fetch_placeholders(&context, &info, &params);
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            crate::cfapi::events::ProviderEvent::FetchPlaceholders(request) => {
+                assert_eq!(request.normalized_path, "");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_move_in_keeps_the_outside_source_and_relative_target() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let context = context(events.clone());
+        let source = wide("\\Device\\HarddiskVolume3\\Elsewhere\\old");
+        let target = wide("\\Users\\momo-\\HF Drive\\drive-dev\\new");
+        let info = CF_CALLBACK_INFO {
+            NormalizedPath: PCWSTR(source.as_ptr()),
+            ..Default::default()
+        };
+        let params = CF_CALLBACK_PARAMETERS {
+            ParamSize: 0,
+            Anonymous: CF_CALLBACK_PARAMETERS_0 {
+                Rename: CF_CALLBACK_PARAMETERS_0_10 {
+                    Flags: CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE
+                        | CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY,
+                    TargetPath: PCWSTR(target.as_ptr()),
+                },
+            },
+        };
+        handle_notify_rename(&context, &info, &params);
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            crate::cfapi::events::ProviderEvent::NotifyRename(notification) => {
+                assert_eq!(notification.normalized_path, "\\Device\\HarddiskVolume3\\Elsewhere\\old");
+                assert_eq!(notification.target_path, "new");
+                assert!(!notification.source_in_scope);
+                assert!(notification.target_in_scope);
+                assert!(notification.is_directory);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

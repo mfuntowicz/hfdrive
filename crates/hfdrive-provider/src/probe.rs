@@ -34,7 +34,7 @@ impl Provider {
             .drive(record.binding.workspace_id)
             .base()
             .join("probe");
-        let request = ProbeRequest {
+        let probe = ProbeRequest {
             run_id,
             connection_id: connection,
             setup_id: Some(setup.setup_id),
@@ -42,26 +42,11 @@ impl Provider {
             staging_dir,
         };
         let account = self.state.open_account(profile.account_key).await.map_err(crate::operations::state_error)?;
-        let native = parts.native;
-        let budget = self.scheduler.wire_budget().clone();
-        let report = match (mode, parts.transport) {
-            (ProbeMode::Full, Some(transport)) => {
-                let namespace = transport.probe(*run_id.as_uuid());
-                CapabilityProbe::new(account, native, namespace, budget)
-                    .run(&request, &self.operations.cancellation)
-                    .await
-                    .map_err(probe_failure)?
-            }
-            (ProbeMode::Full, None) => {
-                return Err(error(wire::ProtocolErrorCode::StorageSetupRequired, "A full capability probe requires supplemental S3 credentials"));
-            }
-            (ProbeMode::ReadOnly, _) => {
-                CapabilityProbe::new(account, native, UnavailableTransport, budget)
-                    .run(&request, &self.operations.cancellation)
-                    .await
-                    .map_err(probe_failure)?
-            }
-        };
+        // Keep S3 credentials bound to the setup, but isolate every native
+        // upload in the same owned namespace used by S3 reads and cleanup.
+        let report = self
+            .execute_storage_probe(&account, &probe, mode, record.binding, parts.transport)
+            .await?;
         let evidence = serde_json::to_value(&report).map_err(|_| crate::operations::internal())?;
         self.state.record_probe_evidence(setup.setup_id, evidence).await.map_err(crate::operations::state_error)?;
         let report_path = self.write_probe_report(&report).await?;
@@ -73,14 +58,56 @@ impl Provider {
             wire::CapabilityState::StorageSetupRequired
         };
         Ok(wire::ProbeStorageResult {
-            run_id: request.run_id.as_uuid().clone(),
+            run_id: probe.run_id.as_uuid().clone(),
             capability,
             checks: report.checks,
             report_path: Some(report_path),
         })
     }
 
-    async fn write_probe_report(
+    /// The one storage-check runner shared by explicit setup probes and
+    /// storage repair: every native upload is isolated in the owned probe
+    /// namespace, and S3 measurement uses the caller's already validated
+    /// transport (absent for read-only runs).
+    pub(crate) async fn execute_storage_probe(
+        &self,
+        account: &hfdrive_state::AccountStore,
+        probe: &ProbeRequest,
+        mode: ProbeMode,
+        binding: hfdrive_core::storage::DriveBinding,
+        transport: Option<hfdrive_publication::S3Transport>,
+    ) -> Result<hfdrive_publication::probe::ProbeReport, wire::ProtocolError> {
+        let mut probe_binding = binding;
+        probe_binding.prefix = probe.prefix();
+        let native = self
+            .native_control(account.account_key())
+            .open_store(probe_binding)
+            .map_err(native_failure)?;
+        let budget = self.scheduler.wire_budget().clone();
+        let report = match (mode, transport) {
+            (ProbeMode::Full, Some(transport)) => {
+                let namespace = transport.probe(*probe.run_id.as_uuid());
+                CapabilityProbe::new(account.clone(), native, namespace, budget)
+                    .run(probe, &self.operations.cancellation)
+                    .await
+                    .map_err(probe_failure)?
+            }
+            (ProbeMode::Full, None) => {
+                return Err(error(wire::ProtocolErrorCode::StorageSetupRequired, "A full capability probe requires supplemental S3 credentials"));
+            }
+            (ProbeMode::ReadOnly, _) => {
+                CapabilityProbe::new(account.clone(), native, UnavailableTransport, budget)
+                    .run(probe, &self.operations.cancellation)
+                    .await
+                    .map_err(probe_failure)?
+            }
+        };
+        Ok(report)
+    }
+
+    /// Persists the non-secret capability report artifact and returns its
+    /// JSON path.
+    pub(crate) async fn write_probe_report(
         &self,
         report: &hfdrive_publication::probe::ProbeReport,
     ) -> Result<String, wire::ProtocolError> {

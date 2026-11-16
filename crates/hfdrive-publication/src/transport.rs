@@ -619,7 +619,14 @@ fn classify_read_verdict(verdict: Verdict) -> PublicationError {
     match verdict {
         Verdict::NotSent | Verdict::NoVerdict => PublicationError::Transport,
         Verdict::Status(404) => PublicationError::Absent,
-        Verdict::Status(401) | Verdict::Status(403) => PublicationError::PermissionDenied,
+        Verdict::Status(status @ (401 | 403)) => {
+            tracing::warn!(
+                operation = "s3_read",
+                http_status = status,
+                "S3 publication credentials were denied"
+            );
+            PublicationError::PermissionDenied
+        }
         Verdict::Status(status) if (300..400).contains(&status) => {
             PublicationError::InvalidResponse
         }

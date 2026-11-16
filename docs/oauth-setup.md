@@ -34,6 +34,20 @@ removed. Startup connects to the existing provider or starts the exact trusted
 provider image; connection failure shows Retry, not an invented empty setup.
 Configured users go directly to the normal application. Adding another drive
 opens the same compact form without deleting existing connections or local files.
+Automatic onboarding returns to the normal shell if a later accepted status
+reveals an existing drive; an explicitly opened **Add drive** form stays open.
+
+For development, build through `scripts/build.ps1` (or initialize
+`scripts/Initialize-BuildEnvironment.ps1` before Cargo). The provider embeds
+the exact trusted desktop executable path at build time; plain Cargo without
+that environment does not authorize a development desktop.
+
+Setup has no system title bar or minimize/maximize buttons. Drag the blank top
+strip to move it; the single top-right close icon hides setup to the tray without
+discarding the wizard or stopping the provider. Finishing setup or choosing
+**Back to HF Drive** restores the normal application's standard window controls.
+**Open HF Drive** reopens the current surface, including an unfinished setup;
+explicit account, connection, and issue actions still navigate to their pages.
 
 1. **Sign in** — request bucket read access through Hugging Face. Device sign-in
    remains an explicit alternative. An already signed-in account skips this page.
@@ -41,7 +55,9 @@ opens the same compact form without deleting existing connections or local files
    Optional private-bucket creation and the exact managed location have expandable
    details. Continue inspects the location without creating remote objects.
 3. **Folder & access** — use the native folder picker or edit the suggested
-   `%USERPROFILE%\HF Drive\<bucket>` path. Two-way sync explicitly requests write
+   unused `%USERPROFILE%\HF Drive\<bucket>` path. Occupied names receive a numeric
+   suffix; entered paths and the same bucket's prior suggestion are preserved.
+   Two-way sync explicitly requests write
    permission and separately protects the storage access keys. Check & review
    reserves setup, runs the real storage checks, and builds the persisted preview.
    Browse-only skips publication keys and probes. Failed checks never enable writes.
@@ -49,12 +65,49 @@ opens the same compact form without deleting existing connections or local files
    initialization, and any collision actions before connecting. A changed preview
    must be reviewed again. Successful setup stays visible until Open HF Drive.
 
-The form uses the official Hugging Face graphic and Storage-inspired blue/neutral
-resources with native light, dark, and high-contrast controls. Technical identifiers
+An existing drive's registered folder belongs to that connection. Manage it
+through **Connections**; a new setup must use another folder rather than taking
+over the existing registration. Root validation reports its specific filesystem
+rejection instead of replacing every failure with a generic invalid-root message.
+
+The form uses CatchingHuggy artwork and Storage-inspired blue/neutral resources
+with native light, dark, and high-contrast controls. Technical identifiers
 and probe results stay expandable, including failed checks before review. Secret
 fields are cleared before any asynchronous submission; immutable .NET strings
 still cannot be guaranteed erased. No local “setup complete” flag overrides
 provider state, and resetting the form never deletes durable setup or user data.
+
+After Connect succeeds, `HuggyPop.gif` celebrates only while the provider reports
+that new drive as usable and working. A probe or preview alone never triggers it.
+The animation stops when setup is hidden or Windows animations are disabled.
+
+## Desktop tray
+
+CatchingHuggy identifies the app, taskbar, package, and notification-area icon.
+Selecting the tray icon opens a compact native panel at the taskbar's work-area
+corner; Escape or deactivation dismisses it. Closing the main window keeps the
+tray and provider connection alive. The tray menu distinguishes exiting the
+desktop UI from the separately confirmed provider exit.
+
+Setup and the tray panel share [Windows 11's native rounded-corner policy](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-rounded-corners)
+without a white nonclient frame. Corners are composed by Windows, not simulated
+with window regions or per-pixel transparency; Windows may suppress rounding
+when a window is snapped, maximized, or subject to its virtualization policy.
+
+The panel reads current per-file activity, paged operation history, and conflicts
+from the authenticated provider. Drive selection, Open folder, pause/resume, and
+issue navigation use the same application session. Unsupported activity,
+disconnection, loading, and failures are not treated as an empty queue.
+Connection errors and failed activity/history/conflict requests appear under
+**Issues**. An empty queue while syncing is blocked is not shown as healthy.
+Each request retains its own error until a fresh successful response; an older
+page response cannot clear a newer authorization failure. Storage-access actions
+manage the existing connection rather than opening **Add drive**.
+
+`VibingHuggy.gif` plays only when every configured drive has fresh, healthy,
+up-to-date status and a proven empty activity queue. No drives, pending work,
+paused or failed drives, conflicts, or stale status never qualify. Both GIFs
+respect Windows animation preferences and stop while their surface is hidden.
 
 
 ## Flows
@@ -132,6 +185,27 @@ are entered in the dedicated setup form, protected separately, and are never
 an OAuth replacement: a PAT is never accepted as an OAuth token, and the key
 pair does not prove the OAuth person's identity. Their scope may cover the
 whole bucket.
+
+### Repair an existing drive
+
+To reuse keys already protected by a successful setup for the same account and
+bucket, keep the existing connection and use the source setup's proposed
+connection ID:
+
+```powershell
+hfdrive repair-storage --connection <existing-connection-id> --credentials-from <verified-source-connection-id>
+```
+
+The provider verifies the existing workspace and root, runs fresh storage checks,
+and replaces only the existing connection's credential binding. It does not
+initialize a workspace, change the folder, unregister the drive, discard local
+work, or consume the source credentials. The durable paused intent is preserved.
+Keys never appear in command arguments.
+
+An incomplete repair exits nonzero and reports the resulting status. A failure
+after credential adoption retains the adopted protected record rather than
+leaving a dangling credential reference; do not reset or add another drive to
+retry recovery.
 
 ## Browser launch boundary
 

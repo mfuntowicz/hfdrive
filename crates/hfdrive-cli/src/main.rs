@@ -4,7 +4,7 @@ mod client;
 
 use args::{Cli, Command, ProviderCommand};
 use clap::Parser;
-use hfdrive_protocol::{ClientRole, ConnectRequest, ExitProviderRequest, ExportDiagnosticsRequest, GetStatusRequest, HelloRequest, ListBucketsRequest, ListConflictsRequest, ListHistoryRequest, ListOwnersRequest, LoginFlow, PrepareUnlinkRequest, ProbeStorageRequest, Request, ResponseResult, RestoreRequest, SignOutRequest, StartLoginRequest, UnlinkRequest};
+use hfdrive_protocol::{ClientRole, ConnectRequest, ExitProviderRequest, ExportDiagnosticsRequest, GetStatusRequest, HelloRequest, ListBucketsRequest, ListConflictsRequest, ListHistoryRequest, ListOwnersRequest, LoginFlow, PauseRequest, PrepareUnlinkRequest, ProbeStorageRequest, RepairStorageRequest, Request, ResponseResult, RestoreRequest, ResumeRequest, SignOutRequest, StartLoginRequest, UnlinkRequest};
 use hfdrive_windows::ipc::{IpcClient, IpcPolicy};
 use std::{io::Write, process::ExitCode, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,8 @@ enum CliError {
     LoginSuperseded,
     #[error("login ended: {0:?}")]
     LoginEnded(hfdrive_protocol::LoginPhase),
+    #[error("storage credentials were verified and saved, but the provider has not reconnected the drive")]
+    RepairIncomplete,
 }
 
 fn policy() -> Result<IpcPolicy, CliError> {
@@ -75,6 +77,12 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
     if hello.protocol_major != 1 || hello.protocol_minor != 0 { return Err(CliError::Response); }
     let request = match &arguments.command {
         Command::Status { .. } => Request::GetStatus(GetStatusRequest {}),
+        Command::Pause(connection) => Request::Pause(PauseRequest {
+            operation_id: Uuid::new_v4(), connection_id: Some(connection.connection),
+        }),
+        Command::Resume(connection) => Request::Resume(ResumeRequest {
+            operation_id: Uuid::new_v4(), connection_id: Some(connection.connection),
+        }),
         Command::Login { device, purpose, organization_id } => Request::StartLogin(StartLoginRequest {
             operation_id: Uuid::new_v4(),
             flow: if *device { LoginFlow::Device } else { LoginFlow::Pkce },
@@ -94,6 +102,11 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
         }),
         Command::Probe { connection, run_id } => Request::ProbeStorage(ProbeStorageRequest {
             operation_id: Uuid::new_v4(), connection_id: *connection, run_id: *run_id,
+        }),
+        Command::RepairStorage { connection, credentials_from } => Request::RepairStorage(RepairStorageRequest {
+            operation_id: Uuid::new_v4(),
+            connection_id: *connection,
+            credentials_from_connection_id: *credentials_from,
         }),
         Command::History { item, cursor } => Request::ListHistory(ListHistoryRequest {
             connection_id: item.connection, item_id: Some(item.item), cursor: cursor.clone(), limit: 200,
@@ -137,7 +150,7 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
         _ => return Err(CliError::Unavailable),
     };
     let request_timeout = match &arguments.command {
-        Command::Probe { .. } => Duration::from_secs(180),
+        Command::Probe { .. } | Command::RepairStorage { .. } => Duration::from_secs(180),
         _ => Duration::from_secs(30),
     };
     if !hello.supported_features.iter().any(|method| method == request.method()) { return Err(CliError::Unavailable); }
@@ -166,6 +179,12 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
                         state_text(connection.state), connection.owner.namespace.as_deref().unwrap_or("namespace not reported"), connection.bucket.name, connection.root_path)?;
                 }
             }
+        }
+        (Command::Pause(_), ResponseResult::Pause(result)) => {
+            writeln!(std::io::stdout().lock(), "Paused connections: {:?}", result.paused_connection_ids)?;
+        }
+        (Command::Resume(_), ResponseResult::Resume(result)) => {
+            writeln!(std::io::stdout().lock(), "Resumed connections: {:?}", result.resumed_connection_ids)?;
         }
         (Command::Login { .. }, ResponseResult::StartLogin(login)) => {
             account::wait_for_login(&mut stream, login, &cancellation).await?;
@@ -223,6 +242,17 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
             for check in result.checks {
                 writeln!(output, "{:?}\t{:?}\t{}\t{}\t{}", check.kind, check.outcome, check.expected, check.observed, check.detail.unwrap_or_default())?;
             }
+        }
+        (Command::RepairStorage { .. }, ResponseResult::RepairStorage(result)) => {
+            let mut output = std::io::stdout().lock();
+            if result.repaired {
+                writeln!(output, "Storage access repaired for connection {}.", result.connection_id)?;
+            } else {
+                writeln!(output, "Storage credentials were saved for connection {}, but the live binding is not active.", result.connection_id)?;
+            }
+            writeln!(output, "Probe {}: state {:?}, capability {:?}.", result.run_id, result.status.state, result.status.capability)?;
+            if let Some(path) = result.report_path { writeln!(output, "Report: {path}")?; }
+            if !result.repaired { return Err(CliError::RepairIncomplete); }
         }
         (Command::History { .. }, ResponseResult::ListHistory(mut page)) => {
             let mut previous_cursor = None;

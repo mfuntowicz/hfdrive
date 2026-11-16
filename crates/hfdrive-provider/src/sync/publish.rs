@@ -75,6 +75,53 @@ pub struct RoundContext<'a, R: RemoteOps> {
     pub cancel: &'a CancellationToken,
 }
 
+impl<R: RemoteOps> RoundContext<'_, R> {
+    /// Records one classified failure against an outbox operation (after any
+    /// retry transition that cleared stale errors). Safe codes/details only.
+    pub(crate) async fn record_outbox_error(
+        &self,
+        operation: OperationId,
+        code: &'static str,
+        detail: &str,
+    ) {
+        crate::sync::work_errors::record_outbox_error(
+            self.state,
+            self.connection,
+            operation,
+            code,
+            detail,
+        )
+        .await;
+    }
+
+    /// Records one classified failure against a transfer journal row.
+    pub(crate) async fn record_transfer_failure(
+        &self,
+        transfer: hfdrive_core::ids::TransferId,
+        error: &PublishError,
+    ) {
+        crate::sync::work_errors::record_transfer_failure(
+            self.state,
+            self.connection,
+            transfer,
+            error,
+        )
+        .await;
+    }
+
+    /// Records one publication-loop failure against an outbox operation.
+    /// Cancellation is never recorded as a permanent failure.
+    pub(crate) async fn record_outbox_failure(&self, operation: OperationId, error: &PublishError) {
+        crate::sync::work_errors::record_outbox_failure(
+            self.state,
+            self.connection,
+            operation,
+            error,
+        )
+        .await;
+    }
+}
+
 /// What one round achieved.
 #[derive(Debug, Default)]
 pub struct RoundOutcome {
@@ -96,8 +143,10 @@ pub enum PublishError {
     Remote(#[from] RemoteError),
     #[error("durable state failed: {0}")]
     State(#[from] hfdrive_state::StateError),
-    #[error("capture failed: {0}")]
-    Capture(String),
+    /// A classified capture failure. `code` is a stable
+    /// [`crate::sync::work_errors::codes`] class; `detail` is safe text.
+    #[error("capture failed: {detail}")]
+    Capture { code: &'static str, detail: String },
     #[error("local apply failed: {0}")]
     LocalApply(&'static str),
     #[error("the managed remote format is unsupported")]
@@ -144,9 +193,70 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, PublishE
 // ---------------------------------------------------------------------------
 
 /// Runs one full round for the connection's pending durable work.
+///
+/// Failures are recorded at their owned sites (capture/upload in
+/// [`upload_entry`], the conditional publication in step 8, local application
+/// in [`execute_pending_actions`]). A round-level abort (head read, catalog/
+/// plan, resume) has no single owning work row, so it is recorded against
+/// exactly the entries this round was driving — the tracked `driven` set —
+/// and only when that entry is still unfinished, not excluded, and carries no
+/// newer owned-site record. Parked-for-retry and published work are never
+/// stamped. Normal cancellation (shutdown/pause) records nothing anywhere.
 pub async fn run_round<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     writable: bool,
+) -> Result<RoundOutcome, PublishError> {
+    let mut driven: Vec<OperationId> = Vec::new();
+    let result = run_round_inner(ctx, writable, &mut driven).await;
+    if let Err(error) = &result {
+        if !crate::sync::work_errors::publish_is_cancellation(error) {
+            for operation in driven {
+                // An owned site already recorded the newer failure for this
+                // work (after its own retry/state transitions).
+                if ctx
+                    .state
+                    .work_error(ctx.connection, hfdrive_state::WorkErrorKind::Outbox, *operation.as_uuid())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(entry) = ctx.state.outbox_entry(ctx.connection, operation).await.ok().flatten()
+                else {
+                    continue;
+                };
+                // Never stamp work that reached a published state before the
+                // abort (its local apply is separate work) or an excluded
+                // subtree (not this round's work).
+                if matches!(
+                    entry.state,
+                    OutboxState::Published | OutboxState::LocalApplyPending | OutboxState::Complete
+                ) {
+                    continue;
+                }
+                let excluded = match parse_intent(&entry) {
+                    Ok(intent) => {
+                        crate::sync::observe::excluded_here(ctx.state, ctx.connection, intent.item_id())
+                            .await
+                    }
+                    Err(_) => true,
+                };
+                if excluded {
+                    continue;
+                }
+                ctx.record_outbox_failure(operation, error).await;
+            }
+        }
+    }
+    result
+}
+
+async fn run_round_inner<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+    writable: bool,
+    driven: &mut Vec<OperationId>,
 ) -> Result<RoundOutcome, PublishError> {
     let mut outcome = RoundOutcome::default();
     let now_ms = now_ms();
@@ -159,8 +269,12 @@ pub async fn run_round<R: RemoteOps>(
     for entry in all {
         match entry.state {
             OutboxState::Complete | OutboxState::LocalApplyPending | OutboxState::Published => {}
-            OutboxState::MetadataReady => resumed.push(entry),
+            OutboxState::MetadataReady => {
+                driven.push(entry.operation_id);
+                resumed.push(entry);
+            }
             OutboxState::PublishUnknown => {
+                driven.push(entry.operation_id);
                 match classify_parked(ctx, &entry).await? {
                     Some(commit_id) => {
                         mark_published_locally(ctx, &entry, &mut outcome, Some(commit_id)).await?
@@ -170,6 +284,7 @@ pub async fn run_round<R: RemoteOps>(
             }
             _ => {
                 if next_step(&entry, now_ms) != PhaseStep::Wait {
+                    driven.push(entry.operation_id);
                     planning.push(entry);
                 }
             }
@@ -202,6 +317,13 @@ pub async fn run_round<R: RemoteOps>(
     let baseline = ctx.state.baseline(ctx.connection).await?;
     let remote_moved = baseline.applied_commit != Some(head.head.commit_id);
     if planning.is_empty() && !remote_moved {
+        // A successful quiet poll still proves which commit is observable.
+        // Do not leave initialized drives permanently without that evidence.
+        if baseline.observed_commit != Some(head.head.commit_id) {
+            ctx.state
+                .set_baseline(ctx.connection, BaselineKind::Observed, Some(head.head.commit_id))
+                .await?;
+        }
         return Ok(outcome);
     }
 
@@ -211,7 +333,7 @@ pub async fn run_round<R: RemoteOps>(
     let catalog_root = catalog_root_of(ctx, &head).await?;
     let digests_source = RemoteDigests(ctx.remote);
     let mut digests = DigestResolver::new(&digests_source, ctx.cancel);
-    let base = build_base_view(ctx.state, ctx.connection, &mut digests).await?;
+    let base = build_base_view(ctx.state, ctx.connection, baseline.applied_commit, &mut digests).await?;
     let remote = build_remote_view(ctx.remote, catalog_root, &mut digests, ctx.cancel).await?;
     let names = collect_names(&base, &remote);
     let intents = build_local_intents(&planning, &names);
@@ -285,7 +407,20 @@ pub async fn run_round<R: RemoteOps>(
     }
 
     // 8. Exactly one conditional write against the preserved base head.
-    match ctx.remote.publish(&head, candidate, ctx.cancel).await? {
+    let published = ctx.remote.publish(&head, candidate, ctx.cancel).await;
+    let published = match published {
+        Ok(result) => result,
+        Err(error) => {
+            // The new failure is recorded after the transitions above (which
+            // clear stale errors), so this is the current failure.
+            let error = PublishError::Remote(error);
+            for entry in &round_entries {
+                ctx.record_outbox_failure(entry.operation_id, &error).await;
+            }
+            return Err(error);
+        }
+    };
+    match published {
         PublishResult::Committed(_) => {
             let commit_id = candidate_commit_id(&round_entries)
                 .unwrap_or(head.head.commit_id);
@@ -294,12 +429,33 @@ pub async fn run_round<R: RemoteOps>(
         }
         PublishResult::PreconditionFailed { current } => {
             // Re-reconcile against the fresh head; parking replaces candidate
-            // evidence legally and keeps bound payloads bound.
+            // evidence legally and keeps bound payloads bound. This is a real
+            // publication failure (a racing writer won) and is recorded after
+            // the parking transition that cleared stale errors.
             park_for_rebase(ctx, &round_entries, RetryClass::None, None).await?;
+            for entry in &round_entries {
+                ctx.record_outbox_error(
+                    entry.operation_id,
+                    crate::sync::work_errors::codes::PUBLISH_PRECONDITION_FAILED,
+                    "the conditional publication lost its race; re-reconciling against the fresh head",
+                )
+                .await;
+            }
             let _ = current;
         }
         PublishResult::Ambiguous(_) => {
+            // The conditional write may or may not have landed; the entry is
+            // parked for identity-based resolution. Recorded as the actual
+            // uncertainty it is, never as a fabricated failure.
             park_for_rebase(ctx, &round_entries, RetryClass::Backoff, Some(500)).await?;
+            for entry in &round_entries {
+                ctx.record_outbox_error(
+                    entry.operation_id,
+                    crate::sync::work_errors::codes::PUBLISH_AMBIGUOUS,
+                    "the conditional publication result is unknown; resolving by identity",
+                )
+                .await;
+            }
         }
     }
     Ok(outcome)
@@ -707,7 +863,13 @@ async fn finish_commit<R: RemoteOps>(
 
     // Mark locally published content in-sync (guarded), then close entries.
     for entry in round_entries {
-        mark_entry_in_sync(ctx, entry).await?;
+        if let Err(error) = mark_entry_in_sync(ctx, entry).await {
+            // A guarded local-apply failure at this owned site, recorded
+            // before it aborts the round (the transitions below would clear
+            // errors; they have not run yet, so this is the newest failure).
+            ctx.record_outbox_failure(entry.operation_id, &error).await;
+            return Err(error);
+        }
         ctx.state
             .transition_outbox(ctx.connection, entry.operation_id, OutboxTransition::Published)
             .await?;
@@ -718,7 +880,20 @@ async fn finish_commit<R: RemoteOps>(
                 OutboxTransition::LocalApplyPending,
             )
             .await?;
-        apply::complete_publication(ctx.state, ctx.connection, entry.operation_id).await?;
+        if let Err(error) = apply::complete_publication(ctx.state, ctx.connection, entry.operation_id).await {
+            // The local-apply/close failure is recorded after the transitions
+            // above (which cleared stale errors), so it is the newest one.
+            ctx.record_outbox_error(
+                entry.operation_id,
+                crate::sync::work_errors::codes::LOCAL_APPLY_FAILED,
+                &format!(
+                    "closing the published work failed: {}",
+                    crate::sync::work_errors::state_code(&error)
+                ),
+            )
+            .await;
+            return Err(PublishError::State(error));
+        }
         outcome.published_operations.push(entry.operation_id);
     }
 
@@ -791,13 +966,24 @@ async fn mark_entry_in_sync<R: RemoteOps>(
     let Some(path) = item_path(ctx, item_id).await else { return Ok(()); };
     let observation = ctx.state.observation(ctx.connection, item_id).await?;
     let generation = observation.map(|o| o.generation).unwrap_or(entry.observed_generation);
-    apply::mark_published_in_sync(
+    let content = intent.pending_content().ok_or(PublishError::UnsupportedFormat)?;
+    let version = VersionId::from_uuid(content.version_id).map_err(|_| PublishError::UnsupportedFormat)?;
+    let identity = hfdrive_windows::cfapi::identity::PlaceholderIdentity::file(ctx.workspace, item_id, version);
+    let marked = apply::mark_published_in_sync(
         &ctx.root.join(&path),
+        &identity,
         &evidence,
         generation,
         entry.observed_generation,
     )
     .map_err(PublishError::LocalApply)?;
+    if let Some(usn) = marked {
+        if let Ok(usn) = u64::try_from(usn) {
+            ctx.state.update_observed_usn(ctx.connection, item_id, entry.observed_generation, usn).await?;
+        }
+    } else if generation == entry.observed_generation {
+        return Err(PublishError::LocalApply("the published source no longer matches its capture"));
+    }
     Ok(())
 }
 
@@ -818,11 +1004,31 @@ pub async fn execute_pending_actions<R: RemoteOps>(
         .await?;
     let mut applied = 0;
     for row in pending {
-        if execute_one_action(ctx, &row).await? {
-            ctx.state
-                .set_local_action_state(ctx.connection, row.action_id, LocalActionState::Applied)
-                .await?;
-            applied += 1;
+        match execute_one_action(ctx, &row).await {
+            Ok(true) => {
+                // Durable state advance clears stale errors for this action;
+                // nothing new to record on success.
+                ctx.state
+                    .set_local_action_state(ctx.connection, row.action_id, LocalActionState::Applied)
+                    .await?;
+                applied += 1;
+            }
+            // A guard refusal keeps the row pending: not a failure, no record.
+            Ok(false) => {}
+            Err(error) => {
+                // The failure is recorded after the attempt so the persisted
+                // error always describes the most recent actual failure
+                // (any earlier state advance already cleared stale errors).
+                // Normal cancellation is never recorded as a failure.
+                crate::sync::work_errors::record_action_failure(
+                    ctx.state,
+                    ctx.connection,
+                    row.action_id,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
         }
     }
     Ok(applied)
@@ -1059,7 +1265,25 @@ fn hex_file_id(file_id: &[u8; 16]) -> String {
 /// an earlier staged capture died), then the upload advances `PayloadReady`.
 /// An entry that already staged a usable coherent snapshot resumes upload
 /// from that file and never recaptures.
+///
+/// Every real failure (capture, upload checkpoint, journal/state write) is
+/// recorded against this operation's transfer and outbox work rows with its
+/// classified code, after the attempt — so a stored error always describes
+/// the newest actual failure. Normal cancellation records nothing.
 pub async fn upload_entry<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+    entry: &OutboxEntry,
+) -> Result<(), PublishError> {
+    let result = upload_entry_inner(ctx, entry).await;
+    if let Err(error) = &result {
+        let transfer = transfer_id_for(entry.operation_id);
+        ctx.record_transfer_failure(transfer, error).await;
+        ctx.record_outbox_failure(entry.operation_id, error).await;
+    }
+    result
+}
+
+async fn upload_entry_inner<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     entry: &OutboxEntry,
 ) -> Result<(), PublishError> {
@@ -1079,29 +1303,37 @@ pub async fn upload_entry<R: RemoteOps>(
     let mut journal = load_journal(ctx.state, ctx.connection, entry.operation_id).await?;
     let mut staged = None;
     if let Some(snapshot_id) = entry.snapshot_id {
-        let row = ctx
-            .state
-            .snapshot(ctx.connection, snapshot_id)
-            .await?
-            .ok_or_else(|| PublishError::Capture("staged snapshot row is missing".to_owned()))?;
-        if let Ok(payload) = staged_payload(entry, &row) {
-            staged = Some(payload);
+        match ctx.state.snapshot(ctx.connection, snapshot_id).await {
+            Ok(Some(row)) => {
+                if let Ok(payload) = staged_payload(entry, &row) {
+                    staged = Some(payload);
+                }
+            }
+            Ok(None) => {
+                return Err(PublishError::Capture {
+                    code: crate::sync::work_errors::codes::SNAPSHOT_UNAVAILABLE,
+                    detail: "staged snapshot row is missing".to_owned(),
+                });
+            }
+            Err(error) => return Err(PublishError::State(error)),
         }
     }
 
     let staged = match staged {
         Some(staged) => {
             if journal.capture.is_none() {
-                return Err(PublishError::Capture(
-                    "capture evidence is missing for a staged payload".to_owned(),
-                ));
+                return Err(PublishError::Capture {
+                    code: crate::sync::work_errors::codes::CAPTURE_EVIDENCE_MISSING,
+                    detail: "capture evidence is missing for a staged payload".to_owned(),
+                });
             }
             staged
         }
         None => {
-            let source = item_path(ctx, item_id)
-                .await
-                .ok_or_else(|| PublishError::Capture("the source path is unknown".to_owned()))?;
+            let source = item_path(ctx, item_id).await.ok_or_else(|| PublishError::Capture {
+                code: crate::sync::work_errors::codes::SOURCE_UNAVAILABLE,
+                detail: "the source path is unknown".to_owned(),
+            })?;
             let snapshot_id = SnapshotId::new();
             let request = crate::sync::capture::CaptureRequest {
                 connection_id: ctx.connection,
@@ -1114,7 +1346,7 @@ pub async fn upload_entry<R: RemoteOps>(
                 expected: None,
                 root: ctx.root.to_path_buf(),
             };
-            let captured = crate::sync::capture::capture_local_change(
+            let captured = match crate::sync::capture::capture_local_change(
                 ctx.state,
                 ctx.scheduler,
                 *ctx.workspace.as_uuid(),
@@ -1122,7 +1354,15 @@ pub async fn upload_entry<R: RemoteOps>(
                 ctx.cancel,
             )
             .await
-            .map_err(|error| PublishError::Capture(error.to_string()))?;
+            {
+                Ok(captured) => captured,
+                Err(error) => {
+                    return Err(PublishError::Capture {
+                        code: error.error_code(),
+                        detail: error.detail(),
+                    });
+                }
+            };
             // Durable capture evidence before any network effect.
             journal.capture = Some(CaptureEvidence {
                 volume_serial_number: captured.evidence.volume_serial_number,
@@ -1142,7 +1382,9 @@ pub async fn upload_entry<R: RemoteOps>(
 
             // Bind the staged file to the entry through the legal edge:
             // Observed -> SnapshotReady; a dead prior capture recaptures
-            // through Recaptured (-> Observed) first.
+            // through Recaptured (-> Observed) first. These transitions clear
+            // stale work errors, so a failure below records its new cause
+            // afterwards.
             match entry.state {
                 OutboxState::Observed => {
                     ctx.state
@@ -1170,9 +1412,10 @@ pub async fn upload_entry<R: RemoteOps>(
                         .await?;
                 }
                 _ => {
-                    return Err(PublishError::Capture(
-                        "upload is only valid before payload binding".to_owned(),
-                    ));
+                    return Err(PublishError::Capture {
+                        code: crate::sync::work_errors::codes::INVALID_STATE,
+                        detail: "upload is only valid before payload binding".to_owned(),
+                    });
                 }
             }
             captured.staged
@@ -1180,34 +1423,22 @@ pub async fn upload_entry<R: RemoteOps>(
     };
     let snapshot: StableSnapshot = staged.stable_snapshot();
 
-    // Xet checkpoint 1: ingestion.
-    let ingested = ctx.remote.ingest_payload(&snapshot, ctx.cancel).await?;
-    journal.ingested = Some(ingested);
-    save_journal(
-        ctx.state,
-        ctx.connection,
-        entry.operation_id,
-        &journal,
-        TransferState::InProgress,
-    )
-    .await?;
-
-    // Xet checkpoint 2: CAS commit.
-    let ingested_ref = journal.ingested.as_ref().unwrap();
-    let committed = ctx.remote.commit_payload_cas(&snapshot, ingested_ref, ctx.cancel).await?;
-    journal.cas_committed = Some(committed);
-    save_journal(
-        ctx.state,
-        ctx.connection,
-        entry.operation_id,
-        &journal,
-        TransferState::InProgress,
-    )
-    .await?;
-
-    // Xet checkpoint 3: exact key binding.
-    let committed_ref = journal.cas_committed.as_ref().unwrap();
-    let object = ctx.remote.bind_payload(&snapshot, committed_ref, ctx.cancel).await?;
+    // Resume at the first missing durable boundary. Re-ingesting after CAS
+    // commitment wastes sessions and cannot add evidence for the key binding.
+    if journal.ingested.is_none() && journal.cas_committed.is_none() {
+        journal.ingested = Some(ctx.remote.ingest_payload(&snapshot, ctx.cancel).await?);
+        save_journal(ctx.state, ctx.connection, entry.operation_id, &journal, TransferState::InProgress).await?;
+    }
+    if journal.cas_committed.is_none() {
+        let ingested = journal.ingested.as_ref().ok_or(PublishError::UnsupportedFormat)?;
+        journal.cas_committed = Some(ctx.remote.commit_payload_cas(&snapshot, ingested, ctx.cancel).await?);
+        save_journal(ctx.state, ctx.connection, entry.operation_id, &journal, TransferState::InProgress).await?;
+    }
+    let committed = journal.cas_committed.as_ref().ok_or(PublishError::UnsupportedFormat)?;
+    let object = match ctx.remote.bind_payload(&snapshot, committed, ctx.cancel).await {
+        Ok(object) => object,
+        Err(error) => return Err(PublishError::Remote(error)),
+    };
     save_journal(
         ctx.state,
         ctx.connection,
@@ -1461,3 +1692,64 @@ fn now_100ns() -> i64 {
 
 /// Re-exported planning helper used by the controller.
 pub use plan::ready_to_plan;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+
+    #[tokio::test]
+    async fn quiet_head_poll_records_observation_without_advancing_publication() {
+        let fixture = connection_fixture().await;
+        let directory = &fixture.directory;
+        let root = &fixture.root;
+        let account = &fixture.account;
+        let workspace = fixture.workspace;
+        let root_item = fixture.root_item;
+        let connection = fixture.connection;
+        let applied = CommitId::new();
+        let prior_publication = CommitId::new();
+        account.set_baseline(connection, BaselineKind::Applied, Some(applied)).await.unwrap();
+        account.set_baseline(connection, BaselineKind::Published, Some(prior_publication)).await.unwrap();
+        let remote = HeadOnlyRemote {
+            head: Some(RemoteHead {
+                head: HeadV1 {
+                    format: format::FORMAT_NAME.to_owned(),
+                    schema_version: format::SCHEMA_VERSION,
+                    workspace_id: workspace,
+                    root_item_id: root_item,
+                    commit_id: applied,
+                    generation: GenerationId::new(),
+                    required_features: Vec::new(),
+                },
+                etag: None,
+            }),
+        };
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        for (mode, writable) in [(ReconcileMode::ReadOnly, false), (ReconcileMode::Writable, true)] {
+            account.set_baseline(connection, BaselineKind::Observed, None).await.unwrap();
+            let context = RoundContext {
+                state: &account,
+                remote: &remote,
+                connection,
+                workspace,
+                root_item_id: root_item,
+                device_id: DeviceId::new(),
+                mode,
+                root: &root,
+                staging_dir: directory.path(),
+                recovery_dir: directory.path(),
+                scheduler: &scheduler,
+                cancel: &cancel,
+            };
+            run_round(&context, writable).await.unwrap();
+            let baseline = account.baseline(connection).await.unwrap();
+            assert_eq!(baseline.observed_commit, Some(applied));
+            assert_eq!(baseline.applied_commit, Some(applied));
+            assert_eq!(baseline.published_commit, Some(prior_publication));
+        }
+        fixture.state.close().await.unwrap();
+    }
+}

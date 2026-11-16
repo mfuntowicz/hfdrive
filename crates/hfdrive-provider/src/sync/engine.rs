@@ -30,8 +30,11 @@ use hfdrive_state::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::remote_watch::{RemoteEvents, RemoteWatch, WatchControl, WatchNotice};
 use crate::scheduler::Scheduler;
-use crate::sync::controller::{ConnectionConfig, ConnectionHealth, ConnectionRuntime};
+use crate::sync::controller::{
+    ConnectionConfig, ConnectionHealth, ConnectionRuntime, WatchFailure, WatchUpdate,
+};
 use crate::sync::publish::{PublishError, initialize_workspace};
 use crate::sync::registry::{self, AdmissionError, AdmissionEvidence};
 use crate::sync::remote::RemoteOps;
@@ -153,6 +156,161 @@ fn resolution_sides(value: &serde_json::Value) -> Option<Vec<ResolutionSide>> {
     }).collect()
 }
 
+/// Runs one connection's remote-watch worker.
+///
+/// Scope rule: this worker owns **only** its own child cancellation token.
+/// Nothing here may cancel the connection scope (the token the CFAPI pump and
+/// the drive loop share): an SSE/poll transport failure, a `StreamUnavailable`
+/// notice, or a persistence failure of one invalidation must never disconnect
+/// the sync root or stop synchronization. The failure is recorded through
+/// [`WatchUpdate::WatchFailed`] (observable in connection health) and:
+///
+/// * a persistence failure leaves the cursor **unacknowledged** and the
+///   notice outstanding (the watch coalesces later triggers into it and
+///   replays from the last acknowledged position on reconnect); the watch
+///   loop keeps running — there is no restart and the independent runtime
+///   interval/poll keeps driving work;
+/// * the run future is polled by exactly one owner; the cleanup join point
+///   reuses that owner and never polls a completed future twice;
+/// * parent-scope cancellation still ends this worker: it is observed as its
+///   own token firing (a child of the cancelled scope).
+async fn run_connection_watch<E: RemoteEvents>(
+    watch: RemoteWatch,
+    control: WatchControl,
+    event_source: E,
+    connection_id: ConnectionId,
+    account: AccountStore,
+    notifications: tokio::sync::mpsc::Sender<WatchUpdate>,
+    cancel: CancellationToken,
+) {
+    let (notices_tx, mut notices_rx) = tokio::sync::mpsc::channel(16);
+    let mut run = Box::pin(watch.run(
+        event_source,
+        resume_cursor(&account, connection_id).await,
+        notices_tx,
+        cancel.clone(),
+    ));
+    let mut run_done = false;
+    let mut notice_channel_open = true;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = &mut run, if !run_done => {
+                // The watch ended on its own. From here on the run future is
+                // complete and is never polled again; the teardown below
+                // skips the join for exactly this reason.
+                run_done = true;
+                let _ = result;
+                break;
+            }
+            notice = notices_rx.recv(), if notice_channel_open => {
+                let Some(notice) = notice else {
+                    // The watch run has released its sender. Its completion is
+                    // joined through the run branch (guarded by `run_done`):
+                    // disabling this branch is what keeps a closed channel
+                    // from spinning `select!`.
+                    notice_channel_open = false;
+                    continue;
+                };
+                let (cursor, source, failure) = match notice {
+                    WatchNotice::HeadInvalidated { cursor, source } => {
+                        // A poll carries no cursor: a cursor-less invalidation
+                        // must never erase the durable resume position. Only
+                        // the notice's own cursor advances it.
+                        let durable_cursor = match &cursor {
+                            Some(value) => Some(value.as_str().to_owned()),
+                            None => resume_cursor(&account, connection_id)
+                                .await
+                                .map(|value| value.as_str().to_owned()),
+                        };
+                        let persisted = account.record_head_invalidation(connection_id, durable_cursor).await;
+                        match persisted {
+                            Ok(_) => (cursor, source, None),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    connection = %connection_id,
+                                    "remote change could not be recorded durably; \
+                                     the cursor is not acknowledged and the change is replayed on reconnect"
+                                );
+                                // The cursor is deliberately NOT acknowledged:
+                                // a reconnect must replay this change.
+                                (None, source, Some(WatchFailure::Persistence))
+                            }
+                        }
+                    }
+                    WatchNotice::Reset => (
+                        None,
+                        crate::remote_watch::NoticeSource::Resync,
+                        match account.record_head_invalidation(connection_id, None).await {
+                            Ok(_) => None,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    connection = %connection_id,
+                                    "remote reset could not be recorded durably; \
+                                     the cursor is not acknowledged and the reset replays on reconnect"
+                                );
+                                Some(WatchFailure::Persistence)
+                            }
+                        },
+                    ),
+                    WatchNotice::StreamUnavailable { issue, .. } => {
+                        // The independent poll keeps running inside the watch
+                        // loop; report the stream condition and release the
+                        // coalesced notice slot without advancing any cursor.
+                        control.acknowledge(None);
+                        let _ = notifications.try_send(WatchUpdate::WatchFailed(
+                            WatchFailure::Stream(issue),
+                        ));
+                        continue;
+                    }
+                };
+                match failure {
+                    Some(failure) => {
+                        // The notice stays outstanding and unacknowledged:
+                        // the watch keeps coalescing later triggers into it
+                        // and its cursor resumes from the last acknowledged
+                        // position. The watch is never restarted here (its run
+                        // future has exactly one owner) and this failure never
+                        // touches the parent connection scope: the CFAPI pump
+                        // and the runtime's independent interval/poll keep
+                        // driving work.
+                        let _ = notifications.try_send(WatchUpdate::WatchFailed(failure));
+                    }
+                    None => {
+                        control.acknowledge(cursor);
+                        // A full queue already represents a pending drive: the
+                        // durable invalidation and the runtime's periodic
+                        // round remain intact.
+                        let _ = notifications.try_send(WatchUpdate::HeadInvalidated { source });
+                    }
+                }
+            }
+        }
+    }
+    // Teardown: only this worker's own scope. A completed run future is not
+    // polled again; the join happens exactly once and only for a run that has
+    // not completed.
+    cancel.cancel();
+    if !run_done {
+        let _ = (&mut run).await;
+    }
+}
+
+/// The durable resume position: the persisted event cursor of this
+/// connection, validated as an opaque cursor. An invalid persisted value is
+/// never used to skip events; the watch starts from the beginning instead.
+async fn resume_cursor(account: &AccountStore, connection_id: ConnectionId) -> Option<hfdrive_hf::EventCursor> {
+    account
+        .scan_state(connection_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|scan| scan.cursor)
+        .and_then(|cursor| hfdrive_hf::EventCursor::new(cursor).ok())
+}
+
 /// One registered connection entry. The remote services live inside the
 /// runtime; the registry keeps the runtime handle and mode.
 struct Registered<R: RemoteOps> {
@@ -166,6 +324,10 @@ pub struct SyncEngine<R: RemoteOps> {
     config: EngineConfig,
     state: Arc<StateStore>,
     scheduler: Arc<Scheduler>,
+    /// The provider-wide live-work registry (one shared instance for every
+    /// connection's CFAPI pump). No new config field: the engine creates it
+    /// in [`SyncEngine::new`] and hands it to each runtime.
+    activity: Arc<crate::sync::activity::ActivityRegistry>,
     running: Mutex<HashMap<ConnectionId, Registered<R>>>,
     cancel: CancellationToken,
 }
@@ -178,12 +340,26 @@ impl<R: RemoteOps> SyncEngine<R> {
         scheduler: Arc<Scheduler>,
         cancel: CancellationToken,
     ) -> Self {
-        Self { config, state, scheduler, running: Mutex::new(HashMap::new()), cancel }
+        Self {
+            config,
+            state,
+            scheduler,
+            activity: Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            running: Mutex::new(HashMap::new()),
+            cancel,
+        }
     }
 
     /// The shared scheduler (provider-wide, never per connection).
     pub fn scheduler(&self) -> &Arc<Scheduler> {
         &self.scheduler
+    }
+
+    /// The provider-wide live-work registry used by every connection's CFAPI
+    /// pump. The activity projection reads in-flight spans through
+    /// [`crate::sync::activity::ActivityRegistry::snapshot`].
+    pub(crate) fn activity_registry(&self) -> &crate::sync::activity::ActivityRegistry {
+        &self.activity
     }
 
     /// Admission evidence for a candidate connection. Pure validation: no
@@ -221,11 +397,87 @@ impl<R: RemoteOps> SyncEngine<R> {
         account: AccountStore,
     ) -> Result<Arc<ConnectionRuntime<R>>, EngineError> {
         let connection_id = config.connection_id;
-        let workspace = config.workspace;
         let mut running = self.running.lock().await;
-        if let Some(entry) = running.get(&connection_id) {
-            return Ok(entry.runtime.clone());
+        if let Some(existing) = running.get(&connection_id).map(|entry| entry.runtime.clone()) {
+            // Idempotent connect reuses a registry entry only while its CFAPI
+            // runtime is actually driving the root. A stale entry (missing,
+            // cancelled or finished runtime) is not a successful connect: it
+            // is drained and the existing root is reconnected below —
+            // registration identity, durable state and work are preserved
+            // and no remote work is ever reinitialized on this path.
+            if existing.runtime_state().await.is_active() {
+                return Ok(existing);
+            }
+            let stale = running
+                .remove(&connection_id)
+                .expect("the entry exists under the map lock");
+            if let Err((error, _drained)) = Self::stop_entry(stale).await {
+                tracing::warn!(
+                    %error,
+                    connection = %connection_id,
+                    "stale connection runtime did not drain cleanly; reconnecting the existing root"
+                );
+            }
         }
+        self.connect_locked(&mut running, config, services, validated, account)
+            .await
+    }
+
+    /// Replaces one connection's runtime and its remote services atomically:
+    /// any existing entry, active or stale, is stopped and drained first, so
+    /// an existing active runtime can never retain stale remote services
+    /// (repaired publication credentials must reach the live transport).
+    /// Registration identity, durable state and work are preserved and the
+    /// same root is reconnected; nothing is ever reinitialized here.
+    pub async fn reconnect(
+        &self,
+        config: ConnectionConfig,
+        services: ConnectionServices<R>,
+        validated: &hfdrive_windows::filesystem::validate::ValidatedRoot,
+        account: AccountStore,
+    ) -> Result<Arc<ConnectionRuntime<R>>, EngineError> {
+        let mut running = self.running.lock().await;
+        if let Some(entry) = running.remove(&config.connection_id) {
+            if let Err((error, entry)) = Self::stop_entry(entry).await {
+                // Keep the entry for the next connect's stale drain (the
+                // runtime is no longer driving the root either way) and
+                // surface the failure instead of silently continuing.
+                running.insert(config.connection_id, entry);
+                return Err(error);
+            }
+        }
+        self.connect_locked(&mut running, config, services, validated, account)
+            .await
+    }
+
+    /// Quiesces one connection's remote dispatch in memory and waits for its
+    /// in-flight drive round to finish; observation and the durable pause
+    /// intent continue untouched. A connection without a runtime has nothing
+    /// dispatching and quiesces trivially.
+    pub async fn quiesce(&self, connection_id: ConnectionId) -> Result<(), EngineError> {
+        let runtime = {
+            let running = self.running.lock().await;
+            running.get(&connection_id).map(|entry| entry.runtime.clone())
+        };
+        if let Some(runtime) = runtime {
+            runtime.quiesce().await;
+        }
+        Ok(())
+    }
+
+    /// Registers, connects and starts one connection's runtime under the
+    /// connection registry lock. The remote services move into the runtime;
+    /// the engine keeps only the runtime.
+    async fn connect_locked(
+        &self,
+        running: &mut HashMap<ConnectionId, Registered<R>>,
+        config: ConnectionConfig,
+        services: ConnectionServices<R>,
+        validated: &hfdrive_windows::filesystem::validate::ValidatedRoot,
+        account: AccountStore,
+    ) -> Result<Arc<ConnectionRuntime<R>>, EngineError> {
+        let connection_id = config.connection_id;
+        let workspace = config.workspace;
         let start_paused = config.start_paused || account
             .settings(format!("connection/{connection_id}/paused"))
             .await?
@@ -243,56 +495,21 @@ impl<R: RemoteOps> SyncEngine<R> {
         let (notifications_tx, notifications_rx) = tokio::sync::mpsc::channel(64);
         let mut watch_task = match services.remote.event_source() {
             Ok(event_source) => {
-                let watch_cancel = connection_cancel.clone();
+                // The watch runs in its own strictly narrower scope: its child
+                // token stops only this observation worker. A watch or
+                // persistence failure must never cancel the connection scope,
+                // which owns the CFAPI pump and the drive loop.
+                let watch_cancel = connection_cancel.child_token();
                 let (watch, control) = crate::remote_watch::RemoteWatch::new(Default::default());
-                let state_for_watch = account.clone();
-                Some(tokio::spawn(async move {
-                    let resume = state_for_watch.scan_state(connection_id).await.ok().flatten()
-                        .and_then(|scan| scan.cursor)
-                        .and_then(|cursor| hfdrive_hf::EventCursor::new(cursor).ok());
-                    let (notices_tx, mut notices_rx) = tokio::sync::mpsc::channel(16);
-                    let mut run = Box::pin(watch.run(
-                        event_source,
-                        resume,
-                        notices_tx,
-                        watch_cancel.clone(),
-                    ));
-                    loop {
-                        tokio::select! {
-                            _ = watch_cancel.cancelled() => break,
-                            _ = &mut run => break,
-                            notice = notices_rx.recv() => {
-                                let Some(notice) = notice else { break; };
-                                let (cursor, persisted) = match notice {
-                                    crate::remote_watch::WatchNotice::HeadInvalidated { cursor, .. } => {
-                                        let durable_cursor = cursor.as_ref().map(|value| value.as_str().to_owned());
-                                        let persisted = state_for_watch
-                                            .record_head_invalidation(connection_id, durable_cursor)
-                                            .await;
-                                        (cursor, persisted)
-                                    }
-                                    crate::remote_watch::WatchNotice::Reset => {
-                                        (None, state_for_watch.record_head_invalidation(connection_id, None).await)
-                                    }
-                                    crate::remote_watch::WatchNotice::StreamUnavailable { .. } => {
-                                        control.acknowledge(None);
-                                        continue;
-                                    }
-                                };
-                                if persisted.is_err() {
-                                    watch_cancel.cancel();
-                                    break;
-                                }
-                                control.acknowledge(cursor);
-                                // A full queue already represents a pending drive. The durable
-                                // invalidation and the runtime's periodic round remain intact.
-                                let _ = notifications_tx.try_send(());
-                            }
-                        }
-                    }
-                    watch_cancel.cancel();
-                    let _ = run.await;
-                }))
+                Some(tokio::spawn(run_connection_watch(
+                    watch,
+                    control,
+                    event_source,
+                    connection_id,
+                    account.clone(),
+                    notifications_tx,
+                    watch_cancel,
+                )))
             }
             Err(_) => None,
         };
@@ -301,6 +518,7 @@ impl<R: RemoteOps> SyncEngine<R> {
             account.clone(),
             services.remote,
             self.scheduler.clone(),
+            self.activity.clone(),
             connection_cancel.clone(),
             notifications_rx,
         );
@@ -344,11 +562,20 @@ impl<R: RemoteOps> SyncEngine<R> {
         Ok(())
     }
 
-    /// Per-connection health projection.
+    /// Per-connection health projection. The runtime liveness is folded in by
+    /// the async [`ConnectionRuntime::health`] (never a stale snapshot), and
+    /// the registry lock is released before it runs so foreground status never
+    /// waits behind connection restoration or drain work holding this map.
     pub async fn health(&self, connection_id: ConnectionId) -> Result<ConnectionHealth, EngineError> {
-        let running = self.running.lock().await;
-        let entry = running.get(&connection_id).ok_or(EngineError::UnknownConnection)?;
-        Ok(entry.runtime.health())
+        let runtime = {
+            let running = self.running.lock().await;
+            running
+                .get(&connection_id)
+                .ok_or(EngineError::UnknownConnection)?
+                .runtime
+                .clone()
+        };
+        Ok(runtime.health().await)
     }
 
     /// Pauses one connection's remote scheduling (observation continues).
@@ -778,3 +1005,372 @@ impl<R: RemoteOps> SyncEngine<R> {
 
 /// Re-exported for the parent's construction of the engine.
 pub use crate::sync::controller::ConnectionConfig as RuntimeConfig;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use hfdrive_core::ids::{AccountKey, WorkspaceId};
+    use hfdrive_core::storage::{
+        BucketBinding, BucketId, BucketName, DriveBinding, Namespace, OwnerId, OwnerKind,
+        RemotePrefix,
+    };
+    use hfdrive_hf::{EventCursor, NativeError, NativeEvent};
+    use hfdrive_state::{
+        AccountRecord, AccountStatus, ConnectionMode, CredentialRef, SetupDraft, StatePaths,
+    };
+
+    // ---- deterministic fake event feed --------------------------
+
+    #[derive(Default)]
+    struct FakeFeedState {
+        /// One script per `open_events` call. A missing script is a dead
+        /// stream (transport failure), exactly like the watch-loop tests.
+        feeds: std::sync::Mutex<VecDeque<Vec<Result<Option<NativeEvent>, NativeError>>>>,
+    }
+
+    struct FakeFeed {
+        events: VecDeque<Result<Option<NativeEvent>, NativeError>>,
+    }
+
+    impl crate::remote_watch::EventFeed for FakeFeed {
+        fn next_event<'a>(
+            &'a mut self,
+            _cancel: &'a CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<NativeEvent>, NativeError>> + Send + 'a>> {
+            let next = self.events.pop_front();
+            Box::pin(async move { next.unwrap_or(Ok(None)) })
+        }
+
+        fn idle_for(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    struct FakeEvents {
+        state: Arc<FakeFeedState>,
+    }
+
+    impl RemoteEvents for FakeEvents {
+        fn open_events(
+            &self,
+            _resume: Option<EventCursor>,
+            _cancel: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn crate::remote_watch::EventFeed>, NativeError>> + Send>>
+        {
+            let script = self
+                .state
+                .feeds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front();
+            Box::pin(async move {
+                match script {
+                    Some(events) => Ok(Box::new(FakeFeed { events: events.into() })
+                        as Box<dyn crate::remote_watch::EventFeed>),
+                    None => Err(NativeError::Transport),
+                }
+            })
+        }
+    }
+
+    /// An open that never answers on its own: the watch sits inside its
+    /// observation until the owning scope ends it.
+    struct PendingEvents;
+
+    impl RemoteEvents for PendingEvents {
+        fn open_events(
+            &self,
+            _resume: Option<EventCursor>,
+            _cancel: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn crate::remote_watch::EventFeed>, NativeError>> + Send>>
+        {
+            Box::pin(std::future::pending::<
+                Result<Box<dyn crate::remote_watch::EventFeed>, NativeError>,
+            >())
+        }
+    }
+
+    fn change(raw: &str) -> NativeEvent {
+        NativeEvent::Changes {
+            cursor: Some(EventCursor::new(raw.to_owned()).unwrap()),
+            changes: vec![hfdrive_hf::NativeChange {
+                key: "HEAD".to_owned(),
+                op: hfdrive_hf::ChangeOp::Update,
+                size: None,
+                xet_file_id: None,
+                uploaded_at: None,
+                mtime: None,
+                mtime_nanos: None,
+            }],
+        }
+    }
+
+    fn watch_config(poll: Duration) -> crate::remote_watch::WatchConfig {
+        crate::remote_watch::WatchConfig {
+            poll_interval: (poll, poll),
+            stream_idle_timeout: Duration::from_secs(3600),
+            backoff_base: Duration::from_millis(1),
+            backoff_ceiling: Duration::from_millis(20),
+            jitter_seed: Some(7),
+        }
+    }
+
+    // ---- real temp StateStore fixtures --------------------------
+
+    async fn open_state() -> (tempfile::TempDir, Arc<StateStore>, AccountStore) {
+        let directory = tempfile::tempdir().expect("test state directory");
+        let state = Arc::new(
+            StateStore::open(StatePaths::new(directory.path().to_path_buf()))
+                .await
+                .expect("test state store"),
+        );
+        let account_key = AccountKey::from_subject("https://huggingface.co", "engine-watch-test");
+        state
+            .record_account(AccountRecord {
+                account_key,
+                issuer: "https://huggingface.co".to_owned(),
+                subject: "engine-watch-test".to_owned(),
+                namespace: "fixture-person".to_owned(),
+                credential_ref: CredentialRef("oauth.hfdcred".to_owned()),
+                auth_epoch: 1,
+                status: AccountStatus::Active,
+            })
+            .await
+            .expect("test account");
+        let account = state.open_account(account_key).await.expect("test account handle");
+        (directory, state, account)
+    }
+
+    fn drive_binding(account_key: AccountKey) -> DriveBinding {
+        DriveBinding {
+            account_key,
+            bucket: BucketBinding {
+                bucket_id: BucketId::new("bucket-01".to_owned()).unwrap(),
+                bucket_name: BucketName::new("engine-fixture".to_owned()).unwrap(),
+                owner_id: OwnerId::new("owner-01".to_owned()).unwrap(),
+                owner_kind: OwnerKind::Personal,
+                owner_namespace: Namespace::new("fixture-person".to_owned()).unwrap(),
+            },
+            prefix: RemotePrefix::new(format!("hfdrive/{}", WorkspaceId::new())).unwrap(),
+            workspace_id: WorkspaceId::new(),
+        }
+    }
+
+    /// Registers one real connection through the setup journal, so its durable
+    /// `event_cursors` row exists exactly as production registration creates it.
+    async fn registered_connection(
+        state: &StateStore,
+        account_key: AccountKey,
+        root: &Path,
+    ) -> ConnectionId {
+        let setup = state
+            .reserve_setup(SetupDraft {
+                operation_id: OperationId::new(),
+                account_key,
+                binding: drive_binding(account_key),
+                initialize: false,
+            })
+            .await
+            .expect("test setup");
+        state
+            .attach_setup_preview(
+                setup.setup_id,
+                serde_json::json!({"fixture": true}),
+                root.to_path_buf(),
+                ConnectionMode::ReadOnly,
+            )
+            .await
+            .expect("test preview");
+        state.finalize_setup(setup.setup_id).await.expect("test registration");
+        setup.connection_id
+    }
+
+    /// A failed durable recording of one invalidation is reported truthfully
+    /// and changes **nothing** else: the connection scope the CFAPI pump and
+    /// the drive loop share stays alive, the watch keeps observing (there is
+    /// no restart-and-die loop), and the notice's cursor is never
+    /// acknowledged — it stays outstanding and coalesces later triggers
+    /// instead of faking recovery.
+    #[tokio::test]
+    async fn persistence_failure_keeps_the_connection_scope_alive_and_the_cursor_unacknowledged() {
+        let (_directory, _state, account) = open_state().await;
+        // A connection whose durable `event_cursors` row is absent is the
+        // exact production persistence failure (recording one invalidation
+        // errors) this worker must survive without touching any parent scope.
+        let connection = ConnectionId::new();
+        let shared = Arc::new(FakeFeedState::default());
+        shared.feeds.lock().unwrap().push_back(vec![
+            Ok(Some(change("c1"))),
+            Ok(Some(change("c2"))),
+            Ok(None),
+        ]);
+        let (watch, control) =
+            crate::remote_watch::RemoteWatch::new(watch_config(Duration::from_secs(3600)));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::channel(64);
+        let connection_cancel = CancellationToken::new();
+        let watch_cancel = connection_cancel.child_token();
+        let task = tokio::spawn(run_connection_watch(
+            watch,
+            control.clone(),
+            FakeEvents { state: shared.clone() },
+            connection,
+            account.clone(),
+            updates_tx,
+            watch_cancel.clone(),
+        ));
+        let update = tokio::time::timeout(Duration::from_secs(5), updates_rx.recv())
+            .await
+            .expect("watch update")
+            .expect("watch worker alive");
+        assert!(
+            matches!(update, WatchUpdate::WatchFailed(WatchFailure::Persistence)),
+            "the durable recording failure is reported, not swallowed: {update:?}"
+        );
+        assert!(
+            control.acknowledged_cursor().is_none(),
+            "a failed persistence never acknowledges a cursor; a reconnect must replay the change"
+        );
+        // The notice stays outstanding: later triggers coalesce into it and no
+        // further update is delivered until it is durably applied.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), updates_rx.recv()).await.is_err(),
+            "an unacknowledged notice keeps coalescing; no fake recovery is reported"
+        );
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a watch failure must never cancel the connection/CFAPI scope"
+        );
+        assert!(
+            !watch_cancel.is_cancelled(),
+            "the watch keeps observing; there is no failure-restart that kills its own scope"
+        );
+        assert!(!task.is_finished(), "the watch worker survives its persistence failure");
+        connection_cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// Parent (connection/CFAPI scope) cancellation ends the watch worker
+    /// through its child token and joins it promptly.
+    #[tokio::test]
+    async fn parent_cancellation_terminates_the_watch_worker() {
+        let (_directory, _state, account) = open_state().await;
+        let connection = ConnectionId::new();
+        let (watch, control) =
+            crate::remote_watch::RemoteWatch::new(watch_config(Duration::from_secs(3600)));
+        let (updates_tx, _updates_rx) = tokio::sync::mpsc::channel(8);
+        let connection_cancel = CancellationToken::new();
+        let watch_cancel = connection_cancel.child_token();
+        let task = tokio::spawn(run_connection_watch(
+            watch,
+            control,
+            PendingEvents,
+            connection,
+            account,
+            updates_tx,
+            watch_cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "the watch is live before cancellation");
+        assert!(!watch_cancel.is_cancelled());
+        connection_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("parent cancellation terminates the watch")
+            .unwrap();
+    }
+
+    /// Cursor semantics at the durable boundary: a cursor-less poll
+    /// invalidation re-records the existing resume position and never erases
+    /// it; a feed reset clears the replayed position (its cursor is expired —
+    /// the authoritative HEAD must be re-read) and requests that re-read.
+    #[tokio::test]
+    async fn poll_notices_preserve_the_durable_cursor_and_reset_clears_it() {
+        let (_directory, state, account) = open_state().await;
+        let root = std::env::temp_dir().join("hfdrive-engine-watch-root");
+        let connection =
+            registered_connection(&state, account.account_key(), &root).await;
+        // Seed the durable resume position and clear its pending flag so the
+        // reset's effect is observable on its own.
+        account
+            .record_head_invalidation(connection, Some("c0".to_owned()))
+            .await
+            .expect("seed cursor");
+        account.ack_head_refresh(connection).await.expect("clear pending flag");
+
+        let shared = Arc::new(FakeFeedState::default());
+        // One empty feed (immediate EOF) then dead opens: only the independent
+        // poll fires notices until the reset script arrives.
+        shared.feeds.lock().unwrap().push_back(Vec::new());
+        let (watch, control) =
+            crate::remote_watch::RemoteWatch::new(watch_config(Duration::from_millis(25)));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::channel(64);
+        let connection_cancel = CancellationToken::new();
+        let task = tokio::spawn(run_connection_watch(
+            watch,
+            control,
+            FakeEvents { state: shared.clone() },
+            connection,
+            account.clone(),
+            updates_tx,
+            connection_cancel.child_token(),
+        ));
+
+        // Phase 1: a poll-sourced invalidation (no cursor of its own).
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), updates_rx.recv())
+                .await
+                .expect("poll update")
+                .expect("watch worker alive");
+            if matches!(
+                update,
+                WatchUpdate::HeadInvalidated {
+                    source: crate::remote_watch::NoticeSource::Poll
+                }
+            ) {
+                break;
+            }
+        }
+        let scan = account.scan_state(connection).await.expect("scan state").expect("cursor row");
+        assert_eq!(
+            scan.cursor.as_deref(),
+            Some("c0"),
+            "a cursor-less poll must never erase the durable resume position"
+        );
+
+        // Phase 2: the server resets the feed (replay expired).
+        shared
+            .feeds
+            .lock()
+            .unwrap()
+            .push_back(vec![Ok(Some(NativeEvent::Reset {
+                reason: "replay expired".to_owned(),
+            }))]);
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), updates_rx.recv())
+                .await
+                .expect("reset update")
+                .expect("watch worker alive");
+            if matches!(
+                update,
+                WatchUpdate::HeadInvalidated {
+                    source: crate::remote_watch::NoticeSource::Resync
+                }
+            ) {
+                break;
+            }
+        }
+        let scan = account.scan_state(connection).await.expect("scan state").expect("cursor row");
+        assert!(
+            scan.cursor.is_none(),
+            "a feed reset clears the replayed resume position; the authoritative HEAD is re-read"
+        );
+        assert!(scan.pending_head_refresh, "the reset's authoritative re-read is durably pending");
+
+        connection_cancel.cancel();
+        task.await.unwrap();
+    }
+}

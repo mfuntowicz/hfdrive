@@ -83,24 +83,25 @@ pub fn guard_state(evidence: &CaptureEvidence) -> FileState {
     evidence.to_file_state()
 }
 
-/// Marks a published placeholder in-sync **only** when the live file is still
-/// exactly the captured generation and the local generation is unchanged.
-/// Returns `true` when the in-sync transition was applied.
+/// Bind the committed version and mark it in-sync only for the captured local
+/// generation. Normal files are converted; existing placeholders keep resident
+/// bytes while their identity advances. Newer edits remain dirty.
 pub fn mark_published_in_sync(
     path: &Path,
+    identity: &PlaceholderIdentity,
     evidence: &CaptureEvidence,
     generation: u64,
     expected_generation: u64,
-) -> Result<bool, &'static str> {
+) -> Result<Option<i64>, &'static str> {
     if generation != expected_generation {
         // A newer local edit exists: the file stays dirty and gets its own
         // publication. This is the superseded-upload guard.
-        return Ok(false);
+        return Ok(None);
     }
     let expected = guard_state(evidence);
-    match hfdrive_windows::cfapi::ops::set_in_sync(path, &expected) {
-        Ok(GuardOutcome::Applied { .. }) => Ok(true),
-        Ok(GuardOutcome::Mismatch(_)) => Ok(false),
+    match hfdrive_windows::cfapi::ops::convert_published(path, identity, &expected) {
+        Ok(GuardOutcome::Applied { usn }) => Ok(usn),
+        Ok(GuardOutcome::Mismatch(_)) => Ok(None),
         Err(_) => Err("in-sync transition failed"),
     }
 }
@@ -406,6 +407,34 @@ mod tests {
         // Unknown USN on either side is never a match (no fake success).
         assert!(!verify_expected(&expected(4, None), &live(None), 4));
         assert!(!verify_expected(&expected(4, Some(11)), &live(None), 4));
+    }
+
+    #[test]
+    fn superseded_publication_leaves_newer_local_bytes_unconverted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("edited.txt");
+        std::fs::write(&path, b"captured bytes").unwrap();
+        let captured = hfdrive_windows::filesystem::volume::query_file_state(&path).unwrap();
+        let evidence = CaptureEvidence {
+            volume_serial_number: captured.identity.volume_serial_number,
+            file_id: captured.identity.file_id,
+            size: captured.size,
+            last_write_time_100ns: captured.last_write_time_100ns,
+            usn: captured.usn,
+        };
+        std::fs::write(&path, b"newer local bytes").unwrap();
+        let identity = PlaceholderIdentity::file(
+            hfdrive_core::ids::WorkspaceId::new(),
+            ItemId::new(),
+            VersionId::new(),
+        );
+        assert_eq!(mark_published_in_sync(&path, &identity, &evidence, 2, 1).unwrap(), None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer local bytes");
+        let after = hfdrive_windows::filesystem::volume::query_file_state(&path).unwrap();
+        assert!(!hfdrive_windows::filesystem::volume::placeholder_state(
+            after.identity.attributes,
+            after.identity.reparse_tag,
+        ).is_placeholder());
     }
 
     #[test]

@@ -660,8 +660,16 @@
           "description": "nullable; optional object properties are omitted from canonical output"
         },
         "generation": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
         },
         "device_id": {
           "type": "string",
@@ -679,7 +687,6 @@
       },
       "required": [
         "commit_id",
-        "generation",
         "device_id",
         "created_at",
         "changes"
@@ -2299,6 +2306,68 @@
       ],
       "description": "body.result of a \"probe_storage\" response"
     },
+    "repair_storage_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "credentials_from_connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
+      "required": [
+        "operation_id",
+        "connection_id",
+        "credentials_from_connection_id"
+      ],
+      "description": "body of a \"repair_storage\" request"
+    },
+    "repair_storage_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "repaired": {
+          "type": "boolean"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "report_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "status": {
+          "$ref": "#/$defs/connection_status"
+        }
+      },
+      "required": [
+        "connection_id",
+        "repaired",
+        "run_id",
+        "status"
+      ],
+      "description": "body.result of a \"repair_storage\" response"
+    },
     "preview_connect_request": {
       "type": "object",
       "additionalProperties": false,
@@ -2760,6 +2829,65 @@
         "settings"
       ],
       "description": "body.result of a \"update_settings\" response"
+    },
+    "list_activity_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "page size limit (max 200)"
+        }
+      },
+      "required": [
+        "connection_id",
+        "limit"
+      ],
+      "description": "body of a \"list_activity\" request"
+    },
+    "list_activity_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activity_record"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "description": "body.result of a \"list_activity\" response"
     },
     "list_history_request": {
       "type": "object",
@@ -3315,6 +3443,7 @@
         "get_status",
         "hello",
         "inspect_drive",
+        "list_activity",
         "list_buckets",
         "list_conflicts",
         "list_history",
@@ -3324,6 +3453,7 @@
         "prepare_upgrade",
         "preview_connect",
         "probe_storage",
+        "repair_storage",
         "resolve_conflict",
         "restore",
         "resume",

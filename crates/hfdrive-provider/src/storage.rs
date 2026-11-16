@@ -5,7 +5,6 @@ use hfdrive_hf::{BucketSummary, CreateBucket, NativeApi, NativeConfig, NativeCon
 use hfdrive_protocol as wire;
 
 pub(crate) struct NativePublicationParts {
-    pub native: hfdrive_hf::NativeBucketStore<crate::tokens::DurableTokens>,
     pub control: NativeControl<crate::tokens::DurableTokens>,
     pub binding: Option<hfdrive_publication::PublicationBinding>,
     pub transport: Option<hfdrive_publication::S3Transport>,
@@ -40,7 +39,6 @@ impl Provider {
             self.scheduler.wire_budget().clone(),
         ).unwrap_or_else(|_| unreachable!("fixed HF endpoint"));
         let control = NativeControl::new(api, config);
-        let native = control.open_store(connection.binding.clone()).map_err(native_failure)?;
         let (binding, transport) = if connection.mode == hfdrive_state::ConnectionMode::ReadOnly {
             (None, None)
         } else {
@@ -76,7 +74,7 @@ impl Provider {
                 }
             }
         };
-        Ok(NativePublicationParts { native, control, binding, transport })
+        Ok(NativePublicationParts { control, binding, transport })
     }
 
     pub(crate) fn remote_for(
@@ -85,17 +83,57 @@ impl Provider {
         profile: &hfdrive_auth::AccountProfile,
     ) -> Result<crate::sync::remote::LiveRemote<crate::tokens::DurableTokens, hfdrive_publication::S3Transport>, wire::ProtocolError> {
         let parts = self.native_parts(connection, profile)?;
+        let native = parts.control.open_store(connection.binding.clone()).map_err(native_failure)?;
         let publication = match (parts.binding, parts.transport) {
             (Some(binding), Some(transport)) => Some(
                 hfdrive_publication::coordinator::PublicationCoordinator::new(
                     binding,
-                    parts.native.clone(),
+                    native.clone(),
                     transport,
                 ).map_err(|_| internal_credential())?
             ),
             _ => None,
         };
-        Ok(crate::sync::remote::LiveRemote::new(parts.native, parts.control, publication))
+        Ok(crate::sync::remote::LiveRemote::new(native, parts.control, publication))
+    }
+
+    /// Connects one restored connection entry with remote services freshly
+    /// built from its durable binding and credentials. Shared by startup
+    /// restore and storage repair so a reconnect never forks the
+    /// config/services construction. `replace` drains any existing runtime
+    /// first — required when the remote services themselves must change;
+    /// without it an already active runtime keeps driving untouched.
+    pub(crate) async fn connect_restored_entry(
+        &self,
+        engine: &crate::sync::SyncEngine<
+            crate::sync::remote::LiveRemote<crate::tokens::DurableTokens, hfdrive_publication::S3Transport>,
+        >,
+        entry: &crate::sync::registry::RestoredConnection,
+        profile: &hfdrive_auth::AccountProfile,
+        replace: bool,
+    ) -> Result<(), wire::ProtocolError> {
+        let remote = self.remote_for(&entry.record, profile)?;
+        let account = self.state.open_account(profile.account_key).await.map_err(crate::operations::state_error)?;
+        let drive = self.paths.account(profile.account_key).drive(entry.record.binding.workspace_id);
+        let config = crate::sync::ConnectionConfig {
+            connection_id: entry.record.connection_id,
+            workspace: entry.record.binding.workspace_id,
+            root_item_id: entry.root_item_id,
+            device_id: self.device_id,
+            root: entry.record.root_path.clone(),
+            staging_dir: drive.snapshots(),
+            recovery_dir: self.paths.account(profile.account_key).recovery(),
+            mode: entry.record.mode,
+            start_paused: false,
+        };
+        let services = crate::sync::ConnectionServices { remote, root_item_id: entry.root_item_id };
+        let connected = if replace {
+            engine.reconnect(config, services, &entry.validated, account).await
+        } else {
+            engine.connect(config, services, &entry.validated, account).await
+        };
+        connected.map_err(engine_failure)?;
+        Ok(())
     }
 
     /// Restores only the currently admitted account. Other accounts retain
@@ -122,33 +160,19 @@ impl Provider {
         let mut first_error = None;
         for entry in restored {
             let connection_id = entry.record.connection_id;
-            if engine.health(connection_id).await.is_ok() {
+            // A registry entry is not running unless its CFAPI runtime is
+            // actually driving the root: a stale (missing, cancelled or
+            // finished) entry is reconnected from its durable binding below.
+            if engine
+                .health(connection_id)
+                .await
+                .map(|health| health.runtime.is_active())
+                .unwrap_or(false)
+            {
                 ids.push(connection_id);
                 continue;
             }
-            let result = async {
-                let remote = self.remote_for(&entry.record, &profile)?;
-                let account = self.state.open_account(profile.account_key).await.map_err(crate::operations::state_error)?;
-                let drive = self.paths.account(profile.account_key).drive(entry.record.binding.workspace_id);
-                let config = crate::sync::ConnectionConfig {
-                    connection_id,
-                    workspace: entry.record.binding.workspace_id,
-                    root_item_id: entry.root_item_id,
-                    device_id: self.device_id,
-                    root: entry.record.root_path.clone(),
-                    staging_dir: drive.snapshots(),
-                    recovery_dir: self.paths.account(profile.account_key).recovery(),
-                    mode: entry.record.mode,
-                    start_paused: false,
-                };
-                engine.connect(
-                    config,
-                    crate::sync::ConnectionServices { remote, root_item_id: entry.root_item_id },
-                    &entry.validated,
-                    account,
-                ).await.map_err(engine_failure)?;
-                Ok::<(), wire::ProtocolError>(())
-            }.await;
+            let result = self.connect_restored_entry(engine, &entry, &profile, false).await;
             match result {
                 Ok(()) => ids.push(connection_id),
                 Err(error) => if first_error.is_none() { first_error = Some(error); },
@@ -178,30 +202,57 @@ impl Provider {
             return Err(error(wire::ProtocolErrorCode::NotFound, "The connection does not exist for this account"));
         }
         let account = self.state.open_account(profile.account_key).await.map_err(crate::operations::state_error)?;
+        let mut first_error = None;
+        if paused {
+            // Pause intent is durable before any runtime is touched: an
+            // unavailable root keeps the intent without failing the request.
+            for record in &records {
+                account.set_settings(
+                    format!("connection/{}/paused", record.connection_id),
+                    serde_json::Value::Bool(true),
+                    None,
+                ).await.map_err(crate::operations::state_error)?;
+                let Some(engine) = &self.engine else { continue; };
+                match engine.pause(record.connection_id).await {
+                    Ok(()) | Err(crate::sync::EngineError::UnknownConnection) => {}
+                    Err(error) => if first_error.is_none() { first_error = Some(engine_failure(error)); },
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            return Ok(records.into_iter().map(|record| *record.connection_id.as_uuid()).collect());
+        }
+        // Resume clears the durable pause intent only after the connection
+        // actually resumed: restore the existing bindings through the normal
+        // restore path first, then resume, then persist. A failed resume keeps
+        // the pause intent and returns the real error — never a reported or
+        // persisted success.
+        let mut resumed_ids = Vec::with_capacity(records.len());
         for record in &records {
+            self.restore_connections().await?;
+            let resumed = match &self.engine {
+                None => false,
+                Some(engine) => match engine.resume(record.connection_id).await {
+                    Ok(()) => true,
+                    Err(crate::sync::EngineError::UnknownConnection) => false,
+                    Err(error) => {
+                        if first_error.is_none() { first_error = Some(engine_failure(error)); }
+                        false
+                    }
+                },
+            };
+            if !resumed {
+                return Err(first_error.take().unwrap_or_else(|| engine_failure(crate::sync::EngineError::UnknownConnection)));
+            }
             account.set_settings(
                 format!("connection/{}/paused", record.connection_id),
-                serde_json::Value::Bool(paused),
+                serde_json::Value::Bool(false),
                 None,
             ).await.map_err(crate::operations::state_error)?;
+            resumed_ids.push(*record.connection_id.as_uuid());
         }
-        let mut first_error = None;
-        for record in &records {
-            let Some(engine) = &self.engine else { continue; };
-            let result = if paused {
-                engine.pause(record.connection_id).await
-            } else {
-                engine.resume(record.connection_id).await
-            };
-            match result {
-                Ok(()) | Err(crate::sync::EngineError::UnknownConnection) => {}
-                Err(error) => if first_error.is_none() { first_error = Some(engine_failure(error)); },
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(records.into_iter().map(|record| *record.connection_id.as_uuid()).collect())
+        Ok(resumed_ids)
     }
 
     pub(crate) fn current_account(&self) -> Result<hfdrive_auth::AccountProfile, wire::ProtocolError> {
@@ -357,7 +408,11 @@ pub(crate) fn engine_failure(error_value: crate::sync::EngineError) -> wire::Pro
         EngineError::UnknownConnection => error(wire::ProtocolErrorCode::NotFound, "The connection is not running"),
         EngineError::UnknownConflict => error(wire::ProtocolErrorCode::NotFound, "The conflict or its preserved evidence is unavailable"),
         EngineError::InvalidResolution => error(wire::ProtocolErrorCode::InvalidRequest, "The requested conflict resolution is not valid for this item"),
-        EngineError::Admission(AdmissionError::LocalRoot(_)) => error(wire::ProtocolErrorCode::LocalRootInvalid, "The local sync root is not valid"),
+        EngineError::Admission(AdmissionError::LocalRoot(reason)) => wire::ProtocolError {
+            code: wire::ProtocolErrorCode::LocalRootInvalid,
+            message: reason,
+            retry_after_ms: None,
+        },
         EngineError::Admission(AdmissionError::State(error)) | EngineError::State(error) => crate::operations::state_error(error),
         EngineError::Admission(_) => error(wire::ProtocolErrorCode::Conflict, "The connection root or registration conflicts with its persisted identity"),
         EngineError::NeedsSignIn => error(wire::ProtocolErrorCode::NeedsSignIn, "Sign-in is required"),

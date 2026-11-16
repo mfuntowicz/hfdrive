@@ -193,13 +193,15 @@ pub fn build_local_intents(entries: &[OutboxEntry], names: &HashMap<ItemId, Stri
     intents
 }
 
-/// Assembles the base view from the remembered common-base rows.
+/// Assembles only the sealed namespace of the applied base commit.
 pub async fn build_base_view<D: DigestSource>(
     state: &AccountStore,
     connection: ConnectionId,
+    commit: Option<CommitId>,
     digests: &mut DigestResolver<'_, D>,
 ) -> Result<CatalogView, PlanError> {
-    let rows = state.list_common_bases(connection).await?;
+    let commit = commit.ok_or_else(|| PlanError::MissingContext("applied common-base commit".to_owned()))?;
+    let rows = state.list_common_bases(connection, commit).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
         let record = format::from_item_record_bytes(row.item_json.as_bytes())
@@ -249,12 +251,12 @@ pub async fn build_remote_view<R: RemoteOps>(
 }
 
 /// Resolves a file record's content digest/size from the remote version
-/// records (bounded reads; cached for the planning cycle). Directories and
-/// content-less records resolve to `None`.
+/// records (bounded reads; cached by immutable version for the planning cycle).
+/// Tombstones retain their binding; content-less records resolve to `None`.
 pub struct DigestResolver<'a, D: DigestSource> {
     remote: &'a D,
     cancel: &'a CancellationToken,
-    cache: HashMap<ItemId, (Option<Sha256Digest>, Option<u64>)>,
+    cache: HashMap<hfdrive_core::ids::VersionId, (Sha256Digest, u64)>,
 }
 
 /// Narrow read seam so the resolver works against any remote boundary.
@@ -275,18 +277,16 @@ impl<'a, D: DigestSource> DigestResolver<'a, D> {
         &mut self,
         record: &ItemRecord,
     ) -> Result<(Option<Sha256Digest>, Option<u64>), PlanError> {
-        if let Some(cached) = self.cache.get(&record.item_id) {
-            return Ok(*cached);
-        }
-        let resolved = match record.content_version_id {
-            Some(version) if !record.deleted => {
-                let (sha256, size) = self.remote.version_digest(version, self.cancel).await?;
-                (Some(sha256), Some(size))
+        let Some(version) = record.content_version_id else { return Ok((None, None)); };
+        let (sha256, size) = match self.cache.get(&version) {
+            Some(cached) => *cached,
+            None => {
+                let binding = self.remote.version_digest(version, self.cancel).await?;
+                self.cache.insert(version, binding);
+                binding
             }
-            _ => (None, None),
         };
-        self.cache.insert(record.item_id, resolved);
-        Ok(resolved)
+        Ok((Some(sha256), Some(size)))
     }
 }
 
@@ -460,7 +460,7 @@ pub fn registry_item(
         item_id: record.item_id,
         parent_id: record.parent_id,
         name: record.name.clone(),
-        name_key: String::from_utf8_lossy(&hfdrive_core::names::collision_key(&record.name)).into_owned(),
+        name_key: String::from_utf8(hfdrive_core::names::collision_key(&record.name)).expect("collision keys are UTF-8"),
         kind: state_kind(record.kind),
         revision: record.item_revision,
         content_version_id: record.content_version_id,
@@ -558,5 +558,93 @@ impl<R: RemoteOps> DigestSource for RemoteDigests<'_, R> {
         let version_record = format::from_version_bytes(&body)
             .map_err(|_| RemoteError::InvalidResponse)?;
         Ok((version_record.sha256, version_record.size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn common_base_view_selects_only_the_applied_commit() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let child_id = ItemId::new();
+        let revision = OperationId::new();
+        let root = ItemRecord {
+            item_id: fixture.root_item, parent_id: None, name: String::new(),
+            kind: format::ItemKind::Directory, item_revision: revision,
+            content_version_id: None, deleted: false, content_operation: revision,
+            location_operation: revision, deletion_operation: None,
+        };
+        let child = ItemRecord {
+            item_id: child_id, parent_id: Some(fixture.root_item), name: "old-name".to_owned(),
+            ..root.clone()
+        };
+        let old = CommitId::new();
+        let applied = CommitId::new();
+        let observed = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, old, &[root.clone(), child.clone()]).await.unwrap();
+        let current_child = ItemRecord { name: "applied-name".to_owned(), ..child.clone() };
+        record_common_bases(&fixture.account, fixture.connection, applied, &[root.clone(), current_child]).await.unwrap();
+        let future_child = ItemRecord { name: "not-applied-name".to_owned(), ..child };
+        record_common_bases(&fixture.account, fixture.connection, observed, &[root.clone(), future_child]).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(applied)).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Observed, Some(observed)).await.unwrap();
+        let remote = crate::sync::test_support::HeadOnlyRemote { head: None };
+        let source = RemoteDigests(&remote);
+        let cancel = CancellationToken::new();
+        let mut digests = DigestResolver::new(&source, &cancel);
+        let baseline = fixture.account.baseline(fixture.connection).await.unwrap();
+        let view = build_base_view(&fixture.account, fixture.connection, baseline.applied_commit, &mut digests).await.unwrap();
+        let names: HashMap<_, _> = view.iter().map(|item| (item.item_id, item.name.as_str())).collect();
+        assert_eq!(names, HashMap::from([(fixture.root_item, ""), (child_id, "applied-name")]));
+        let older = build_base_view(&fixture.account, fixture.connection, Some(old), &mut digests).await.unwrap();
+        assert_eq!(older.iter().find(|item| item.item_id == child_id).unwrap().name, "old-name");
+        let absent = build_base_view(&fixture.account, fixture.connection, None, &mut digests).await;
+        assert!(matches!(absent, Err(PlanError::MissingContext(_))));
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn digest_resolution_preserves_tombstones_and_distinct_content_versions() {
+        use hfdrive_core::ids::VersionId;
+        struct Versions(HashMap<VersionId, (Sha256Digest, u64)>);
+        impl DigestSource for Versions {
+            async fn version_digest(
+                &self, version: VersionId, _: &CancellationToken,
+            ) -> Result<(Sha256Digest, u64), RemoteError> {
+                self.0.get(&version).copied().ok_or(RemoteError::RemoteContentUnavailable)
+            }
+        }
+        let first = VersionId::new();
+        let second = VersionId::new();
+        let first_digest = Sha256Digest::of(b"first");
+        let second_digest = Sha256Digest::of(b"second");
+        let versions = Versions(HashMap::from([(first, (first_digest, 5)), (second, (second_digest, 6))]));
+        let operation = OperationId::new();
+        let deletion = OperationId::new();
+        let deleted = ItemRecord {
+            item_id: ItemId::new(), parent_id: Some(ItemId::new()), name: "file.bin".to_owned(),
+            kind: format::ItemKind::File, item_revision: deletion, content_version_id: Some(first),
+            deleted: true, content_operation: operation, location_operation: operation,
+            deletion_operation: Some(deletion),
+        };
+        let cancel = CancellationToken::new();
+        let mut resolver = DigestResolver::new(&versions, &cancel);
+        let (sha256, size) = resolver.resolve(&deleted).await.unwrap();
+        let tombstone = ItemState::from_record(&deleted, sha256, size).unwrap();
+        assert!(tombstone.deleted);
+        assert_eq!(tombstone.content_version_id, Some(first));
+        assert_eq!(tombstone.content_sha256, Some(first_digest));
+        assert_eq!(tombstone.content_size, Some(5));
+        let current = ItemRecord {
+            content_version_id: Some(second), deleted: false, deletion_operation: None,
+            item_revision: OperationId::new(), ..deleted
+        };
+        let (sha256, size) = resolver.resolve(&current).await.unwrap();
+        let changed = ItemState::from_record(&current, sha256, size).unwrap();
+        assert_eq!(changed.content_sha256, Some(second_digest));
+        assert_eq!(changed.content_size, Some(6));
+        assert_eq!(resolver.resolve(&tombstone.to_record()).await.unwrap(), (Some(first_digest), Some(5)));
     }
 }

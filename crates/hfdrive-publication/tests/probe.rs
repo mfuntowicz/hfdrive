@@ -100,6 +100,47 @@ async fn full_probe_measures_every_dimension_and_cleans_up_only_owned_keys() {
 }
 
 #[tokio::test]
+async fn mismatched_native_namespace_cannot_write_to_a_drive_or_another_probe() {
+    for prefix in [
+        "hfdrive/work".to_owned(),
+        format!("hfdrive-probe/{}", GenerationId::new().as_uuid()),
+    ] {
+        let remote = Remote::new();
+        let mut drive = drive_binding();
+        drive.prefix = RemotePrefix::new(prefix).unwrap();
+        let existing_key = drive.prefix.head_key().to_string();
+        let existing_bytes = b"preexisting remote content".to_vec();
+        remote.lock().unwrap().seed(&existing_key, existing_bytes.clone());
+
+        let run_id = GenerationId::new();
+        let journal = FixtureJournal::default();
+        let probe = CapabilityProbe::new(
+            journal.clone(),
+            FixtureNative::with_drive(remote.clone(), drive),
+            FixtureProbeTransport::new(remote.clone(), run_id),
+            WireBudget::new(BudgetConfig::default()),
+        );
+        let staging = tempfile::tempdir().unwrap();
+        let request = ProbeRequest {
+            run_id,
+            connection_id: ConnectionId::new(),
+            setup_id: None,
+            mode: ProbeMode::Full,
+            staging_dir: staging.path().to_owned(),
+        };
+
+        assert!(matches!(
+            probe.run(&request, &CancellationToken::new()).await,
+            Err(hfdrive_publication::probe::ProbeError::Publication(PublicationError::KeyOutOfScope))
+        ));
+        assert!(journal.states().is_empty(), "a rejected scope must not reserve remote effects");
+        let remote = remote.lock().unwrap();
+        assert_eq!(remote.bytes(&existing_key), Some(existing_bytes));
+        assert_eq!(remote.keys_owned().collect::<Vec<_>>(), vec![existing_key]);
+    }
+}
+
+#[tokio::test]
 async fn interrupted_probe_resumes_reconciles_and_cleans_up() {
     let (remote, probe, journal, request, _staging) = probe_setup();
     let cancel = CancellationToken::new();

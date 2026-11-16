@@ -15,7 +15,7 @@ use crate::schema::{self, DatabaseKind};
 use crate::sql as s;
 use hfdrive_core::ids::{
     AccountKey, ActionId, CommitId, ConflictId, ConnectionId, GenerationId, ItemId, OperationId,
-    SetupId, SnapshotId, TransferId,
+    SetupId, SnapshotId, TransferId, VersionId,
 };
 use hfdrive_core::storage::Sha256Digest;
 use rusqlite::{Connection, params};
@@ -47,6 +47,13 @@ const LOCAL_ACTION_COLUMNS: &str = "connection_id, action_id, item_id, kind, exp
 
 const ITEM_COLUMNS: &str = "connection_id, item_id, parent_id, name, name_key, kind, revision, content_version_id, \
      deleted, metadata_json";
+
+/// Volume/journal identity recorded before anything has been observed for a
+/// connection. It is bookkeeping, not evidence: `begin_scan` replaces it with
+/// the observed pair when a scan actually starts, and until then the
+/// connection holds no scan evidence.
+const UNOBSERVED_VOLUME_ID: &str = "unobserved-volume";
+const UNOBSERVED_JOURNAL_ID: &str = "unobserved-journal";
 
 /// The worker-owned database context: the control database plus lazily opened
 /// account databases, all on this one thread.
@@ -672,6 +679,81 @@ impl Db {
         })
     }
 
+    /// Commits one successful storage repair in a single account transaction:
+    /// the connected connection's supplemental credential reference moves to
+    /// the staged record and the fresh capability evidence lands on its setup
+    /// journal. The reference update is guarded by the previously observed
+    /// value, so a concurrent credential commit loses the race and changes
+    /// nothing (`Ok(None)`). Root, workspace, mode, durable work, local
+    /// observations and scan evidence are never touched, and the source of a
+    /// repair is never modified. The control mirror follows as separate
+    /// commits, exactly like every other setup journal mutation.
+    pub(crate) fn commit_storage_repair(
+        &mut self,
+        connection_id: ConnectionId,
+        expected_ref: Option<CredentialRef>,
+        credential_ref: CredentialRef,
+        probe_evidence: serde_json::Value,
+    ) -> SResult<Option<SetupRecord>> {
+        let mut record = self
+            .get_setup_by_connection(connection_id)?
+            .ok_or(StateError::UnknownConnection(connection_id))?;
+        let now = schema::checked_i64(schema::now_ms())?;
+        let evidence_text = probe_evidence.to_string();
+        {
+            let account = self.account_conn(record.account_key)?;
+            let tx = account.unchecked_transaction()?;
+            let changed = tx.execute(
+                "UPDATE connections SET s3_ref = ?2, updated_at_ms = ?3
+                  WHERE connection_id = ?1 AND s3_ref IS ?4",
+                params![
+                    connection_id.as_bytes().as_slice(),
+                    credential_ref.0.as_str(),
+                    now,
+                    expected_ref.as_ref().map(|reference| reference.0.as_str()),
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            // The setup journal names the same record and carries the fresh
+            // evidence in the same transaction: a later probe of this
+            // connection loads the repaired pair, never the replaced one.
+            let journal = tx.execute(
+                "UPDATE setup_intents SET credential_ref = ?2, probe_evidence_json = ?3,
+                        evidence_generation = evidence_generation + 1, updated_at_ms = ?4
+                  WHERE setup_id = ?1",
+                params![record.setup_id.as_bytes().as_slice(), credential_ref.0.as_str(), evidence_text, now],
+            )?;
+            if journal == 0 {
+                return Err(StateError::UnknownSetup(record.setup_id));
+            }
+            tx.commit()?;
+        }
+        record.credential_ref = Some(credential_ref);
+        record.probe_evidence_json = Some(probe_evidence);
+        record.evidence_generation += 1;
+        self.control.execute(
+            "UPDATE connections SET s3_ref = ?2, updated_at_ms = ?3 WHERE connection_id = ?1",
+            params![
+                connection_id.as_bytes().as_slice(),
+                record.credential_ref.as_ref().map(|reference| reference.0.as_str()),
+                now,
+            ],
+        )?;
+        let mirror = Self::setup_mirror_of(&record)?;
+        self.write_setup_control_mirror(&mirror)?;
+        {
+            let account = self.account_conn(record.account_key)?;
+            account.execute(
+                "UPDATE setup_intents SET control_committed = 1 WHERE setup_id = ?1",
+                params![record.setup_id.as_bytes().as_slice()],
+            )?;
+        }
+        record.control_committed = true;
+        Ok(Some(record))
+    }
+
     /// Attaches the local-root proof and access mode chosen at preview time.
     pub(crate) fn attach_setup_preview(
         &mut self,
@@ -762,10 +844,14 @@ impl Db {
         let oauth_ref = Some(account_record.credential_ref.0.clone());
         let s3_ref = record.credential_ref.as_ref().map(|r| r.0.clone());
 
-        // Account-side registry commit.
+        // Account-side registry commit. The registry row and its durable
+        // event/scan bookkeeping land in one transaction: a finalized
+        // connection is never registered without the row that must record
+        // every later notification.
         {
             let account = self.account_conn(record.account_key)?;
-            account.execute(
+            let tx = account.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO connections
                    (connection_id, account_key, workspace_id, owner_kind, owner_id, owner_namespace, bucket_id,
                     bucket_name, prefix, root_path, volume_guid, volume_serial, sync_root_id, oauth_ref, s3_ref,
@@ -794,6 +880,12 @@ impl Db {
                     now,
                 ],
             )?;
+            // The event/scan bookkeeping row lands in the same transaction:
+            // a finalized connection is never registered without the row that
+            // must record every later notification. It claims no cursor, no
+            // pending refresh and no scan evidence.
+            ensure_event_cursor_row(&tx, record.connection_id, now)?;
+            tx.commit()?;
         }
         record.account_committed = true;
 
@@ -870,7 +962,12 @@ impl Db {
     }
 
     /// Reconciles the connection registry: connected setups become registry
-    /// rows; draft rows are never deleted silently.
+    /// rows; draft rows are never deleted silently. Every registered
+    /// connection is repaired to hold its durable event/scan bookkeeping, so
+    /// connected setups finalized before that bookkeeping existed (and rows
+    /// restored from an interrupted finalization) work through the normal
+    /// open/reconcile path. An existing row is never rewritten: unknown scan
+    /// evidence stays unknown and deletion-ineligible.
     pub(crate) fn reconcile_connections(&mut self) -> SResult<Vec<ConnectionRecord>> {
         let setups = self.list_setups(None)?;
         for setup in setups {
@@ -889,6 +986,11 @@ impl Db {
                 [],
                 s::read_account_connection,
             )?);
+        }
+        let now = schema::checked_i64(schema::now_ms())?;
+        for record in &out {
+            let conn = self.account_conn(record.account_key)?;
+            ensure_event_cursor_row(conn, record.connection_id, now)?;
         }
         Ok(out)
     }
@@ -1027,6 +1129,55 @@ impl Db {
             .ok_or_else(|| StateError::not_found("outbox", entry.operation_id))
     }
 
+    pub(crate) fn record_observed_work(
+        &mut self,
+        account: AccountKey,
+        item: Option<&ItemRecord>,
+        mut entry: OutboxEntry,
+        usn: Option<u64>,
+    ) -> SResult<OutboxEntry> {
+        let id = entry.item_id.ok_or_else(|| StateError::invalid_state(
+            "outbox", entry.operation_id, "local work requires an item",
+        ))?;
+        if item.is_some_and(|item| item.connection_id != entry.connection_id || item.item_id != id) {
+            return Err(StateError::invalid_state("outbox", entry.operation_id, "local item binding differs"));
+        }
+        self.account_conn(account)?.execute_batch("SAVEPOINT observed_work")?;
+        let result = (|| {
+            if let Some(item) = item {
+                self.upsert_item(account, item)?;
+            }
+            entry.observed_generation = self.bump_observation(account, entry.connection_id, id, usn)?.generation;
+            self.record_outbox(account, &entry)
+        })();
+        match result {
+            Ok(entry) => {
+                self.account_conn(account)?.execute_batch("RELEASE observed_work")?;
+                Ok(entry)
+            }
+            Err(error) => {
+                self.account_conn(account)?.execute_batch("ROLLBACK TO observed_work; RELEASE observed_work")?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn update_observed_usn(
+        &mut self,
+        account: AccountKey,
+        connection: ConnectionId,
+        item: ItemId,
+        generation: u64,
+        usn: u64,
+    ) -> SResult<bool> {
+        Ok(self.account_conn(account)?.execute(
+            "UPDATE local_observations SET observed_usn = ?4
+             WHERE connection_id = ?1 AND item_id = ?2 AND generation = ?3",
+            params![connection.as_bytes().as_slice(), item.as_bytes().as_slice(),
+                schema::checked_i64(generation)?, schema::checked_i64(usn)?],
+        )? == 1)
+    }
+
     pub(crate) fn outbox_entry(
         &mut self,
         account: AccountKey,
@@ -1064,6 +1215,205 @@ impl Db {
                 s::read_outbox,
             ),
         }
+    }
+
+    /// Unfinished outbox work with its durable creation timestamp, ordered
+    /// oldest first. The timestamp is the activity start evidence; it is read
+    /// from the row, never synthesized. Paging is keyset: `after` is a pure
+    /// ordered position — a `(created_at_ms, native UUID blob)` tuple strictly
+    /// before the returned rows — and need not name any stored row (merged
+    /// projection derives nil/max UUID sentinels from its source ranks).
+    /// `limit + 1` rows are read (see [`checked_page_limit`]) so the caller can
+    /// detect overflow and fail closed instead of omitting work; the caller
+    /// owns page truncation and the next cursor.
+    pub(crate) fn list_outbox_rows(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> SResult<Vec<OutboxWorkRow>> {
+        let probe = checked_page_limit(limit)?;
+        let after_ms = after.map(|cursor| schema::checked_i64(cursor.created_at_ms)).transpose()?;
+        let after_id = after.map(|cursor| cursor.work_id.as_bytes().to_vec());
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            &format!(
+                "SELECT {OUTBOX_COLUMNS}, created_at_ms FROM outbox
+                 WHERE connection_id = ?1 AND state <> 'complete'
+                   AND (?2 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND operation_id > ?3))
+                 ORDER BY created_at_ms, operation_id LIMIT ?4"
+            ),
+            params![
+                connection_id.as_bytes().as_slice(),
+                after_ms,
+                after_id,
+                probe
+            ],
+            |row| {
+                Ok(OutboxWorkRow {
+                    entry: s::read_outbox(row)?,
+                    created_at_ms: c::unsigned(row.get_ref(15)?, "outbox.created_at_ms")?,
+                })
+            },
+        )
+    }
+
+    /// Unfinished journaled local actions with their durable creation
+    /// timestamps, ordered oldest first (see [`Self::list_outbox_rows`] on
+    /// paging and the `limit + 1` overflow probe). An action is unfinished
+    /// until it has a durable outcome (`applied`/`recovered`); a `failed` row
+    /// awaits its retry and must project with its recorded failure.
+    pub(crate) fn list_action_rows(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> SResult<Vec<ActionWorkRow>> {
+        let probe = checked_page_limit(limit)?;
+        let after_ms = after.map(|cursor| schema::checked_i64(cursor.created_at_ms)).transpose()?;
+        let after_id = after.map(|cursor| cursor.work_id.as_bytes().to_vec());
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            &format!(
+                "SELECT {LOCAL_ACTION_COLUMNS}, created_at_ms FROM local_actions
+                 WHERE connection_id = ?1 AND state IN ('pending', 'in_progress', 'failed', 'requeued')
+                   AND (?2 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND action_id > ?3))
+                 ORDER BY created_at_ms, action_id LIMIT ?4"
+            ),
+            params![
+                connection_id.as_bytes().as_slice(),
+                after_ms,
+                after_id,
+                probe
+            ],
+            |row| {
+                Ok(ActionWorkRow {
+                    action: s::read_local_action(row)?,
+                    created_at_ms: c::unsigned(row.get_ref(13)?, "local_actions.created_at_ms")?,
+                })
+            },
+        )
+    }
+
+    /// Transfer journal rows still unfinished, with their durable creation
+    /// timestamps, ordered oldest first (see [`Self::list_outbox_rows`] on
+    /// paging and the `limit + 1` overflow probe). A `failed` transfer awaits
+    /// its retry and must project with its recorded failure; a terminal update
+    /// (`succeeded`/`cancelled`) retires it.
+    pub(crate) fn list_transfer_rows(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> SResult<Vec<TransferWorkRow>> {
+        let probe = checked_page_limit(limit)?;
+        let after_ms = after.map(|cursor| schema::checked_i64(cursor.created_at_ms)).transpose()?;
+        let after_id = after.map(|cursor| cursor.work_id.as_bytes().to_vec());
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            &format!(
+                "SELECT connection_id, transfer_id, operation_id, direction, version_id, range_start, range_end,
+                        state, sdk_resume_json, logical_bytes, wire_bytes, created_at_ms
+                 FROM transfers
+                 WHERE connection_id = ?1 AND state IN ('pending', 'in_progress', 'failed')
+                   AND (?2 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND transfer_id > ?3))
+                 ORDER BY created_at_ms, transfer_id LIMIT ?4"
+            ),
+            params![
+                connection_id.as_bytes().as_slice(),
+                after_ms,
+                after_id,
+                probe
+            ],
+            |row| {
+                Ok(TransferWorkRow {
+                    transfer: s::read_transfer(row)?,
+                    created_at_ms: c::unsigned(row.get_ref(11)?, "transfers.created_at_ms")?,
+                })
+            },
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // Work failures (account database)
+    // ---------------------------------------------------------------
+
+    /// Records the real failure classification and text captured at a failure
+    /// site. The row is scoped to one work item and is deleted by the next
+    /// durable state advance of that item, so its presence means the work is
+    /// still unfinished and currently failed. Never store signed URLs, tokens
+    /// or payloads here.
+    pub(crate) fn record_work_error(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+        error_code: &str,
+        error_detail: &str,
+    ) -> SResult<()> {
+        let now = schema::checked_i64(schema::now_ms())?;
+        let conn = self.account_conn(account)?;
+        conn.execute(
+            "INSERT INTO work_errors (connection_id, work_kind, work_id, error_code, error_detail, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(connection_id, work_kind, work_id) DO UPDATE SET
+               error_code = excluded.error_code, error_detail = excluded.error_detail,
+               updated_at_ms = excluded.updated_at_ms",
+            params![
+                connection_id.as_bytes().as_slice(),
+                s::work_error_kind_text(kind),
+                work_id.as_bytes().as_slice(),
+                error_code,
+                error_detail,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes one recorded work failure. Durable state advances clear it
+    /// transactionally on their own; this is the explicit clear for callers
+    /// that resolve a failure without a state change.
+    pub(crate) fn clear_work_error(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+    ) -> SResult<()> {
+        let conn = self.account_conn(account)?;
+        clear_work_error_conn(conn, connection_id, kind, work_id)
+    }
+
+    /// The recorded failure of one work item, if it is currently failed. This
+    /// is a bounded point lookup: bulk projection only resolves errors for the
+    /// rows on its current page, never the whole error table.
+    pub(crate) fn work_error(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+    ) -> SResult<Option<WorkErrorRow>> {
+        let conn = self.account_conn(account)?;
+        query_optional(
+            conn,
+            "SELECT connection_id, work_kind, work_id, error_code, error_detail, updated_at_ms FROM work_errors
+             WHERE connection_id = ?1 AND work_kind = ?2 AND work_id = ?3",
+            params![
+                connection_id.as_bytes().as_slice(),
+                s::work_error_kind_text(kind),
+                work_id.as_bytes().as_slice(),
+            ],
+            s::read_work_error,
+        )
     }
 
     pub(crate) fn work_counts(
@@ -1193,7 +1543,10 @@ impl Db {
         }
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
-        conn.execute(
+        // The state advance and its error clearing are one durable step: a
+        // page projection can never observe a new state with a stale failure.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE outbox SET state = ?3, snapshot_id = ?4, object_ref_json = ?5, candidate_commit = ?6,
                     candidate_head_json = ?7, expected_etag = ?8, retry_class = ?9, next_attempt_at_ms = ?10,
                     updated_at_ms = ?11
@@ -1212,6 +1565,8 @@ impl Db {
                 now,
             ],
         )?;
+        clear_work_error_conn(&tx, connection_id, WorkErrorKind::Outbox, *operation_id.as_uuid())?;
+        tx.commit()?;
         self.outbox_entry(account, connection_id, operation_id)?
             .ok_or_else(|| StateError::not_found("outbox", operation_id))
     }
@@ -1237,10 +1592,14 @@ impl Db {
         let now = schema::checked_i64(schema::now_ms())?;
         {
             let conn = self.account_conn(account)?;
-            conn.execute(
+            // The completion and its error clearing are one durable step.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "UPDATE outbox SET state = 'complete', updated_at_ms = ?3 WHERE connection_id = ?1 AND operation_id = ?2",
                 params![connection_id.as_bytes().as_slice(), operation_id.as_bytes().as_slice(), now],
             )?;
+            clear_work_error_conn(&tx, connection_id, WorkErrorKind::Outbox, *operation_id.as_uuid())?;
+            tx.commit()?;
         }
         let Some(item_id) = entry.item_id else {
             return Ok(CompletionOutcome::Completed { generation: entry.observed_generation });
@@ -1284,6 +1643,50 @@ impl Db {
         )?;
         self.snapshot(account, connection_id, snapshot_id)?
             .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))
+    }
+
+    /// Binds an in-flight capture to the outbox operation it serves. `begin_snapshot`
+    /// is unchanged: the binding is a separate explicit step taken by the
+    /// capture site once its operation id is known. A capture serves exactly
+    /// one operation; re-binding the same operation is idempotent, while
+    /// re-binding a different operation is refused.
+    pub(crate) fn bind_snapshot_operation(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+    ) -> SResult<()> {
+        let snapshot = self
+            .snapshot(account, connection_id, snapshot_id)?
+            .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))?;
+        match snapshot.operation_id {
+            Some(bound) if bound != operation_id => {
+                return Err(StateError::invalid_state(
+                    "snapshot",
+                    snapshot_id,
+                    format!("capture is already bound to operation {bound}"),
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let now = schema::checked_i64(schema::now_ms())?;
+        let conn = self.account_conn(account)?;
+        let changed = conn.execute(
+            "UPDATE snapshots SET operation_id = ?3, updated_at_ms = ?4
+             WHERE connection_id = ?1 AND snapshot_id = ?2 AND operation_id IS NULL",
+            params![
+                connection_id.as_bytes().as_slice(),
+                snapshot_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                now
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StateError::not_found("snapshot", snapshot_id));
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_snapshot(
@@ -1352,7 +1755,7 @@ impl Db {
         let conn = self.account_conn(account)?;
         query_optional(
             conn,
-            "SELECT connection_id, snapshot_id, path, size, sha256, status FROM snapshots
+            "SELECT connection_id, snapshot_id, path, size, sha256, status, operation_id FROM snapshots
              WHERE connection_id = ?1 AND snapshot_id = ?2",
             params![connection_id.as_bytes().as_slice(), snapshot_id.as_bytes().as_slice()],
             s::read_snapshot,
@@ -1367,7 +1770,7 @@ impl Db {
         let conn = self.account_conn(account)?;
         query_many(
             conn,
-            "SELECT connection_id, snapshot_id, path, size, sha256, status FROM snapshots
+            "SELECT connection_id, snapshot_id, path, size, sha256, status, operation_id FROM snapshots
              WHERE connection_id = ?1 ORDER BY created_at_ms",
             params![connection_id.as_bytes().as_slice()],
             s::read_snapshot,
@@ -1417,7 +1820,10 @@ impl Db {
     ) -> SResult<TransferRecord> {
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
-        let changed = conn.execute(
+        // The state change and its error clearing are one durable step: a
+        // page projection can never observe a new state with a stale failure.
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE transfers SET state = ?3, logical_bytes = ?4, wire_bytes = ?5, sdk_resume_json = ?6, updated_at_ms = ?7
              WHERE connection_id = ?1 AND transfer_id = ?2",
             params![
@@ -1433,6 +1839,8 @@ impl Db {
         if changed == 0 {
             return Err(StateError::not_found("transfer", transfer_id));
         }
+        clear_work_error_conn(&tx, connection_id, WorkErrorKind::Transfer, *transfer_id.as_uuid())?;
+        tx.commit()?;
         self.transfer(account, connection_id, transfer_id)?
             .ok_or_else(|| StateError::not_found("transfer", transfer_id))
     }
@@ -1686,7 +2094,12 @@ impl Db {
         )
     }
 
-    /// Registers the durable event/scan cursor row for a connection.
+    /// Ensures the durable event/scan cursor row exists for a connection,
+    /// seeding the identity the caller observed when the row is created. An
+    /// existing row is never rewritten: an opaque cursor, a pending refresh
+    /// and scan evidence recorded earlier survive repeated registration,
+    /// finalization and reconciliation; observed identity changes land through
+    /// `begin_scan`, which supersedes stale deletion evidence.
     pub(crate) fn init_event_cursor(
         &mut self,
         account: AccountKey,
@@ -1696,14 +2109,7 @@ impl Db {
     ) -> SResult<ScanState> {
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
-        conn.execute(
-            "INSERT INTO event_cursors
-               (connection_id, cursor, pending_head_refresh, volume_id, journal_id, usn_cursor, scan_epoch,
-                scan_complete, scan_invalidated, updated_at_ms)
-             VALUES (?1, NULL, 0, ?2, ?3, NULL, 0, 0, 0, ?4)
-             ON CONFLICT(connection_id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
-            params![connection_id.as_bytes().as_slice(), volume_id, journal_id, now],
-        )?;
+        insert_event_cursor_row(conn, connection_id, volume_id, journal_id, now)?;
         self.scan_state(account, connection_id)?.ok_or(StateError::UnknownConnection(connection_id))
     }
 
@@ -1835,7 +2241,10 @@ impl Db {
     ) -> SResult<LocalAction> {
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
-        let changed = conn.execute(
+        // The state change and its error clearing are one durable step: a
+        // page projection can never observe a new state with a stale failure.
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE local_actions SET state = ?3, updated_at_ms = ?4 WHERE connection_id = ?1 AND action_id = ?2",
             params![
                 connection_id.as_bytes().as_slice(),
@@ -1847,6 +2256,8 @@ impl Db {
         if changed == 0 {
             return Err(StateError::not_found("local_action", action_id));
         }
+        clear_work_error_conn(&tx, connection_id, WorkErrorKind::Action, *action_id.as_uuid())?;
+        tx.commit()?;
         self.local_action(account, connection_id, action_id)?
             .ok_or_else(|| StateError::not_found("local_action", action_id))
     }
@@ -2054,13 +2465,14 @@ impl Db {
         &mut self,
         account: AccountKey,
         connection_id: ConnectionId,
+        commit_id: CommitId,
     ) -> SResult<Vec<CommonBaseRecord>> {
         let conn = self.account_conn(account)?;
         query_many(
             conn,
             "SELECT connection_id, item_id, commit_id, item_json FROM common_bases
-             WHERE connection_id = ?1 ORDER BY item_id, commit_id",
-            params![connection_id.as_bytes().as_slice()],
+             WHERE connection_id = ?1 AND commit_id = ?2 ORDER BY item_id",
+            params![connection_id.as_bytes().as_slice(), commit_id.as_bytes().as_slice()],
             s::read_common_base,
         )
     }
@@ -2107,6 +2519,32 @@ impl Db {
             conn,
             &format!("SELECT {ITEM_COLUMNS} FROM items WHERE connection_id = ?1 AND item_id = ?2"),
             params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+            s::read_item,
+        )
+    }
+
+    /// Resolves the item currently bound to a content version, backed by the
+    /// `items_by_version` index. Used for download transfer naming when no
+    /// operation identifies an item. A live item is preferred; ties are broken
+    /// deterministically by item id, so the answer is stable across queries.
+    pub(crate) fn item_for_version(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        version_id: VersionId,
+    ) -> SResult<Option<ItemRecord>> {
+        let conn = self.account_conn(account)?;
+        query_optional(
+            conn,
+            &format!(
+                "SELECT {ITEM_COLUMNS} FROM items
+                 WHERE connection_id = ?1 AND content_version_id = ?2
+                 ORDER BY deleted, item_id LIMIT 1"
+            ),
+            params![
+                connection_id.as_bytes().as_slice(),
+                version_id.as_bytes().as_slice(),
+            ],
             s::read_item,
         )
     }
@@ -2487,6 +2925,114 @@ pub struct ObservationFlags {
     pub pin_requested: Option<bool>,
     pub pin_complete: Option<bool>,
     pub excluded: Option<bool>,
+}
+
+/// The `limit + 1` overflow-probe bound. Pages are limited to 200 rows, so the
+/// probe is bounded too: no caller can make the state layer materialize an
+/// unbounded page, and no offset prefix grows across calls.
+fn checked_page_limit(limit: u32) -> SResult<i64> {
+    if !(1..=200).contains(&limit) {
+        return Err(StateError::invalid_state("work page", limit, "page limit must be 1..=200"));
+    }
+    Ok(i64::from(limit) + 1)
+}
+
+/// Inserts the durable event/scan bookkeeping row for a connection. An
+/// existing row is never rewritten: an opaque cursor, a pending refresh or
+/// scan evidence recorded earlier survives every later registration,
+/// finalization and reconciliation.
+fn insert_event_cursor_row(
+    conn: &Connection,
+    connection_id: ConnectionId,
+    volume_id: &str,
+    journal_id: &str,
+    now: i64,
+) -> SResult<()> {
+    conn.execute(
+        "INSERT INTO event_cursors
+           (connection_id, cursor, pending_head_refresh, volume_id, journal_id, usn_cursor, scan_epoch,
+            scan_complete, scan_invalidated, updated_at_ms)
+         VALUES (?1, NULL, 0, ?2, ?3, NULL, 0, 0, 0, ?4)
+         ON CONFLICT(connection_id) DO NOTHING",
+        params![connection_id.as_bytes().as_slice(), volume_id, journal_id, now],
+    )?;
+    Ok(())
+}
+
+/// Registers a connection's event/scan bookkeeping at a durable boundary,
+/// seeding the identity the state already records for it: the registry's
+/// volume GUID, or the provider's durable registration record. With neither,
+/// the row is explicitly unknown — it holds no cursor, no pending refresh and
+/// no scan evidence, so it is deletion-ineligible until `begin_scan` records
+/// the observed volume and journal.
+fn ensure_event_cursor_row(conn: &Connection, connection_id: ConnectionId, now: i64) -> SResult<()> {
+    let existing: Option<()> = query_optional(
+        conn,
+        "SELECT 1 FROM event_cursors WHERE connection_id = ?1",
+        params![connection_id.as_bytes().as_slice()],
+        |_| Ok(()),
+    )?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let volume_id = initial_event_volume(conn, connection_id)?;
+    insert_event_cursor_row(conn, connection_id, &volume_id, UNOBSERVED_JOURNAL_ID, now)
+}
+
+/// The best volume identity known for a connection before any scan observes
+/// one. Real recorded identity wins; the journal is never recorded before a
+/// scan, so it stays explicitly unknown.
+fn initial_event_volume(conn: &Connection, connection_id: ConnectionId) -> SResult<String> {
+    let registry_volume: Option<String> = query_optional(
+        conn,
+        "SELECT volume_guid FROM connections WHERE connection_id = ?1",
+        params![connection_id.as_bytes().as_slice()],
+        |row| c::text_opt(row.get_ref(0)?, "volume_guid"),
+    )?
+    .flatten()
+    .filter(|volume| !volume.is_empty());
+    if let Some(volume_id) = registry_volume {
+        return Ok(volume_id);
+    }
+    // The provider's registration record is the other place a real volume
+    // identity is durably recorded before a scan runs. A missing or malformed
+    // record simply leaves the identity unknown.
+    let scope = format!("connection/{connection_id}/registration");
+    let registration: Option<serde_json::Value> = query_optional(
+        conn,
+        "SELECT value_json FROM settings WHERE scope_id = ?1",
+        params![scope],
+        |row| c::text_opt(row.get_ref(0)?, "value_json"),
+    )?
+    .flatten()
+    .and_then(|text| serde_json::from_str(&text).ok());
+    Ok(registration
+        .as_ref()
+        .and_then(|value| value.get("volume_guid"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|volume| !volume.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| UNOBSERVED_VOLUME_ID.to_owned()))
+}
+
+/// Deletes one recorded work failure. Durable state advances call this inside
+/// their own transaction so the new state and the cleared failure are one
+/// durable step.
+fn clear_work_error_conn(
+    conn: &Connection,
+    connection_id: ConnectionId,
+    kind: WorkErrorKind,
+    work_id: uuid::Uuid,
+) -> SResult<()> {
+    conn.execute(
+        "DELETE FROM work_errors WHERE connection_id = ?1 AND work_kind = ?2 AND work_id = ?3",
+        params![
+            connection_id.as_bytes().as_slice(),
+            s::work_error_kind_text(kind),
+            work_id.as_bytes().as_slice(),
+        ],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn query_optional<T, F>(

@@ -11,7 +11,7 @@ use crate::store::{CompletionOutcome, Db, ObservationFlags, OperationResolution,
 use crate::worker::{Queue, Worker};
 use hfdrive_core::ids::{
     AccountKey, ActionId, CommitId, ConflictId, ConnectionId, GenerationId, ItemId, OperationId,
-    SetupId, SnapshotId, TransferId,
+    SetupId, SnapshotId, TransferId, VersionId,
 };
 use hfdrive_core::storage::Sha256Digest;
 use std::path::{Path, PathBuf};
@@ -129,6 +129,27 @@ impl StateStore {
     ) -> Result<SetupRecord, StateError> {
         self.queue()
             .call(move |db| db.record_probe_evidence(setup_id, evidence))
+            .await
+    }
+
+    /// Commits one successful storage repair: the connected connection's
+    /// supplemental credential reference moves to the staged record and the
+    /// fresh capability evidence lands on its setup journal in one account
+    /// transaction guarded by the previously observed reference. `Ok(None)`
+    /// reports the lost guard race — nothing was committed. Root, workspace,
+    /// mode, durable work, local observations and scan evidence are never
+    /// touched.
+    pub async fn commit_storage_repair(
+        &self,
+        connection_id: ConnectionId,
+        expected_ref: Option<CredentialRef>,
+        credential_ref: CredentialRef,
+        probe_evidence: serde_json::Value,
+    ) -> Result<Option<SetupRecord>, StateError> {
+        self.queue()
+            .call(move |db| {
+                db.commit_storage_repair(connection_id, expected_ref, credential_ref, probe_evidence)
+            })
             .await
     }
 
@@ -334,6 +355,29 @@ impl AccountStore {
         queue.call(move |db| db.record_outbox(account, &entry)).await
     }
 
+    /// Atomically register a local item, advance its generation, and queue work.
+    pub async fn record_observed_work(
+        &self,
+        item: Option<ItemRecord>,
+        entry: OutboxEntry,
+        usn: Option<u64>,
+    ) -> Result<OutboxEntry, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.record_observed_work(account, item.as_ref(), entry, usn)).await
+    }
+
+    /// Remember the provider's own metadata transition without creating an edit.
+    pub async fn update_observed_usn(
+        &self,
+        connection: ConnectionId,
+        item: ItemId,
+        generation: u64,
+        usn: u64,
+    ) -> Result<bool, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.update_observed_usn(account, connection, item, generation, usn)).await
+    }
+
     pub async fn outbox_entry(
         &self,
         connection_id: ConnectionId,
@@ -407,6 +451,21 @@ impl AccountStore {
         let (account, queue) = (self.account, self.queue.clone());
         queue
             .call(move |db| db.begin_snapshot(account, connection_id, snapshot_id, Path::new(&path)))
+            .await
+    }
+
+    /// Binds an in-flight capture to the outbox operation it serves, without
+    /// changing `begin_snapshot`. A capture serves exactly one operation;
+    /// re-binding the same operation is idempotent, a different one is refused.
+    pub async fn bind_snapshot_operation(
+        &self,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+    ) -> Result<(), StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| db.bind_snapshot_operation(account, connection_id, snapshot_id, operation_id))
             .await
     }
 
@@ -744,9 +803,14 @@ impl AccountStore {
             .await
     }
 
-    pub async fn list_common_bases(&self, connection_id: ConnectionId) -> Result<Vec<CommonBaseRecord>, StateError> {
+    /// Lists one sealed common-base namespace, not records from other commits.
+    pub async fn list_common_bases(
+        &self,
+        connection_id: ConnectionId,
+        commit_id: CommitId,
+    ) -> Result<Vec<CommonBaseRecord>, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
-        queue.call(move |db| db.list_common_bases(account, connection_id)).await
+        queue.call(move |db| db.list_common_bases(account, connection_id, commit_id)).await
     }
 
     // ---- items --------------------------------------------------
@@ -782,6 +846,18 @@ impl AccountStore {
     ) -> Result<Option<ItemRecord>, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.item(account, connection_id, item_id)).await
+    }
+
+    /// Resolves the item currently bound to a content version (live item
+    /// preferred, deterministic ordering), for download transfer naming when
+    /// no operation identifies an item.
+    pub async fn item_for_version(
+        &self,
+        connection_id: ConnectionId,
+        version_id: VersionId,
+    ) -> Result<Option<ItemRecord>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.item_for_version(account, connection_id, version_id)).await
     }
 
     pub async fn list_children(
@@ -879,6 +955,93 @@ impl AccountStore {
         queue
             .call(move |db| db.retention_snapshot(account, connection_id))
             .await
+    }
+
+    /// Unfinished outbox work with its durable creation timestamps, ordered
+    /// oldest first (activity projection input). Keyset paging: `after` is a
+    /// pure ordered position (a `(created_at_ms, work UUID)` tuple, not a row
+    /// anchor); sentinel `nil`/`max` UUID positions are valid input. The query
+    /// returns at most `limit + 1` rows so the caller can detect overflow and
+    /// own page truncation/next cursor. `limit` is 1..=200.
+    pub async fn list_outbox_rows(
+        &self,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> Result<Vec<OutboxWorkRow>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.list_outbox_rows(account, connection_id, after, limit)).await
+    }
+
+    /// Unfinished journaled local actions with their durable creation
+    /// timestamps, ordered oldest first (see [`Self::list_outbox_rows`] on
+    /// paging and the `limit + 1` overflow probe).
+    pub async fn list_action_rows(
+        &self,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> Result<Vec<ActionWorkRow>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.list_action_rows(account, connection_id, after, limit)).await
+    }
+
+    /// Transfer journal rows still unfinished, with their durable creation
+    /// timestamps, ordered oldest first (see [`Self::list_outbox_rows`] on
+    /// paging and the `limit + 1` overflow probe).
+    pub async fn list_transfer_rows(
+        &self,
+        connection_id: ConnectionId,
+        after: Option<WorkPageCursor>,
+        limit: u32,
+    ) -> Result<Vec<TransferWorkRow>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.list_transfer_rows(account, connection_id, after, limit)).await
+    }
+
+    /// Records the real failure classification and text captured at a failure
+    /// site. Callers record the new failure after any retry transition, which
+    /// clears stale failures; never store signed URLs, tokens or payloads.
+    pub async fn record_work_error(
+        &self,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+        error_code: String,
+        error_detail: String,
+    ) -> Result<(), StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| {
+                db.record_work_error(account, connection_id, kind, work_id, &error_code, &error_detail)
+            })
+            .await
+    }
+
+    /// Explicitly clears one recorded work failure. Durable state advances
+    /// (`transition_outbox`, `complete_outbox`, `set_local_action_state`,
+    /// `update_transfer`) clear it transactionally on their own.
+    pub async fn clear_work_error(
+        &self,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+    ) -> Result<(), StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.clear_work_error(account, connection_id, kind, work_id)).await
+    }
+
+    /// The recorded failure of one work item, if it is currently failed. A
+    /// bounded point lookup: projection resolves errors only for the rows on
+    /// its current page, never the whole error table.
+    pub async fn work_error(
+        &self,
+        connection_id: ConnectionId,
+        kind: WorkErrorKind,
+        work_id: uuid::Uuid,
+    ) -> Result<Option<WorkErrorRow>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.work_error(account, connection_id, kind, work_id)).await
     }
 }
 

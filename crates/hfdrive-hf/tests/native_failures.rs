@@ -561,3 +561,53 @@ async fn vanished_snapshot_source_demands_recapture() {
         .expect("vanished source must be refused");
     assert!(matches!(error, NativeError::SourceChanged));
 }
+
+#[tokio::test]
+async fn committed_checkpoint_binds_without_reingesting_snapshot() {
+    let route: Route = Arc::new(|method, path, _index, lines| {
+        if method == "POST" && path.ends_with("/batch") && lines == 1 {
+            response("200 OK", &[], r#"{"success":true,"processed":1,"succeeded":1,"failed":[]}"#)
+        } else {
+            response("404 Not Found", &[], "{}")
+        }
+    });
+    let server = fixture(route).await;
+    let key = account("checkpoint-resume");
+    let api = NativeApi::new(stub(key, key), key, format!("http://{}", server.addr)).unwrap();
+    let mut binding = drive(key);
+    binding.prefix = RemotePrefix::new(format!("hfdrive/{}", binding.workspace_id)).unwrap();
+    let upload_id = UploadId::new();
+    let snapshot = StableSnapshot {
+        snapshot_id: hfdrive_core::ids::SnapshotId::new(),
+        upload_id,
+        path: std::env::temp_dir().join(format!("hfdrive-cas-resume-{upload_id}.bin")),
+        size: 7,
+        sha256: Sha256Digest::of(b"fixture"),
+    };
+    assert!(!snapshot.path.exists(), "binding must not require the staged file after CAS commitment");
+    let target = binding.prefix.immutable_key(ImmutableKey::Payload(snapshot.upload_id));
+    let checkpoint = hfdrive_hf::CasCommitCheckpoint {
+        target_key: target.to_string(),
+        xet_file_id: XetFileId::new("aa".repeat(32)).unwrap(),
+        size: snapshot.size,
+        sha256: snapshot.sha256,
+        sdk_task_id: 1,
+    };
+    let store = NativeBucketStore::new(api, binding, config(format!("http://{}", server.addr))).unwrap();
+    let lease = store.capture_lease().unwrap();
+    let bound = store.resume_committed(&lease, &snapshot, &checkpoint).unwrap()
+        .bind(&CancellationToken::new()).await.unwrap();
+    assert_eq!(bound.key, target);
+    let object = bound.payload_ref(&store.binding().prefix).unwrap();
+    assert_eq!(object.key, PayloadKey::new(upload_id));
+    let mut wrong_prefix = bound.clone();
+    wrong_prefix.key = RelativeKey::new(format!("{}-other/objects/{upload_id}", store.binding().prefix.as_str())).unwrap();
+    assert!(matches!(wrong_prefix.payload_ref(&store.binding().prefix), Err(NativeError::InvalidResponse)));
+    assert_eq!(object.sha256, snapshot.sha256);
+    assert_eq!(object.size, snapshot.size);
+    assert_eq!(object.xet_file_id, checkpoint.xet_file_id);
+    let mut foreign = checkpoint;
+    foreign.target_key = "other-workspace/payload".to_owned();
+    assert!(matches!(store.resume_committed(&lease, &snapshot, &foreign), Err(NativeError::SourceChanged)));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}

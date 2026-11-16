@@ -38,12 +38,12 @@ use hfdrive_core::ids::{
     CommitId, ConnectionId, DeviceId, GenerationId, ItemId, OperationId, SetupId, UploadId,
     WorkspaceId,
 };
-use hfdrive_core::storage::{ByteRange, Sha256Digest, StableSnapshot};
+use hfdrive_core::storage::{ByteRange, RemotePrefix, Sha256Digest, StableSnapshot};
 use hfdrive_hf::wire_budget::WireBudget;
 use hfdrive_hf::{NativeError, NativeLease};
 use hfdrive_protocol::{ProbeCheck, ProbeCheckKind, ProbeOutcome};
 use hfdrive_state::{AccountStore, ProbeKeyRecord, ProbeKeyState, StateError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -125,7 +125,7 @@ pub fn probe_payload_sha256() -> Sha256Digest {
 }
 
 /// Probe execution mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeMode {
     /// Full capability measurement (explicit setup/CLI action).
@@ -148,6 +148,14 @@ pub struct ProbeRequest {
     pub mode: ProbeMode,
     /// Caller-owned staging directory for the deterministic payload capture.
     pub staging_dir: PathBuf,
+}
+
+impl ProbeRequest {
+    /// The owned bucket-relative namespace shared by native uploads and S3.
+    pub fn prefix(&self) -> RemotePrefix {
+        RemotePrefix::new(format!("hfdrive-probe/{}", self.run_id.as_uuid()))
+            .expect("a nonzero run UUID forms a valid probe prefix")
+    }
 }
 
 /// Probe journal seam. Production: [`AccountStore`] (see the impl below); the
@@ -315,7 +323,7 @@ pub enum ProbeError {
 }
 
 /// Per-dimension capability flags derived from the recorded checks.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProbeCapabilities {
     /// Fresh native write authorization was observed.
     pub native_write: bool,
@@ -337,7 +345,7 @@ pub struct ProbeCapabilities {
 
 /// Measured wire-byte delta across this run's S3/native traffic. Encoded body
 /// bytes only, from the shared wire budget; never reconstructed content.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WireBytes {
     /// Encoded upload body bytes admitted at metered boundaries.
     pub wire_write_bytes: u64,
@@ -346,7 +354,7 @@ pub struct WireBytes {
 }
 
 /// Cleanup result of one run.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProbeCleanupReport {
     /// Keys deleted in this run.
     pub deleted: Vec<String>,
@@ -357,7 +365,7 @@ pub struct ProbeCleanupReport {
 /// One probe run's evidence. Serializes to the capability report persisted by
 /// the caller (`artifacts/capabilities/<run-id>` and the setup record); no
 /// secret, signed URL, or user path is ever included.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeReport {
     /// The probe run identity.
     pub run_id: Uuid,
@@ -540,6 +548,9 @@ where
         cancel: &CancellationToken,
     ) -> Result<ProbeReport, ProbeError> {
         let run_id = *request.run_id.as_uuid();
+        if self.native.drive().prefix != request.prefix() {
+            return Err(PublicationError::KeyOutOfScope.into());
+        }
         let mut log = CheckLog::default();
         let mut capabilities = ProbeCapabilities {
             read_only: request.mode == ProbeMode::ReadOnly,

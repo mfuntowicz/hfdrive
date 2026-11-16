@@ -18,14 +18,18 @@ impl Provider {
         let (setup_id, connection, old_preview) = self.find_preview(profile.account_key, preview_id).await?;
         let setup = self.state.get_setup(setup_id).await.map_err(crate::operations::state_error)?
             .ok_or_else(|| error(wire::ProtocolErrorCode::NotFound, "The setup reservation does not exist"))?;
-        if setup.status != hfdrive_state::SetupStatus::Active {
-            return Err(error(wire::ProtocolErrorCode::Conflict, "The setup reservation is not active"));
-        }
+        // A replayed finalize: the setup is already Connected. Restore the
+        // existing binding through the normal restore path and report the
+        // actual status; a connected setup is never re-initialized on replay.
         if setup.phase == hfdrive_state::SetupPhase::Connected {
+            self.restore_connections().await?;
             return Ok(wire::ConnectResult {
                 connection_id: *connection.as_uuid(),
                 status: self.connection_status(connection).await?,
             });
+        }
+        if setup.status != hfdrive_state::SetupStatus::Active {
+            return Err(error(wire::ProtocolErrorCode::Conflict, "The setup reservation is not active"));
         }
         let root = setup.root_path.clone().ok_or_else(|| error(wire::ProtocolErrorCode::PreviewChanged, "The preview has no local root"))?;
         let root_text = root.to_str().ok_or_else(|| error(wire::ProtocolErrorCode::LocalRootInvalid, "The local root is not valid UTF-8"))?.to_owned();

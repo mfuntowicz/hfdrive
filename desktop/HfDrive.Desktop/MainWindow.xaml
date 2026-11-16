@@ -11,18 +11,72 @@
       status shows a configured connection or the user finishes setup. The
       content host receives either the single page frame (compact) or the
       navigation shell (configured) from code-behind.
+
+      Compact chrome: while compact, the window has no system caption strip
+      (no minimize/maximize/close buttons). The caption and painted border are
+      removed with OverlappedPresenter.SetBorderAndTitleBar(false,false) so no
+      1px nonclient frame paints; the explicit DWM corner opt-in in the shared
+      WindowChrome helper keeps the rounded corners and shadow — and the top
+      row replaces the strip with exactly one accessible close control on the
+      existing AppWindow.Closing close-to-tray path plus an OS-designated
+      caption drag region. The normal shell restores the standard title bar
+      and min/max/resize controls in the same window.
     -->
     <Grid x:Name="RootLayout">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
+
+        <!--
+          Compact-only replacement for the system caption strip. The drag
+          header spans the top of the client area and is registered with
+          InputNonClientPointerSource as the window's Caption drag region
+          (client-relative physical pixels, recomputed on size/scale change);
+          the close button sits outside that region so it stays interactive.
+          No screen-coordinate drag loop: the OS moves the window.
+        -->
+        <Grid x:Name="SetupCaptionBar"
+              Grid.Row="0"
+              Height="40"
+              Visibility="Collapsed"
+              Background="{ThemeResource HfHeaderBackgroundBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <!-- Draggable blank caption area (never the close button). -->
+            <Grid x:Name="SetupDragHeader"
+                  Grid.Column="0"
+                  Background="{ThemeResource HfHeaderBackgroundBrush}"
+                  AutomationProperties.AutomationId="SetupDragHeader"
+                  AutomationProperties.Name="Setup title bar" />
+            <!-- The single custom close control; outside the drag region so it
+                 keeps hover/press/click/keyboard input. Min size is cleared so
+                 it renders as a caption-sized button. -->
+            <Button x:Name="SetupCloseButton"
+                    Grid.Column="1"
+                    Width="48"
+                    Height="40"
+                    MinWidth="0"
+                    MinHeight="0"
+                    Padding="0"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    AutomationProperties.AutomationId="SetupClose"
+                    AutomationProperties.Name="Close setup"
+                    ToolTipService.ToolTip="Close"
+                    Click="OnSetupCloseClick">
+                <FontIcon Glyph="&#xE711;" FontSize="12" />
+            </Button>
+        </Grid>
 
         <!-- Visible retry surface for bounded provider startup failures. -->
         <Grid
             x:Name="StartupErrorBanner"
-            Grid.Row="0"
+            Grid.Row="1"
             Visibility="Collapsed"
             Padding="12,8"
             BorderThickness="0,0,0,1"
@@ -49,7 +103,7 @@
         <!-- Compact-flow header: a way back to the normal shell once one exists. -->
         <Grid
             x:Name="CompactHeader"
-            Grid.Row="1"
+            Grid.Row="2"
             Visibility="Collapsed"
             Padding="12,8,12,0">
             <Button
@@ -59,6 +113,6 @@
                 Click="OnBackToShellClick" />
         </Grid>
 
-        <Grid x:Name="ShellHost" Grid.Row="2" />
+        <Grid x:Name="ShellHost" Grid.Row="3" />
     </Grid>
 </Window>

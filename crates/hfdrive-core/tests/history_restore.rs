@@ -1,8 +1,7 @@
 //! Bounded paginated history traversal and restore-as-new-mutation planning.
 
 use hfdrive_core::format::{
-    ChangeKind, CommitV1, DisplayMetadata, ItemChange, ItemKind, ItemRecord, FORMAT_NAME,
-    SCHEMA_VERSION,
+    ChangeKind, CommitV1, DisplayMetadata, ItemChange, ItemKind, FORMAT_NAME, SCHEMA_VERSION,
 };
 use hfdrive_core::history::{
     history_page, plan_restore, CommitSource, HistoryCursor, HistoryError, HistoryOptions,
@@ -10,7 +9,7 @@ use hfdrive_core::history::{
 };
 use hfdrive_core::ids::{CommitId, ItemId, OperationId, UploadId, VersionId, WorkspaceId};
 use hfdrive_core::reconcile::{
-    DeterministicIds, IdSource, IntentOutcomeKind, ItemState, LocalActionKind, ReconcileMode,
+    DeterministicIds, IntentOutcomeKind, ItemState, LocalActionKind, ReconcileMode,
 };
 use hfdrive_core::storage::{ObjectRef, PayloadKey, Sha256Digest, XetFileId};
 use std::collections::BTreeMap;

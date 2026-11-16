@@ -40,7 +40,7 @@ use bytes::Bytes;
 use hfdrive_auth::TokenSource;
 use hfdrive_core::catalog::{self, PublishSet};
 use hfdrive_core::format::{self, CommitV1, FormatError, HeadV1, VersionV1};
-use hfdrive_core::ids::{CommitId, GenerationId, OperationId, WorkspaceId};
+use hfdrive_core::ids::{CommitId, GenerationId, ItemId, OperationId, WorkspaceId};
 use hfdrive_core::storage::{
     ByteRange, DriveBinding, ImmutableKey, ObjectRef, PayloadKey, RelativeKey, Sha256Digest,
     StableSnapshot,
@@ -420,6 +420,25 @@ impl PublicationStore for S3Transport {
     ) -> impl Future<Output = Result<BoundedRecord, PublicationError>> + Send {
         S3Transport::read_metadata(self, lease, record, cancel)
     }
+}
+
+/// Verifies an established workspace through a candidate store before any
+/// credential commit: one bounded `HEAD` read whose workspace and root
+/// identity must equal the connection's existing ones. An absent, unreadable
+/// or mismatched `HEAD` is an error — this never initializes a workspace,
+/// never treats absence as deletion, and never invents identity.
+pub async fn verify_existing_workspace<S: PublicationStore>(
+    store: &S,
+    lease: &NativeLease,
+    expected_workspace: WorkspaceId,
+    expected_root: ItemId,
+    cancel: &CancellationToken,
+) -> Result<HeadV1, PublicationError> {
+    let version = store.read_head(lease, cancel).await?;
+    if version.head.workspace_id != expected_workspace || version.head.root_item_id != expected_root {
+        return Err(PublicationError::BindingMismatch);
+    }
+    Ok(version.head)
 }
 
 impl<N: PublicationNative, S: PublicationStore> AncestrySource for PublicationCoordinator<N, S> {
@@ -805,6 +824,13 @@ impl<N: PublicationNative, S: PublicationStore> PublicationCoordinator<N, S> {
         } else {
             self.native.check_read(lease, cancel).await
         };
+        if matches!(&result, Err(NativeError::PermissionDenied)) {
+            tracing::warn!(
+                operation = if write { "native_bucket_write_check" } else { "native_bucket_read_check" },
+                http_status = 403,
+                "Hugging Face denied native bucket access"
+            );
+        }
         result.map_err(map_native_error)
     }
 

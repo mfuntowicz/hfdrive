@@ -288,8 +288,9 @@ impl SyncIntent {
 /// (`YYYY-MM-DDTHH:MM:SSZ`, validated by the core format rules).
 pub fn display_timestamp(last_write_time_100ns: i64) -> String {
     const EPOCH_OFFSET_100NS: i64 = 116_444_736_000_000_000; // 1601 -> 1970
-    let unix_nanos = last_write_time_100ns.saturating_sub(EPOCH_OFFSET_100NS) / 10;
-    let seconds = unix_nanos.div_euclid(1_000_000_000);
+    let seconds = last_write_time_100ns
+        .saturating_sub(EPOCH_OFFSET_100NS)
+        .div_euclid(10_000_000);
     match time::OffsetDateTime::from_unix_timestamp(seconds) {
         Ok(at) => {
             let formatted = format!(

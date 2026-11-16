@@ -163,29 +163,43 @@ impl CfConnection {
         )
     }
 
-    /// Complete one `FETCH_PLACEHOLDERS` request with a batch of entries.
-    /// Returns every per-entry result (never just the batch HRESULT).
+    /// Deliver the directory listing in bounded calls, then finish the request.
+    ///
+    /// Set `complete_directory` only for an authoritative whole-directory
+    /// listing. The terminal call disables on-demand population only when all
+    /// entries were processed and left present; subsets and failures stay
+    /// unpopulated. Occupied names are preserved, never overwritten.
+    /// Returns every per-entry result, including unprocessed failures.
     pub fn complete_placeholders(
         &self,
         ack: AckToken,
-        total_count: usize,
         entries: &[super::ops::PlaceholderCreate],
+        complete_directory: bool,
     ) -> CfResult<Vec<super::ops::PlaceholderOutcome>> {
         let pending = super::ops::to_pending(entries)?;
-        let results = crate::ffi::cfapi::transfer_placeholders(
-            ack,
-            TransferStatus::Success,
-            i64::try_from(total_count).unwrap_or(i64::MAX),
-            &pending,
-        );
-        let results = results.map_err(|code| CfError::Win32 {
-            operation: "CfExecute(TRANSFER_PLACEHOLDERS)",
-            code,
-        })?;
+        let total = i64::try_from(entries.len()).unwrap_or(i64::MAX);
+        let mut results = Vec::with_capacity(entries.len());
+        for range in crate::ffi::cfapi::population_calls(entries.len()) {
+            let mark_populated = range.is_empty()
+                && crate::ffi::cfapi::directory_populated_mark(complete_directory, &results);
+            let batch = crate::ffi::cfapi::transfer_placeholders(
+                ack,
+                TransferStatus::Success,
+                total,
+                &pending[range],
+                mark_populated,
+            );
+            let batch = batch.map_err(|code| CfError::Win32 {
+                operation: "CfExecute(TRANSFER_PLACEHOLDERS)",
+                code,
+            })?;
+            results.extend(batch);
+        }
         Ok(super::ops::from_entry_results(entries, results))
     }
 
-    /// Fail one `FETCH_PLACEHOLDERS` request truthfully.
+    /// Fail one `FETCH_PLACEHOLDERS` request truthfully. A failed request is
+    /// never marked fully populated.
     pub fn fail_placeholders(
         &self,
         ack: AckToken,
@@ -196,6 +210,7 @@ impl CfConnection {
             TransferStatus::Failed(failure),
             0,
             &[],
+            false,
         )
         .map(|_| ())
         .map_err(|code| CfError::Win32 {

@@ -47,7 +47,7 @@ fn smoke_validate_sync_root_accepts_plain_ntfs_directory() {
     let context = RootContext {
         state_dir,
         configured_roots: Vec::new(),
-        ignored_existing_root: None,
+        existing_sync_root_id: None,
     };
     let validated = validate_sync_root(&dir, &context).expect("plain NTFS dir validates");
     assert_eq!(validated.volume.file_system, "NTFS");
@@ -68,13 +68,13 @@ fn smoke_validate_rejects_nested_overlapping_roots() {
     let first = RootContext {
         state_dir: state_dir.clone(),
         configured_roots: Vec::new(),
-        ignored_existing_root: None,
+        existing_sync_root_id: None,
     };
     validate_sync_root(&outer, &first).expect("outer validates");
     let second = RootContext {
         state_dir,
         configured_roots: vec![outer.clone()],
-        ignored_existing_root: None,
+        existing_sync_root_id: None,
     };
     assert!(
         validate_sync_root(&inner, &second).is_err(),

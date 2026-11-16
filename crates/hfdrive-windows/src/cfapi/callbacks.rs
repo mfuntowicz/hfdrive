@@ -193,6 +193,7 @@ impl EventSink for CallbackHub {
                 TransferStatus::Failed(FetchFailure::ResourceExhausted),
                 0,
                 &[],
+                false,
             );
         }
     }

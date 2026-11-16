@@ -24,4 +24,15 @@
     <ProjectReference Include="..\HfDrive.Protocol\HfDrive.Protocol.csproj" />
   </ItemGroup>
 
+  <!--
+    Compile the tray's real readiness and issue-projection logic into the
+    protocol tests so these regressions exercise the same source the tray
+    ships. The files depend only on the protocol DTOs, so no UI reference is
+    introduced.
+  -->
+  <ItemGroup>
+    <Compile Include="..\HfDrive.Desktop\ViewModels\TraySyncReadiness.cs" Link="TraySyncReadiness.cs" />
+    <Compile Include="..\HfDrive.Desktop\ViewModels\TrayIssueProjection.cs" Link="TrayIssueProjection.cs" />
+  </ItemGroup>
+
 </Project>

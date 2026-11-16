@@ -87,6 +87,12 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
     private string? _conflictsCursor;
     private readonly HashSet<Guid> _conflictsSeen = new();
 
+    /// <summary>
+    /// Conflict id requested by the tray bridge; consumed only when an accepted
+    /// provider row with exactly that id arrives (never a synthetic row).
+    /// </summary>
+    private Guid? _pendingConflictSelection;
+
     public OperationsViewModel(ProviderSession session)
     {
         _session = session;
@@ -857,14 +863,18 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
 
     private bool CanLoadMoreConflicts() => !IsBusy && HasMoreConflicts;
 
-    private async Task LoadConflictsCoreAsync(bool replace, CancellationToken cancellationToken)
+    /// <summary>Outcome of one conflicts page load; the tray bridge's bounded
+    /// search continues only on <see cref="Loaded"/>.</summary>
+    private enum ConflictsPageResult { NotLoaded, Loaded, EndOfPages }
+
+    private async Task<ConflictsPageResult> LoadConflictsCoreAsync(bool replace, CancellationToken cancellationToken)
     {
-        if (IsBusy) return;
+        if (IsBusy) return ConflictsPageResult.NotLoaded;
         if (!TryReadConnectionId(out Guid connectionId, out string? connectionError))
         {
             ConflictsErrorText = connectionError;
             ConflictsResultText = string.Empty;
-            return;
+            return ConflictsPageResult.NotLoaded;
         }
         if (replace)
         {
@@ -889,7 +899,7 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                     Limit = ProtocolConstants.MaxPageLimit,
                 },
                 request.Token).ConfigureAwait(true);
-            if (IsScopeStale(scope)) return;
+            if (IsScopeStale(scope)) return ConflictsPageResult.NotLoaded;
             int added = 0;
             foreach (ConflictRecord record in result.Items)
             {
@@ -905,8 +915,10 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                 $"Loaded {result.Items.Count.ToString(CultureInfo.InvariantCulture)} records "
               + $"({added.ToString(CultureInfo.InvariantCulture)} new; duplicates are never re-shown). "
               + (result.NextCursor is null ? "No further pages." : $"Next cursor: {result.NextCursor}");
+            TryApplyPendingConflictSelection();
+            return result.NextCursor is null ? ConflictsPageResult.EndOfPages : ConflictsPageResult.Loaded;
         }
-        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { return ConflictsPageResult.NotLoaded; }
         catch (Exception ex)
         {
             if (!IsScopeStale(scope))
@@ -914,6 +926,7 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                 ConflictsErrorText = ErrorMessage(ex);
                 ConflictsResultText = string.Empty;
             }
+            return ConflictsPageResult.NotLoaded;
         }
         finally
         {
@@ -991,6 +1004,87 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
         {
             IsBusy = false;
             BusyText = string.Empty;
+        }
+    }
+
+    // ── Tray bridge (typed, explicit; no automatic resolution) ──────────
+
+    /// <summary>
+    /// Scopes every connection-scoped operation on this surface to the given
+    /// connection (the same <see cref="ConnectionIdText"/> the page already
+    /// binds), optionally paging the real conflict records until the exact
+    /// conflict id arrives and selecting that accepted row for the user to
+    /// resolve explicitly. Only provider-returned rows are ever selected; if
+    /// the id is not in the records the result is an honest message and no
+    /// selection. Each request is bounded to the wire page limit (200 rows);
+    /// the search itself has no total narrowing — it continues until the exact
+    /// row is found, the provider reports a terminal cursor, the request is
+    /// cancelled or superseded by a newer scoped request, or a page fails or
+    /// reports the list busy.
+    /// </summary>
+    /// <returns>True when the conflict row was found and selected.</returns>
+    public async Task<bool> LoadConflictsForConnectionAsync(Guid connectionId, Guid? conflictId, CancellationToken cancellationToken)
+    {
+        // Same exact "D" format TryParseExact requires (8-4-4-4-12 hex).
+        ConnectionIdText = connectionId.ToString("D");
+        _pendingConflictSelection = conflictId;
+        if (conflictId is null)
+        {
+            await LoadConflictsCoreAsync(replace: true, cancellationToken).ConfigureAwait(true);
+            return false;
+        }
+
+        bool anyPageLoaded = false;
+        ConflictsPageResult lastOutcome = ConflictsPageResult.NotLoaded;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            lastOutcome = await LoadConflictsCoreAsync(replace: !anyPageLoaded, cancellationToken).ConfigureAwait(true);
+            if (lastOutcome == ConflictsPageResult.Loaded) anyPageLoaded = true;
+            if (SelectedConflict is { } selected && selected.Record.ConflictId == conflictId.Value)
+                return true;
+            if (lastOutcome != ConflictsPageResult.Loaded)
+                break;
+        }
+
+        // Terminal end: never fabricate a selection. The pending id is dropped
+        // so a later manual load cannot silently select a stale target; a newer
+        // scoped request owns the pending id and gets no message here. On
+        // cancellation the existing guards already stop quietly.
+        if (_pendingConflictSelection == conflictId)
+        {
+            _pendingConflictSelection = null;
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                ConflictsErrorText = lastOutcome switch
+                {
+                    ConflictsPageResult.EndOfPages =>
+                        $"Conflict {conflictId} is not in this connection's conflict records; it may already be resolved.",
+                    _ => anyPageLoaded
+                        ? $"Loading conflicts stopped before conflict {conflictId} was found (a request failed or the list is busy). Open Manage again to resume the search."
+                        : "The conflicts list is busy or failed to load; open Manage again to select this conflict.",
+                };
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Selects the pending tray-requested conflict id when an accepted provider
+    /// row with exactly that id is present; never selects by index or fabricates
+    /// a row. Clears the pending id once matched so repeated loads do not steal
+    /// the user's later explicit selection.
+    /// </summary>
+    private void TryApplyPendingConflictSelection()
+    {
+        if (_pendingConflictSelection is not { } wanted) return;
+        foreach (ConflictRow row in Conflicts)
+        {
+            if (row.Record.ConflictId == wanted)
+            {
+                _pendingConflictSelection = null;
+                SelectedConflict = row;
+                return;
+            }
         }
     }
 

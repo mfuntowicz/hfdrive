@@ -287,6 +287,11 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
     public string StepProgressText => _connected ? "All set" : $"Step {CurrentStep + 1} of {StepCount}";
     public double ProgressValue => _connected ? 100 : CurrentStep * 100.0 / StepCount;
     public bool IsComplete => _connected;
+    public bool IsSetupWorking => _connected && _main.HasObservedStatus && _main.Connections.Any(row =>
+        row.Status.ConnectionId == _connectionId && row.Status.LastError is null && row.Status.ConflictFiles == 0
+        && row.Status.Capability is CapabilityState.Writable or CapabilityState.ReadOnly
+        && row.Status.State is ConnectionState.UpToDate or ConnectionState.PendingUpload
+            or ConnectionState.Uploading or ConnectionState.PublishingChanges or ConnectionState.Downloading);
     public bool IsWorking => IsBusy || _isContinuing || _main.IsBusy || _main.IsAccountCommandBusy || _main.IsStartingProvider;
     public bool CanEdit => !IsWorking;
     public bool CanGoBack => !IsWorking && !_connected && CurrentStep > 0;
@@ -746,6 +751,7 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(IsCollisionReviewVisible));
         OnPropertyChanged(nameof(IsSuccessVisible));
         OnPropertyChanged(nameof(IsComplete));
+        OnPropertyChanged(nameof(IsSetupWorking));
         OnPropertyChanged(nameof(ProgressValue));
         OnPropertyChanged(nameof(StepProgressText));
         OnPropertyChanged(nameof(AccountSummaryText));

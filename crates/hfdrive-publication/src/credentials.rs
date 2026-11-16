@@ -62,6 +62,17 @@ impl SupplementalCredentialRecord {
         &self.context
     }
 
+    /// Rebinds the same zeroizing key pair to a different protection context.
+    ///
+    /// Internal credential repair only: the source record is decoded with its
+    /// original entropy and context, then its pair moves into a record bound
+    /// to the target's existing protection context so it can be re-protected
+    /// there. The source record itself is never modified and the pair never
+    /// leaves zeroizing storage.
+    pub fn rebind(self, context: PublicationProtectionContext) -> Self {
+        Self { context, key_id: self.key_id, secret_key: self.secret_key }
+    }
+
     /// Requires exact equality with the expected context (including `connection_id`).
     pub fn validate_context(
         &self,
@@ -180,6 +191,28 @@ mod tests {
         let text = format!("{:?}", record());
         assert!(!text.contains("AKIAEXAMPLEKEYID1234"), "{text}");
         assert!(!text.contains("secret-key-material-0123456789"), "{text}");
+    }
+
+    #[test]
+    fn rebind_moves_the_pair_to_the_new_context_only() {
+        let source = context();
+        let mut target = source.clone();
+        target.connection_id = Uuid::from_bytes([8; 16]);
+        target.workspace_id = Uuid::from_bytes([10; 16]);
+        target.prefix = "hfdrive/repaired".to_owned();
+
+        let rebound = record().rebind(target.clone());
+        assert_eq!(rebound.key_id(), "AKIAEXAMPLEKEYID1234");
+        assert_eq!(rebound.secret_key(), "secret-key-material-0123456789");
+        assert_eq!(rebound.context(), &target);
+        assert!(rebound.validate_context(&target).is_ok());
+        assert!(rebound.validate_context(&source).is_err(), "rebinding must not leave the old binding accepted");
+
+        // The re-protected record round-trips under the target context and its
+        // encoded form carries the pair, never the source context.
+        let decoded = SupplementalCredentialRecord::decode(rebound.encode().unwrap().as_slice()).unwrap();
+        assert_eq!(decoded, rebound);
+        assert!(decoded.validate_context(&source).is_err());
     }
 
     #[test]

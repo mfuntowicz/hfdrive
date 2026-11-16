@@ -5,7 +5,8 @@
 use bytes::Bytes;
 use futures_util::StreamExt;
 use hfdrive_core::storage::{
-    ByteRange, DriveBinding, ImmutableKey, ObjectRef, PayloadKey, RelativeKey, Sha256Digest, StableSnapshot, XetFileId,
+    ByteRange, DriveBinding, ImmutableKey, ObjectRef, PayloadKey, RelativeKey, RemotePrefix, Sha256Digest,
+    StableSnapshot, XetFileId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -213,9 +214,16 @@ pub struct BoundObject {
 }
 
 impl BoundObject {
-    /// Rebuild the payload reference for `objects/<upload-uuid>` keys.
-    pub fn payload_ref(&self) -> Result<ObjectRef, NativeError> {
-        let key: PayloadKey = self.key.as_str().parse().map_err(|_| NativeError::InvalidResponse)?;
+    /// Rebuild a workspace-relative payload reference from its exact bucket key.
+    pub fn payload_ref(&self, prefix: &RemotePrefix) -> Result<ObjectRef, NativeError> {
+        let suffix = if prefix.as_str().is_empty() {
+            self.key.as_str()
+        } else {
+            self.key.as_str().strip_prefix(prefix.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .ok_or(NativeError::InvalidResponse)?
+        };
+        let key: PayloadKey = suffix.parse().map_err(|_| NativeError::InvalidResponse)?;
         Ok(ObjectRef {
             key,
             sha256: self.sha256,
@@ -877,6 +885,29 @@ impl<T: TokenSource> NativeBucketStore<T> {
         Ok(report)
     }
 
+    /// Resume exact-key binding from durable CAS evidence, without opening
+    /// another ingestion session or uploading the captured bytes again.
+    pub fn resume_committed(
+        &self,
+        lease: &NativeLease,
+        snapshot: &StableSnapshot,
+        checkpoint: &CasCommitCheckpoint,
+    ) -> Result<StagedCommitted<T>, NativeError> {
+        self.inner.api.check_lease(lease)?;
+        let target_key = self.inner.binding.prefix.immutable_key(ImmutableKey::Payload(snapshot.upload_id));
+        if checkpoint.target_key != target_key.as_str()
+            || checkpoint.size != snapshot.size
+            || checkpoint.sha256 != snapshot.sha256
+        {
+            return Err(NativeError::SourceChanged);
+        }
+        Ok(StagedCommitted {
+            store: self.clone(), lease: lease.clone(), target_key,
+            xet_file_id: checkpoint.xet_file_id.clone(),
+            size: checkpoint.size, sha256: checkpoint.sha256,
+        })
+    }
+
     // ---- staged immutable uploads ----
 
     /// Begin one staged upload. Validates the source against its capture
@@ -1242,6 +1273,12 @@ impl<T: TokenSource> StagedIngested<T> {
             sha256: self.expected_sha256,
             sdk_task_id: self.task_id,
         }
+    }
+
+    /// Release an ingestion-only SDK session before reconstructing a commit
+    /// from the durable checkpoint. Dropping its handle alone does not abort it.
+    pub fn abort(self) -> Result<(), NativeError> {
+        self.commit.abort().map_err(map_xet_error)
     }
 
     /// Push the ingested metadata to the Xet CAS. Returns the durable

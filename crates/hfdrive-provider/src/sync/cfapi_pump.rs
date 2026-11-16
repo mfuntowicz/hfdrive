@@ -26,8 +26,14 @@
 //!   The guard's synchronous `Drop` fails the request and cleans its
 //!   interest bookkeeping unless a real terminal completion already disarmed
 //!   it, so a normal failure never produces a second `CfExecute`.
-//! * `FETCH_PLACEHOLDERS` populates one directory from the durable item
-//!   registry in bounded batches, checking every per-entry outcome.
+//! * `FETCH_PLACEHOLDERS` delivers one directory's **complete** durable
+//!   child list (the OS lookup pattern is a minimum filter — it never narrows
+//!   the listing) in bounded completion calls, checking every per-entry
+//!   outcome. The request's terminal call marks the directory fully
+//!   populated only when the delivery was the complete authoritative listing
+//!   and every entry is present; an empty directory therefore completes and
+//!   stops re-fetching, while a subset delivery (e.g. a child that cannot
+//!   become a placeholder) is delivered but never claimed complete.
 //! * `NOTIFY_RENAME` / `NOTIFY_DELETE` persist their observation **before**
 //!   acknowledging. A delete of locally dirty content preserves the bytes to
 //!   the recovery area first (and vetoes the delete when preservation is not
@@ -51,7 +57,7 @@
 //! swallowed.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hfdrive_core::ids::{ConnectionId, ItemId, VersionId, WorkspaceId};
 use hfdrive_core::storage::ByteRange;
@@ -66,8 +72,10 @@ use hfdrive_windows::cfapi::CfConnection;
 use hfdrive_windows::filesystem::WatchAction;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::scheduler::{Scheduler, WorkClass};
+use crate::sync::activity::{ActivityRegistry, LiveWork, LiveWorkKind, now_unix_ms};
 use crate::sync::observe::RawObservation;
 use crate::sync::remote::{RangeSource, RemoteError, RemoteOps, version_object};
 
@@ -90,6 +98,10 @@ pub trait PumpHost<R: RemoteOps>: Send + Sync + 'static {
     fn remote(&self) -> &R;
     /// The provider-wide scheduler (read permits + clean range cache).
     fn scheduler(&self) -> &Scheduler;
+    /// The provider-wide live-work registry: the pump opens one RAII span per
+    /// accepted fetch/population request and holds it until that request's
+    /// terminal outcome.
+    fn activity(&self) -> &ActivityRegistry;
     /// The connection identity (scheduler fairness key).
     fn connection_id(&self) -> ConnectionId;
     /// The connection's workspace (placeholder identity validation).
@@ -323,10 +335,16 @@ pub async fn run_pump<R: RemoteOps, H: PumpHost<R>>(
 /// synchronous `Drop` fails the request truthfully and cleans its interest
 /// bookkeeping. Because every disarming path completes the request itself, a
 /// normal failure can never produce a second `CfExecute` completion.
+///
+/// The guard also owns the request's live-activity byte counter: bytes are
+/// added **only after** the OS accepted the chunk (`CfExecute` returned
+/// `Ok`), so the reported progress never exceeds delivered bytes.
 struct FetchGuard {
     connection: Arc<CfConnection>,
     ack: hfdrive_windows::cfapi::events::AckToken,
     required: ByteRange,
+    /// Live-activity delivered-bytes counter of this request's span.
+    progress: Option<Arc<AtomicU64>>,
     armed: bool,
 }
 
@@ -337,11 +355,13 @@ impl FetchGuard {
         connection: Arc<CfConnection>,
         ack: hfdrive_windows::cfapi::events::AckToken,
         required: ByteRange,
+        progress: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             connection,
             ack,
             required,
+            progress,
             armed: true,
         }
     }
@@ -364,6 +384,11 @@ impl FetchGuard {
         };
         match self.connection.complete_transfer(completion, bytes) {
             Ok(()) => {
+                // The OS accepted this chunk: only now do its bytes count as
+                // delivered progress for the live span.
+                if let Some(progress) = &self.progress {
+                    progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                }
                 if terminal {
                     // Success terminal: drop the request's interest
                     // bookkeeping (failures go through `fail_fetch`, which
@@ -427,22 +452,55 @@ async fn serve_fetch<R: RemoteOps, H: PumpHost<R>>(
         ..
     } = request;
 
-    let mut guard = FetchGuard::new(connection.clone(), ack, required);
+    // The transfer plan is pure and decided before the span opens, so the
+    // span's `total_bytes` is the request's actual planned span length (the
+    // sum of its planned chunks) and never a synthesized figure. An
+    // unplannable (out-of-bounds) request has an unknown total and is failed
+    // truthfully below.
+    let plan = plan_chunks(required, optional, file_size);
+    let total_bytes = plan
+        .as_ref()
+        .map(|chunks| chunks.iter().map(|chunk| chunk.len).sum::<u64>())
+        .ok();
+
+    // One live span per accepted request, opened at dispatch and held until
+    // this worker leaves (terminal outcome, cancellation or drop). Keyed by
+    // a fresh unique activity UUID, so overlapping/cancelled requests can
+    // never replace or remove each other's spans.
+    let progress = Arc::new(AtomicU64::new(0));
+    let _span = host.activity().begin(LiveWork {
+        connection_id: host.connection_id(),
+        activity_id: Uuid::new_v4(),
+        kind: LiveWorkKind::Fetch,
+        item_id: Some(identity.item),
+        path_hint: None,
+        started_unix_ms: now_unix_ms(),
+        total_bytes,
+        completed_bytes: progress.clone(),
+    });
+
+    let mut guard = FetchGuard::new(connection.clone(), ack, required, Some(progress));
     // One child token per request: pump shutdown cancels it (canceling every
     // remote read, range stream and scheduler wait), while the request's own
     // `cancelled` flag remains the CFAPI cancellation signal.
     let cancel = pump_cancel.child_token();
-    let failure = fetch_flow(
-        host,
-        &cancel,
-        &cancelled,
-        identity,
-        file_size,
-        required,
-        optional,
-        &mut guard,
-    )
-    .await;
+    let failure = match plan {
+        Ok(chunks) => {
+            fetch_flow(
+                host,
+                &cancel,
+                &cancelled,
+                identity,
+                file_size,
+                chunks,
+                &mut guard,
+            )
+            .await
+        }
+        // Out-of-bounds ranges fail before any SDK/OS use (the planner is the
+        // single place range validity is decided).
+        Err(_) => Some(FetchFailure::InvalidRequest),
+    };
     if guard.armed {
         // No real terminal completion happened (flow-reported failure, or an
         // impossible empty plan): complete the request exactly once here. A
@@ -457,10 +515,14 @@ async fn serve_fetch<R: RemoteOps, H: PumpHost<R>>(
         };
         guard.fail_now(failure);
     }
+    // `_span` drops here, exactly when the request reaches its terminal
+    // outcome: the live activity record disappears with the real request.
 }
 
 /// The fetch body: returns the terminal failure to report, or `None` when
 /// the final planned chunk already completed the request (guard disarmed).
+/// `chunks` is the already-validated transfer plan (from
+/// [`plan_chunks`]; out-of-bounds ranges are rejected before this is called).
 #[allow(clippy::too_many_arguments)]
 async fn fetch_flow<R: RemoteOps, H: PumpHost<R>>(
     host: &H,
@@ -468,8 +530,7 @@ async fn fetch_flow<R: RemoteOps, H: PumpHost<R>>(
     cancelled: &Arc<std::sync::atomic::AtomicBool>,
     identity: PlaceholderIdentity,
     file_size: u64,
-    required: ByteRange,
-    optional: Option<ByteRange>,
+    chunks: Vec<TransferChunk>,
     guard: &mut FetchGuard,
 ) -> Option<FetchFailure> {
     // Immutable binding: the identity names the exact version to serve.
@@ -490,10 +551,6 @@ async fn fetch_flow<R: RemoteOps, H: PumpHost<R>>(
         return Some(FetchFailure::InvalidRequest);
     }
 
-    let chunks = match plan_chunks(required, optional, file_size) {
-        Ok(chunks) => chunks,
-        Err(_) => return Some(FetchFailure::InvalidRequest),
-    };
     let total: u64 = chunks.iter().map(|chunk| chunk.len).sum();
     let mut completed: u64 = 0;
     let runs = chunk_runs(&chunks, file_size);
@@ -713,37 +770,95 @@ async fn serve_placeholders<R: RemoteOps, H: PumpHost<R>>(
         .filter(|component| !component.as_os_str().is_empty())
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect();
-    let parent = if components.is_empty() {
-        None // the sync root directory itself
-    } else {
-        match host.resolve(&components).await {
-            Some(item) => Some(item),
-            None => {
-                let _ = connection.fail_placeholders(ack, FetchFailure::InvalidRequest);
-                return;
-            }
-        }
+    // The empty spelling is the sync root directory itself; `resolve` maps
+    // empty components to the root item, so root population lists exactly
+    // the root's durable children (which parent to the root item).
+    let Some(parent) = host.resolve(&components).await else {
+        let _ = connection.fail_placeholders(ack, FetchFailure::InvalidRequest);
+        return;
     };
-    let Some(children) = host.children(parent).await else {
+    // One live span for the population request, opened as soon as the target
+    // directory is known and held until this request reaches its terminal
+    // outcome (success delivery, failure or drop). The item id is the
+    // directory being populated; the path hint is the request's own relative
+    // path (never an internal object key). Population moves metadata entries,
+    // not data bytes, so the span carries no byte progress at all:
+    // `total_bytes` stays unknown and `completed_bytes` stays 0 — entry counts
+    // are never reported as byte progress through the activity projection.
+    let _span = host.activity().begin(LiveWork {
+        connection_id: host.connection_id(),
+        activity_id: Uuid::new_v4(),
+        kind: LiveWorkKind::DirectoryPopulation,
+        item_id: Some(parent),
+        path_hint: Some(normalized_path.clone()),
+        started_unix_ms: now_unix_ms(),
+        total_bytes: None,
+        completed_bytes: Arc::new(AtomicU64::new(0)),
+    });
+    let Some(children) = host.children(Some(parent)).await else {
         let _ = connection.fail_placeholders(ack, FetchFailure::Internal);
         return;
     };
-    let mut entries: Vec<PlaceholderCreate> = Vec::new();
-    for child in children {
-        if let Some(pattern) = &pattern {
-            if !pattern_matches(pattern, &child.name) {
-                continue;
+    let (entries, complete_directory) =
+        plan_population(host.workspace(), pattern.as_deref(), children);
+    match connection.complete_placeholders(ack, &entries, complete_directory) {
+        Ok(outcomes) => {
+            // Per-entry results are reconciled, never assumed: an existing
+            // path is left for the ordinary reconciliation path. Entry
+            // outcomes are not byte progress and are never counted as such.
+            for outcome in outcomes {
+                match outcome.outcome {
+                    PlaceholderRequestOutcome::Created { .. }
+                    | PlaceholderRequestOutcome::AlreadyExists { .. } => {}
+                    PlaceholderRequestOutcome::Failed { code } => {
+                        // Every per-entry outcome is preserved and inspected.
+                        // A failed create leaves its name absent unless the
+                        // failure is an untouched occupied name, which is why
+                        // `complete_placeholders` marks the directory fully
+                        // populated only when every entry ended up *present*
+                        // (see `entry_present`), not merely attempted.
+                        tracing::warn!(code, "placeholder creation failed for one entry");
+                    }
+                }
             }
         }
+        Err(_) => {
+            let _ = connection.fail_placeholders(ack, FetchFailure::Internal);
+        }
+    }
+    // `_span` drops here, exactly when the request reaches its terminal
+    // outcome.
+}
+
+/// Build the authoritative whole-directory listing required by Full population.
+/// Windows permits additional entries beyond its lookup pattern; filtering by
+/// that pattern must not hide other names or truncate the directory.
+/// A versionless file cannot become a placeholder, so its delivery remains
+/// incomplete and must not disable further population.
+fn plan_population(
+    workspace: WorkspaceId,
+    request_pattern: Option<&str>,
+    children: Vec<PumpChild>,
+) -> (Vec<PlaceholderCreate>, bool) {
+    tracing::debug!(
+        pattern_supplied = request_pattern.is_some(),
+        children = children.len(),
+        "FETCH_PLACEHOLDERS: delivering the complete directory listing"
+    );
+    let mut complete_directory = true;
+    let mut entries = Vec::with_capacity(children.len());
+    for child in children {
         let identity = if child.is_directory {
-            PlaceholderIdentity::directory(host.workspace(), child.item_id)
+            PlaceholderIdentity::directory(workspace, child.item_id)
         } else {
             let Some(version) = child.version else {
                 // A file without a content version cannot become a
-                // placeholder; skip it rather than fabricate content.
+                // placeholder; skip it rather than fabricate content — and
+                // the delivery becomes a subset, never claimed complete.
+                complete_directory = false;
                 continue;
             };
-            PlaceholderIdentity::file(host.workspace(), child.item_id, version)
+            PlaceholderIdentity::file(workspace, child.item_id, version)
         };
         entries.push(PlaceholderCreate {
             name: child.name,
@@ -756,47 +871,8 @@ async fn serve_placeholders<R: RemoteOps, H: PumpHost<R>>(
             identity,
             mark_in_sync: true,
         });
-        if entries.len() >= 1000 {
-            break;
-        }
     }
-    let total = entries.len();
-    match connection.complete_placeholders(ack, total, &entries) {
-        Ok(outcomes) => {
-            // Per-entry results are reconciled, never assumed: an existing
-            // path is left for the ordinary reconciliation path.
-            for outcome in outcomes {
-                match outcome.outcome {
-                    PlaceholderRequestOutcome::Created { .. }
-                    | PlaceholderRequestOutcome::AlreadyExists { .. } => {}
-                    PlaceholderRequestOutcome::Failed { .. } => {
-                        tracing::warn!("placeholder creation failed for one entry");
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            let _ = connection.fail_placeholders(ack, FetchFailure::Internal);
-        }
-    }
-}
-
-/// Minimal `*` / `?` matching for the OS-provided search pattern.
-fn pattern_matches(pattern: &str, name: &str) -> bool {
-    fn matches(pattern: &[char], name: &[char]) -> bool {
-        match (pattern.split_first(), name.split_first()) {
-            (None, None) => true,
-            (Some(('*', rest)), _) => (0..=name.len()).any(|skip| matches(rest, &name[skip..])),
-            (Some(('?', rest)), Some((_, name_rest))) => matches(rest, name_rest),
-            (Some((p, pattern_rest)), Some((n, name_rest))) if p == n => {
-                matches(pattern_rest, name_rest)
-            }
-            _ => false,
-        }
-    }
-    let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    matches(&pattern, &name)
+    (entries, complete_directory)
 }
 
 // ---------------------------------------------------------------------------
@@ -902,5 +978,100 @@ async fn handle_completion<R: RemoteOps, H: PumpHost<R>>(host: &H, completion: C
                 host.void_delete_intents_for_present_items().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(name: &str, is_directory: bool, version: Option<VersionId>) -> PumpChild {
+        PumpChild {
+            item_id: ItemId::new(),
+            name: name.to_owned(),
+            is_directory,
+            version,
+            size: if is_directory { 0 } else { 42 },
+            modified_at_100ns: 133_738_424_000_000_000,
+        }
+    }
+
+    /// Full population must preserve every remote name regardless of case or
+    /// DOS-style lookup patterns.
+    #[test]
+    fn a_nonmatching_os_pattern_never_narrows_the_delivery() {
+        let workspace = WorkspaceId::new();
+        let children = vec![
+            child("IMG_3688.MP4", false, Some(VersionId::new())),
+            child("readme.txt", false, Some(VersionId::new())),
+            child("docs", true, None),
+        ];
+        for pattern in ["*.txt", "*.MP4", "*.*", "nomatch", "img_3688.mp4"] {
+            let (entries, complete) = plan_population(workspace, Some(pattern), children.clone());
+            assert!(
+                entries.iter().any(|entry| entry.name == "IMG_3688.MP4"),
+                "pattern {pattern:?} dropped the copy source from the population"
+            );
+            assert_eq!(entries.len(), 3, "pattern {pattern:?} narrowed the listing");
+            assert!(complete, "pattern {pattern:?} made a full listing look partial");
+        }
+    }
+
+    /// A complete, fully representable directory — including a genuinely
+    /// empty one — is delivered completely and claimed complete.
+    #[test]
+    fn complete_and_empty_directories_are_delivered_and_claimed_complete() {
+        let workspace = WorkspaceId::new();
+        let (entries, complete) = plan_population(workspace, Some("*"), vec![]);
+        assert!(entries.is_empty());
+        assert!(complete, "an empty directory is a complete empty listing");
+
+        let (entries, complete) = plan_population(
+            workspace,
+            None,
+            vec![
+                child("a.txt", false, Some(VersionId::new())),
+                child("sub", true, None),
+            ],
+        );
+        assert_eq!(entries.len(), 2);
+        assert!(complete);
+    }
+
+    /// A child that cannot become a placeholder (a file without a content
+    /// version) is skipped rather than fabricated, and the delivery becomes
+    /// a subset: it must never be claimed complete, while the representable
+    /// entries are still delivered in full.
+    #[test]
+    fn a_versionless_child_makes_the_delivery_an_unclaimed_subset() {
+        let workspace = WorkspaceId::new();
+        let (entries, complete) = plan_population(
+            workspace,
+            Some("*"),
+            vec![
+                child("good.txt", false, Some(VersionId::new())),
+                child("bad.txt", false, None),
+                child("dir", true, None),
+            ],
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["good.txt", "dir"],
+            "representable entries are still delivered in full"
+        );
+        assert!(!complete, "a subset delivery must never claim to be complete");
+    }
+
+    /// Every child reaches an entry: no 1000-entry truncation, and the
+    /// completeness flag still describes the whole directory.
+    #[test]
+    fn large_directories_are_never_truncated() {
+        let workspace = WorkspaceId::new();
+        let children: Vec<PumpChild> = (0..2500)
+            .map(|i| child(&format!("f{i:04}.bin"), false, Some(VersionId::new())))
+            .collect();
+        let (entries, complete) = plan_population(workspace, Some("*"), children);
+        assert_eq!(entries.len(), 2500, "the delivery dropped children");
+        assert!(complete);
     }
 }

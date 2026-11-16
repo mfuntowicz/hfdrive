@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hfdrive_core::ids::{ConnectionId, DeviceId, ItemId, OperationId, UploadId, VersionId, WorkspaceId};
 use hfdrive_core::reconcile::ReconcileMode;
@@ -33,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::scheduler::Scheduler;
 use crate::sync::observe::{
     Classification, EchoTable, LocalObserver, ObserverConfig, PendingRemovals,
-    classify_observation, deletion_evidence, resolve_item,
+    classify_observation, resolve_item,
 };
 use crate::sync::outbox::{
     IntentKind, PendingContent, PhaseStep, SyncIntent, display_timestamp, intent_entry,
@@ -56,6 +57,51 @@ pub struct ConnectionConfig {
     pub start_paused: bool,
 }
 
+/// Liveness of one connection's CFAPI runtime.
+///
+/// The status and reconnect paths must be able to tell a healthy active
+/// runtime from a missing, cancelled or finished one: none of the latter are
+/// synchronized, and none of them may be reported as if they were. Local data
+/// is preserved in every state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeState {
+    /// No CFAPI pump is attached: the root is not being driven.
+    #[default]
+    Missing,
+    /// The connection's cancellation fired: the runtime is stopping or has
+    /// stopped.
+    Cancelled,
+    /// The CFAPI pump ran to its end (or is draining): the sync root is no
+    /// longer driven by this runtime.
+    Finished,
+    /// Callbacks are attached and the pump is running.
+    Active,
+}
+
+impl RuntimeState {
+    /// True only for a CFAPI runtime that is actually driving the root.
+    pub fn is_active(self) -> bool {
+        matches!(self, RuntimeState::Active)
+    }
+
+    /// Non-secret explanation for the status layer. None of these claim that
+    /// local data was lost: state, registration and files are preserved.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RuntimeState::Active => "the local sync runtime is connected and running",
+            RuntimeState::Missing => {
+                "the local sync runtime is not connected; local files are preserved and reconnect resumes synchronization"
+            }
+            RuntimeState::Cancelled => {
+                "the local sync runtime was stopped; local files are preserved and reconnect resumes synchronization"
+            }
+            RuntimeState::Finished => {
+                "the local sync runtime ended; local files are preserved and reconnect resumes synchronization"
+            }
+        }
+    }
+}
+
 /// Durable capability + health state surfaced to the parent's status layer.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionHealth {
@@ -65,6 +111,70 @@ pub struct ConnectionHealth {
     pub dirty_files: u32,
     pub conflict_files: u32,
     pub last_error: Option<String>,
+    /// The remote observation worker (SSE/poll) recorded a failure. The
+    /// connection's own drive loop and CFAPI runtime are unaffected; remote
+    /// reconciliation continues and the failure stays visible until a live
+    /// watch proves itself again.
+    pub watch_error: Option<WatchFailure>,
+    /// Live CFAPI runtime liveness, folded in by
+    /// [`ConnectionRuntime::health`]. A stale snapshot is never presented as
+    /// an active runtime.
+    pub runtime: RuntimeState,
+}
+
+/// A recorded remote-watch failure. Non-secret; kept in health so the status
+/// layer can project it truthfully instead of claiming "up to date".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFailure {
+    /// A remote change was observed but could not be recorded durably. Its
+    /// cursor was not acknowledged, so a reconnect replays it.
+    Persistence,
+    /// The change feed is unavailable (throttled, needs sign-in, denied,
+    /// offline or transport failure). Independent polling keeps running.
+    Stream(crate::remote_watch::WatchIssue),
+}
+
+impl WatchFailure {
+    /// Non-secret explanation for the status layer. Never claims local data
+    /// was lost: state, registration and files are preserved.
+    pub fn describe(self) -> &'static str {
+        match self {
+            WatchFailure::Persistence => {
+                "a remote change could not be recorded durably; it is replayed on reconnect and local files are preserved"
+            }
+            WatchFailure::Stream(crate::remote_watch::WatchIssue::RateLimited) => {
+                "the remote service throttled change observation; independent polling continues"
+            }
+            WatchFailure::Stream(crate::remote_watch::WatchIssue::AuthRequired) => {
+                "change observation requires sign-in; local files are preserved"
+            }
+            WatchFailure::Stream(crate::remote_watch::WatchIssue::PermissionDenied) => {
+                "change observation was denied; local files are preserved"
+            }
+            WatchFailure::Stream(crate::remote_watch::WatchIssue::RemoteUnavailable) => {
+                "the remote service is unavailable; independent polling continues and local files are preserved"
+            }
+            WatchFailure::Stream(crate::remote_watch::WatchIssue::Transport) => {
+                "change observation transport failed; independent polling continues and local files are preserved"
+            }
+        }
+    }
+}
+
+/// Engine → connection-runtime notifications for one connection's remote
+/// watch worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchUpdate {
+    /// A remote `HEAD` invalidation was durably recorded and acknowledged.
+    /// A poll-sourced invalidation proves durable persistence again but says
+    /// nothing about the event stream; an event/reset-sourced one proves the
+    /// whole observation path.
+    HeadInvalidated {
+        source: crate::remote_watch::NoticeSource,
+    },
+    /// The remote watch worker recorded a failure. The connection's drive
+    /// loop and CFAPI runtime are deliberately unaffected by a watch failure.
+    WatchFailed(WatchFailure),
 }
 
 /// One running connection.
@@ -73,13 +183,24 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     state: AccountStore,
     remote: R,
     scheduler: Arc<Scheduler>,
+    /// The provider-wide live-work registry this connection's CFAPI pump
+    /// opens its in-flight spans in.
+    activity: Arc<crate::sync::activity::ActivityRegistry>,
     cancel: CancellationToken,
     paused: watch::Sender<bool>,
     health: watch::Sender<ConnectionHealth>,
     echo: tokio::sync::Mutex<EchoTable>,
     pending_removals: tokio::sync::Mutex<PendingRemovals>,
+    /// Held across each drive round so quiescence can await exactly the
+    /// in-flight dispatch instead of guessing at pause timing.
+    dispatch: tokio::sync::Mutex<()>,
     pump: tokio::sync::Mutex<Option<PumpHandle>>,
     disconnect_failure: tokio::sync::Mutex<Option<DisconnectError>>,
+    observer: tokio::sync::Mutex<Option<LocalObserver>>,
+    observation_tx: tokio::sync::Mutex<Option<mpsc::Sender<crate::sync::observe::ObservationBatch>>>,
+    local_ready: AtomicBool,
+    scan_requested: AtomicBool,
+    persistence_failed: AtomicBool,
 }
 
 /// The live CFAPI pump of one connected root. Stopping it cancels its work
@@ -90,8 +211,8 @@ pub struct ConnectionRuntime<R: RemoteOps> {
 /// carried there and surfaced by [`ConnectionRuntime::disconnect`], never
 /// reported as a successful disconnect.
 pub struct PumpHandle {
-    token: CancellationToken,
-    task: tokio::task::JoinHandle<crate::sync::cfapi_pump::PumpOutcome>,
+    pub(crate) token: CancellationToken,
+    pub(crate) task: tokio::task::JoinHandle<crate::sync::cfapi_pump::PumpOutcome>,
 }
 
 /// Why a pump did not disconnect its sync root cleanly. Surfaced by
@@ -147,6 +268,29 @@ fn export_dirty_file(source: &std::path::Path, recovery_dir: &std::path::Path) -
     }
 }
 
+/// Pure runtime-liveness classification for one connection's CFAPI pump.
+///
+/// Cancellation of the connection scope wins first (the runtime is stopping),
+/// then a missing pump handle (never attached or already detached), then the
+/// handle's own evidence: a cancelled token or a task that ran to completion
+/// is not an active runtime. Local data is preserved in every state.
+fn pump_liveness(
+    connection_cancel: &CancellationToken,
+    pump: Option<&PumpHandle>,
+) -> RuntimeState {
+    if connection_cancel.is_cancelled() {
+        return RuntimeState::Cancelled;
+    }
+    let Some(handle) = pump else {
+        return RuntimeState::Missing;
+    };
+    if handle.token.is_cancelled() || handle.task.is_finished() {
+        RuntimeState::Finished
+    } else {
+        RuntimeState::Active
+    }
+}
+
 impl<R: RemoteOps> ConnectionRuntime<R> {
     /// The connection's managed workspace identity.
     pub fn workspace_id(&self) -> WorkspaceId {
@@ -173,6 +317,10 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
 
     fn scheduler(&self) -> &Scheduler {
         &self.scheduler
+    }
+
+    fn activity(&self) -> &crate::sync::activity::ActivityRegistry {
+        &self.activity
     }
 
     fn connection_id(&self) -> ConnectionId {
@@ -359,52 +507,49 @@ fn parse_rfc3339_whole_seconds(value: &str) -> Option<i64> {
 }
 
 impl<R: RemoteOps> ConnectionRuntime<R> {
-    /// Builds the runtime and starts its worker loop. `notifications` wakes
-    /// the loop on remote `HEAD` invalidations. The runtime owns its
-    /// directory watcher for its whole lifetime.
+    /// Builds the runtime and starts its worker loop. `notifications` carries
+    /// the connection's remote-watch updates (durably recorded `HEAD`
+    /// invalidations and watch failures) and wakes the loop. The runtime owns
+    /// its directory watcher for its whole lifetime.
     pub fn start(
         config: ConnectionConfig,
         state: AccountStore,
         remote: R,
         scheduler: Arc<Scheduler>,
+        activity: Arc<crate::sync::activity::ActivityRegistry>,
         cancel: CancellationToken,
-        mut notifications: mpsc::Receiver<()>,
+        mut notifications: mpsc::Receiver<WatchUpdate>,
     ) -> Arc<Self> {
         // Engine connect explicitly resumes after durable pause state is
         // loaded, so a restored connection cannot dispatch during startup.
         let (paused_tx, _) = watch::channel(true);
-        let (health_tx, _) = watch::channel(ConnectionHealth::default());
+        let (health_tx, _) = watch::channel(ConnectionHealth {
+            last_error: Some("Local filesystem discovery is starting".to_owned()),
+            ..ConnectionHealth::default()
+        });
+        let (observation_tx, mut observation_rx) =
+            mpsc::channel::<crate::sync::observe::ObservationBatch>(64);
         let runtime = Arc::new(Self {
             config,
             state,
             remote,
             scheduler,
+            activity,
             cancel: cancel.clone(),
             paused: paused_tx,
             health: health_tx,
             echo: tokio::sync::Mutex::new(EchoTable::default()),
             pending_removals: tokio::sync::Mutex::new(PendingRemovals::default()),
+            dispatch: tokio::sync::Mutex::new(()),
             pump: tokio::sync::Mutex::new(None),
             disconnect_failure: tokio::sync::Mutex::new(None),
+            observer: tokio::sync::Mutex::new(None),
+            observation_tx: tokio::sync::Mutex::new(Some(observation_tx)),
+            local_ready: AtomicBool::new(false),
+            scan_requested: AtomicBool::new(true),
+            persistence_failed: AtomicBool::new(false),
         });
 
-        // Local observation pipeline: the watcher thread and the debounce
-        // loop live as long as the runtime's cancel scope.
-        let (observation_tx, mut observation_rx) =
-            mpsc::channel::<crate::sync::observe::ObservationBatch>(64);
-        let _observer = LocalObserver::start(
-            ObserverConfig {
-                root: runtime.config.root.clone(),
-                coalesce: crate::sync::observe::COALESCE_WINDOW,
-                scan_interval: crate::sync::observe::SCAN_INTERVAL,
-            },
-            cancel.clone(),
-            observation_tx,
-        );
-        // Leak the observer on purpose: its shutdown joins the watcher thread
-        // and cannot run inside an async worker; it stops when the runtime's
-        // cancel token fires (the watcher thread exits) or at process exit.
-        std::mem::forget(_observer);
 
         // Worker loop.
         let worker = runtime.clone();
@@ -413,23 +558,46 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut notifications_open = true;
+            let mut observations_open = true;
+            let mut next_scan = tokio::time::Instant::now();
             loop {
+                let mut wake = false;
                 tokio::select! {
                     _ = worker_cancel.cancelled() => break,
                     notification = notifications.recv(), if notifications_open => {
-                        if notification.is_none() {
-                            notifications_open = false;
-                            continue;
+                        match notification {
+                            None => notifications_open = false,
+                            Some(update) => {
+                                worker.note_watch_update(update);
+                                wake = true;
+                            }
                         }
                     }
-                    batch = observation_rx.recv() => {
+                    batch = observation_rx.recv(), if observations_open => {
                         match batch {
                             Some(batch) => worker.ingest_observations(batch).await,
-                            None => {}
+                            None => {
+                                observations_open = false;
+                                if !worker_cancel.is_cancelled() {
+                                    worker.local_failure("Local file observation stopped; reconnect the drive");
+                                }
+                            }
                         }
+                        wake = true;
                     }
-                    _ = interval.tick() => {}
+                    _ = interval.tick() => { wake = true; }
                 }
+                if !wake {
+                    continue;
+                }
+                let observing = worker.observer.lock().await.as_ref().is_some_and(LocalObserver::is_running);
+                if observing && (worker.scan_requested.swap(false, Ordering::AcqRel)
+                    || tokio::time::Instant::now() >= next_scan)
+                {
+                    worker.scan_local().await;
+                    next_scan = tokio::time::Instant::now() + crate::sync::observe::SCAN_INTERVAL;
+                }
+                if !worker.local_ready.load(Ordering::Acquire) { continue; }
                 if *worker.paused.borrow() {
                     continue;
                 }
@@ -467,6 +635,19 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             crate::sync::cfapi_pump::run_pump(host, connection, streams, pump_cancel).await
         });
         *self.pump.lock().await = Some(PumpHandle { token, task });
+        self.start_observer().await;
+    }
+
+    async fn start_observer(&self) {
+        let Some(sender) = self.observation_tx.lock().await.take() else { return; };
+        match LocalObserver::start(
+            ObserverConfig { root: self.config.root.clone(), coalesce: crate::sync::observe::COALESCE_WINDOW },
+            self.cancel.child_token(),
+            sender,
+        ).await {
+            Ok(observer) => { *self.observer.lock().await = Some(observer); }
+            Err(_) => self.local_failure("Local file observation could not start; local files are preserved"),
+        }
     }
 
     /// Stops the live pump: cancellation marks its workers, every in-flight
@@ -483,6 +664,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     pub async fn disconnect(&self) -> Result<(), DisconnectError> {
         if let Some(error) = self.disconnect_failure.lock().await.clone() {
             return Err(error);
+        }
+        if let Some(observer) = self.observer.lock().await.take() {
+            observer.shutdown().await;
         }
         // Take the handle and release the pump lock before awaiting the
         // drain: nothing else may hold this mutex across a worker join.
@@ -785,14 +969,73 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         self.paused.send_replace(true);
     }
 
+    /// Quiesces dispatch in memory: pauses remote scheduling and waits for the
+    /// in-flight drive round to finish. Observation and the durable pause
+    /// intent continue untouched; after this returns, no publication dispatch
+    /// is running or can start until `resume`.
+    pub async fn quiesce(&self) {
+        self.pause();
+        let _round = self.dispatch.lock().await;
+    }
+
     /// Resumes remote scheduling; the next drive revalidates capabilities.
     pub fn resume(&self) {
         self.paused.send_replace(false);
     }
 
+    /// Records one remote-watch notification. A watch failure is observable
+    /// in health and never stops this connection's drive loop or its CFAPI
+    /// runtime: the independent poll and the durable intent remain intact.
+    fn note_watch_update(&self, update: WatchUpdate) {
+        let mut health = self.health.borrow().clone();
+        match update {
+            WatchUpdate::HeadInvalidated { source } => {
+                // A durably recorded and acknowledged change proves durable
+                // persistence again. Only an event/reset-sourced one proves
+                // the event stream itself: a poll firing is not evidence that
+                // SSE recovered.
+                match source {
+                    crate::remote_watch::NoticeSource::Poll => {
+                        if matches!(health.watch_error, Some(WatchFailure::Persistence)) {
+                            health.watch_error = None;
+                        }
+                    }
+                    crate::remote_watch::NoticeSource::Event
+                    | crate::remote_watch::NoticeSource::Resync => {
+                        health.watch_error = None;
+                    }
+                }
+            }
+            WatchUpdate::WatchFailed(failure) => {
+                health.watch_error = Some(failure);
+            }
+        }
+        self.health.send_replace(health);
+    }
+
     /// Current health projection for the parent's status layer.
-    pub fn health(&self) -> ConnectionHealth {
-        self.health.borrow().clone()
+    ///
+    /// The runtime liveness is folded in here, never trusted from the stale
+    /// snapshot: a missing, cancelled or finished CFAPI runtime is always
+    /// reported as such and is never presented as if it were driving the
+    /// root. Local data is preserved in every state.
+    pub async fn health(&self) -> ConnectionHealth {
+        let mut health = self.health.borrow().clone();
+        health.runtime = self.runtime_state().await;
+        if health.runtime.is_active()
+            && self.observer.lock().await.as_ref().is_none_or(|observer| !observer.is_running())
+        {
+            health.last_error = Some("Local file observation is unavailable; reconnect the drive".to_owned());
+        }
+        health
+    }
+
+    /// Live liveness of this connection's CFAPI runtime, rechecked on every
+    /// call: a pump handle being present is not proof that the task is still
+    /// running.
+    pub async fn runtime_state(&self) -> RuntimeState {
+        let pump = self.pump.lock().await;
+        pump_liveness(&self.cancel, pump.as_ref())
     }
 
     /// True when this connection may dispatch remote mutation.
@@ -830,6 +1073,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     /// before any effect. Watcher overflow voids deletion evidence.
     pub async fn ingest_observations(&self, batch: crate::sync::observe::ObservationBatch) {
         if batch.rescan_required {
+            self.scan_requested.store(true, Ordering::Release);
             let _ = self.state.invalidate_scan(self.config.connection_id).await;
         }
         let echo = self.echo.lock().await;
@@ -850,6 +1094,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 | Classification::Excluded
                 | Classification::Ignored => {}
                 Classification::RescanRequired => {
+                    self.scan_requested.store(true, Ordering::Release);
                     let _ = self.state.invalidate_scan(self.config.connection_id).await;
                 }
                 Classification::Created {
@@ -868,14 +1113,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                     self.persist_move(item_id, &observation.relative_path, &state).await;
                 }
                 Classification::Removed { item_id } => {
-                    let mut pending = self.pending_removals.lock().await;
-                    pending.park(item_id, observation.relative_path.clone(), now_ms());
-                    let scan =
-                        self.state.scan_state(self.config.connection_id).await.ok().flatten();
-                    for released in pending.release(deletion_evidence(&scan)) {
-                        self.persist_intent(SyncIntent::Delete { item_id: *released.as_uuid() })
-                            .await;
-                    }
+                    self.pending_removals.lock().await.park(item_id, observation.relative_path.clone(), now_ms());
+                    self.scan_requested.store(true, Ordering::Release);
+                    let _ = self.state.invalidate_scan(self.config.connection_id).await;
                 }
                 Classification::UntrackedRemoval => {
                     let _ = self.state.invalidate_scan(self.config.connection_id).await;
@@ -923,7 +1163,19 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 }),
             }
         };
-        self.persist_intent(intent).await;
+        let item = if let SyncIntent::Create { name, .. } = &intent { Some(hfdrive_state::ItemRecord {
+            connection_id: self.config.connection_id,
+            item_id,
+            parent_id: Some(ItemId::from_uuid(parent).expect("resolved parent is a non-nil item")),
+            name: name.clone(),
+            name_key: String::from_utf8(hfdrive_core::names::collision_key(name)).expect("collision keys are UTF-8"),
+            kind: if is_directory == Some(true) { hfdrive_state::ItemKind::Directory } else { hfdrive_state::ItemKind::File },
+            revision: OperationId::new(),
+            content_version_id: None,
+            deleted: false,
+            metadata_json: serde_json::json!({ "size": state.size, "modified_at": display_timestamp(state.last_write_time_100ns) }),
+        }) } else { None };
+        self.persist_intent(intent, item, state.usn.and_then(|usn| u64::try_from(usn).ok())).await;
     }
 
     /// Persists a move/rename with its resolved parent.
@@ -933,7 +1185,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             item_id: *item_id.as_uuid(),
             parent_id: parent,
             name: file_name(relative_path),
-        })
+        }, None, _state.usn.and_then(|usn| u64::try_from(usn).ok()))
         .await;
     }
 
@@ -963,52 +1215,123 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         }
     }
 
-    /// Persists one durable intent (generation first, then the outbox entry).
-    /// A second content intent is suppressed while an earlier one for the
-    /// same item is still pre-capture: its capture reads the latest bytes and
-    /// the generation guard schedules the follow-up. This suppresses nothing
-    /// durable: the newer generation stays dirty until its own intent.
-    async fn persist_intent(&self, intent: SyncIntent) {
-        let item_id = intent.item_id();
-        let observed = self
-            .state
-            .bump_observation(self.config.connection_id, item_id, None)
-            .await;
-        let Ok(observation) = observed else { return; };
-        if intent.has_content() {
-            if let Ok(entries) = self
-                .state
-                .list_outbox(self.config.connection_id, Some(OutboxState::Observed), 64)
-                .await
-            {
-                let pending_upload = entries.iter().any(|entry| {
-                    entry.item_id == Some(item_id)
-                        && parse_intent(entry)
-                            .map(|intent| intent.has_content())
-                            .unwrap_or(false)
-                });
-                if pending_upload {
-                    return;
+    /// Item identity, generation, and intent commit together before capture.
+    async fn persist_intent(
+        &self,
+        intent: SyncIntent,
+        item: Option<hfdrive_state::ItemRecord>,
+        usn: Option<u64>,
+    ) {
+        let result = async {
+            let base = self.state.baseline(self.config.connection_id).await?.applied_commit;
+            let entry = intent_entry(
+                self.config.connection_id, OperationId::new(), Some(intent.item_id()),
+                base, None, 0, &intent,
+            ).map_err(|_| hfdrive_state::StateError::Io(std::io::Error::other("invalid local intent")))?;
+            self.state.record_observed_work(item, entry, usn).await
+        }.await;
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::Release);
+            self.local_failure("Local changes could not be recorded; local files are preserved");
+        }
+    }
+
+    fn local_failure(&self, message: &str) {
+        self.local_ready.store(false, Ordering::Release);
+        let mut health = self.health.borrow().clone();
+        health.last_error = Some(message.to_owned());
+        self.health.send_replace(health);
+    }
+
+    async fn scan_local(&self) {
+        let result: Result<(), &'static str> = async {
+            let previous = self.state.scan_state(self.config.connection_id).await
+                .map_err(|_| "Local scan state is unavailable")?
+                .ok_or("Local scan state is missing")?;
+            let known = self.state.list_all_items(self.config.connection_id, false).await
+                .map_err(|_| "Local item registry is unavailable")?;
+            self.state.begin_scan(self.config.connection_id, previous.volume_id, previous.journal_id).await
+                .map_err(|_| "Local discovery could not be recorded")?;
+            if let Some(observer) = self.observer.lock().await.as_ref() { observer.begin_scan(); }
+            let root = self.config.root.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let scan_cancel = cancelled.clone();
+            let mut scan = tokio::task::spawn_blocking(move ||
+                crate::sync::observe::enumerate_metadata(&root, &scan_cancel)
+            );
+            let (entries, report) = tokio::select! {
+                result = &mut scan => result.map_err(|_| "Local discovery task failed")?
+                    .map_err(|_| "Local discovery failed; local files are preserved")?,
+                _ = self.cancel.cancelled() => {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = scan.await;
+                    return Err("Local discovery was cancelled");
+                }
+            };
+            let observations = entries.iter().map(|entry| crate::sync::observe::RawObservation {
+                relative_path: entry.relative_path.clone(),
+                action: hfdrive_windows::filesystem::WatchAction::Modified,
+            }).collect();
+            self.ingest_observations(crate::sync::observe::ObservationBatch {
+                observations, rescan_required: false,
+            }).await;
+            if !report.complete || report.overflow || self.persistence_failed.load(Ordering::Acquire) {
+                return Err("Local discovery is incomplete; no deletions were inferred");
+            }
+            let lost = self.observer.lock().await.as_ref()
+                .is_none_or(|observer| !observer.is_running() || observer.overflowed());
+            if lost || self.cancel.is_cancelled() {
+                return Err("Local observation changed during discovery; no deletions were inferred");
+            }
+            let completed = self.state.complete_scan(self.config.connection_id, None).await
+                .map_err(|_| "Local discovery completion could not be recorded")?;
+            if !completed.may_infer_deletion() {
+                return Err("Local discovery was invalidated; no deletions were inferred");
+            }
+            let explicit: std::collections::HashSet<_> =
+                self.pending_removals.lock().await.release(true).into_iter().collect();
+            let seen: std::collections::HashSet<_> = entries.iter().map(|entry| entry.relative_path.as_path()).collect();
+            let by_id: std::collections::HashMap<_, _> = known.iter().map(|item| (item.item_id, item)).collect();
+            for item in &known {
+                if item.item_id == self.config.root_item_id { continue; }
+                if !explicit.contains(&item.item_id)
+                    && self.state.observation(self.config.connection_id, item.item_id).await
+                        .map_err(|_| "Local observation state is unavailable")?.is_none()
+                { continue; }
+                let mut names = Vec::new();
+                let mut current = item;
+                while let Some(parent) = current.parent_id {
+                    names.push(current.name.as_str());
+                    if names.len() > 512 { return Err("Local item ancestry is invalid"); }
+                    current = by_id.get(&parent).copied().ok_or("Local item ancestry is incomplete")?;
+                }
+                let path: PathBuf = names.into_iter().rev().collect();
+                if seen.contains(path.as_path()) { continue; }
+                match std::fs::symlink_metadata(self.config.root.join(&path)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if self.observer.lock().await.as_ref().is_none_or(LocalObserver::overflowed) {
+                            return Err("Local observation was lost; deletion inference stopped");
+                        }
+                        self.persist_intent(SyncIntent::Delete { item_id: *item.item_id.as_uuid() }, None, None).await;
+                    }
+                    Err(_) => return Err("A local item could not be inspected; no deletion was inferred"),
+                    Ok(_) => {}
                 }
             }
-        }
-        let operation = OperationId::new();
-        let base_commit = self
-            .state
-            .baseline(self.config.connection_id)
-            .await
-            .ok()
-            .and_then(|baseline| baseline.applied_commit);
-        if let Ok(entry) = intent_entry(
-            self.config.connection_id,
-            operation,
-            Some(item_id),
-            base_commit,
-            None,
-            observation.generation,
-            &intent,
-        ) {
-            let _ = self.state.record_outbox(entry).await;
+            if self.persistence_failed.load(Ordering::Acquire) { return Err("Local changes could not be recorded"); }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                self.local_ready.store(true, Ordering::Release);
+                let mut health = self.health.borrow().clone();
+                health.last_error = None;
+                self.health.send_replace(health);
+            }
+            Err(message) => {
+                let _ = self.state.invalidate_scan(self.config.connection_id).await;
+                self.local_failure(message);
+            }
         }
     }
 
@@ -1017,7 +1340,16 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     // -----------------------------------------------------------------------
 
     /// One worker step: upload pass, publication round, apply pass.
+    ///
+    /// Holds the dispatch gate for the whole round so quiescence can await
+    /// exactly the in-flight dispatch; paused is re-checked under the gate so
+    /// a quiesce landing between the caller's check and this round can never
+    /// start one.
     pub async fn drive(&self) {
+        let _round = self.dispatch.lock().await;
+        if *self.paused.borrow() {
+            return;
+        }
         self.refresh_health().await;
         let cancel = self.cancel.child_token();
         let ctx = self.round_context(&cancel);
@@ -1112,7 +1444,22 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                     self.schedule_followup(&entry).await;
                 }
                 Ok(_) => {}
-                Err(_) => {}
+                Err(error) => {
+                    // A real local-apply/close failure is recorded after the
+                    // attempt (state advances above cleared stale errors), so
+                    // the activity projection can name it.
+                    crate::sync::work_errors::record_outbox_error(
+                        &self.state,
+                        self.config.connection_id,
+                        entry.operation_id,
+                        crate::sync::work_errors::codes::LOCAL_APPLY_FAILED,
+                        &format!(
+                            "closing the published work failed: {}",
+                            crate::sync::work_errors::state_code(&error)
+                        ),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1135,7 +1482,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 version_id: VersionId::new().as_uuid().clone(),
                 modified_at: display_timestamp(state.last_write_time_100ns),
             },
-        })
+        }, None, state.usn.and_then(|usn| u64::try_from(usn).ok()))
         .await;
     }
 
@@ -1399,4 +1746,107 @@ pub async fn registry_path(
         path.push(component);
     }
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::cfapi_pump::PumpOutcome;
+
+    #[tokio::test]
+    async fn startup_discovery_queues_an_existing_file_and_rolls_back_failed_work() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("already-here.txt"), b"recover these local bytes").unwrap();
+        let cancel = CancellationToken::new();
+        let (_notifications, receiver) = mpsc::channel(1);
+        let runtime = ConnectionRuntime::start(
+            ConnectionConfig {
+                connection_id: fixture.connection, workspace: fixture.workspace,
+                root_item_id: fixture.root_item, device_id: DeviceId::new(),
+                root: fixture.root.clone(), staging_dir: fixture.directory.path().join("snapshots"),
+                recovery_dir: fixture.directory.path().join("recovery"),
+                mode: hfdrive_state::ConnectionMode::Writable, start_paused: true,
+            },
+            fixture.account.clone(), HeadOnlyRemote { head: None },
+            Arc::new(Scheduler::new(Default::default())),
+            Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            cancel.clone(), receiver,
+        );
+        runtime.start_observer().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.local_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert!(matches!(parse_intent(entry).unwrap(), SyncIntent::Create { name, .. } if name == "already-here.txt"));
+        let item_id = entry.item_id.unwrap();
+        let item = fixture.account.item(fixture.connection, item_id).await.unwrap().unwrap();
+        assert_eq!(item.parent_id, Some(fixture.root_item));
+        assert_eq!(item.name, "already-here.txt");
+        let observation = fixture.account.observation(fixture.connection, item_id).await.unwrap().unwrap();
+        assert!(observation.dirty);
+        let mut replacement = item.clone();
+        replacement.name = "must-not-survive.txt".to_owned();
+        assert!(fixture.account.record_observed_work(Some(replacement), entry.clone(), None).await.is_err());
+        assert_eq!(fixture.account.item(fixture.connection, item_id).await.unwrap(), Some(item));
+        assert_eq!(fixture.account.observation(fixture.connection, item_id).await.unwrap(), Some(observation));
+        assert_eq!(std::fs::read(fixture.root.join("already-here.txt")).unwrap(), b"recover these local bytes");
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    fn pump_outcome() -> PumpOutcome {
+        PumpOutcome { disconnect: Ok(()), worker_panicked: false }
+    }
+
+    /// Runtime liveness is classified from live evidence on every call, never
+    /// from a stale snapshot: missing, cancelled, finished (own scope stopped
+    /// or task ended) and active are all distinguishable, and local data is
+    /// preserved in every state.
+    #[tokio::test]
+    async fn pump_liveness_reports_missing_cancelled_finished_and_active() {
+        let connection = CancellationToken::new();
+
+        // Missing: no CFAPI pump is attached.
+        let missing = pump_liveness(&connection, None);
+        assert_eq!(missing, RuntimeState::Missing);
+        assert!(!missing.is_active());
+
+        // Active: the pump's scope is live and its task has not ended.
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        let pump_token = connection.child_token();
+        let task = tokio::spawn(async move {
+            let _ = hold_rx.await;
+            pump_outcome()
+        });
+        let handle = PumpHandle { token: pump_token.clone(), task };
+        assert_eq!(pump_liveness(&connection, Some(&handle)), RuntimeState::Active);
+
+        // Finished: the pump's own scope stopped (its work is draining) even
+        // though its task has not ended yet.
+        pump_token.cancel();
+        assert_eq!(pump_liveness(&connection, Some(&handle)), RuntimeState::Finished);
+        drop(hold_tx);
+
+        // Finished: the pump task ran to its end while its scope stayed live.
+        let task = tokio::spawn(async { pump_outcome() });
+        let handle = PumpHandle { token: connection.child_token(), task };
+        while !handle.task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.token.is_cancelled());
+        assert_eq!(pump_liveness(&connection, Some(&handle)), RuntimeState::Finished);
+
+        // Cancelled: the connection scope fired first, regardless of the pump.
+        let task = tokio::spawn(async { pump_outcome() });
+        let handle = PumpHandle { token: connection.child_token(), task };
+        connection.cancel();
+        assert_eq!(pump_liveness(&connection, Some(&handle)), RuntimeState::Cancelled);
+        assert!(!pump_liveness(&connection, Some(&handle)).is_active());
+    }
 }

@@ -1,5 +1,5 @@
 //! Account publication follows durable selection; credential material stays in the auth store.
-use crate::{Provider, account, operations::{error, internal, state_error}};
+use crate::{AccountFailure, Provider, account, operations::{error, internal, state_error}};
 use hfdrive_auth::{AccountCredentialStore, AuthError, AuthSnapshot, LoginFlow, LoginState};
 use hfdrive_protocol::{self as wire, ProtocolError, ProtocolErrorCode};
 use hfdrive_state::{AccountRecord, AccountStatus, CredentialRef};
@@ -58,7 +58,9 @@ impl Provider {
         }
     }
 
-    fn publish_account(&self, account: wire::AccountStatus) -> Result<(), ProtocolError> {
+    /// The one account-status watch publisher: monotonic sequence, no-op when
+    /// the account is unchanged, and never a parallel status-writing path.
+    pub(crate) fn publish_account(&self, account: wire::AccountStatus) -> Result<(), ProtocolError> {
         let mut exhausted = false;
         self.status.send_if_modified(|snapshot| {
             if snapshot.account == account { return false; }
@@ -74,14 +76,12 @@ impl Provider {
         let mut receiver = self.auth.watch();
         loop {
             if let Err(error) = self.synchronize_account().await {
-                let mut account = self.status.borrow().account.clone();
-                account.state = wire::AuthenticationState::NeedsSignIn;
-                account.last_error = Some(error);
-                let _ = self.publish_account(account);
+                // Synchronizing the account failed and its token epoch was
+                // cleared: the session needs a new interactive grant.
+                let _ = self.publish_account_error(AccountFailure::SignInRequired, error);
             } else if let Err(error) = self.restore_connections().await {
-                let mut account = self.status.borrow().account.clone();
-                account.last_error = Some(error);
-                let _ = self.publish_account(account);
+                // The session itself is intact; only restoration failed.
+                let _ = self.publish_account_error(AccountFailure::Restore, error);
             }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
@@ -182,5 +182,60 @@ impl Provider {
             return Err(error);
         }
         Ok(wire::SignOutResult { signed_out: true })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hfdrive_protocol::StatusSnapshot;
+
+    /// The two observer failure kinds keep distinct session semantics through
+    /// the shared publication boundary: a lost token epoch requires sign-in,
+    /// while a restoration failure only annotates the intact session.
+    #[tokio::test]
+    async fn failure_kinds_keep_needs_sign_in_and_restore_semantics() {
+        let provider = Provider::new(StatusSnapshot {
+            sequence: 3,
+            account: wire::AccountStatus {
+                state: wire::AuthenticationState::SignedIn,
+                profile: None,
+                login: None,
+                last_error: None,
+            },
+            connections: Vec::new(),
+        });
+
+        // A restore failure on an intact session records the failure without
+        // demanding a new interactive grant.
+        provider
+            .publish_account_error(
+                AccountFailure::Restore,
+                error(ProtocolErrorCode::Timeout, "the persisted root could not be restored"),
+            )
+            .unwrap();
+        let snapshot = provider.status.borrow().clone();
+        assert_eq!(snapshot.account.state, wire::AuthenticationState::SignedIn);
+        assert_eq!(
+            snapshot.account.last_error.as_ref().map(|failure| failure.code),
+            Some(ProtocolErrorCode::Timeout)
+        );
+        assert_eq!(snapshot.sequence, 4);
+
+        // The synchronization failure path (which clears the token epoch)
+        // is the only one that publishes NeedsSignIn.
+        provider
+            .publish_account_error(
+                AccountFailure::SignInRequired,
+                error(ProtocolErrorCode::NeedsSignIn, "the account must sign in again"),
+            )
+            .unwrap();
+        let snapshot = provider.status.borrow().clone();
+        assert_eq!(snapshot.account.state, wire::AuthenticationState::NeedsSignIn);
+        assert_eq!(
+            snapshot.account.last_error.as_ref().map(|failure| failure.code),
+            Some(ProtocolErrorCode::NeedsSignIn)
+        );
+        assert_eq!(snapshot.sequence, 5);
     }
 }

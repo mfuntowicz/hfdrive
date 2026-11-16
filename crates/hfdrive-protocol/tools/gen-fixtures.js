@@ -383,6 +383,18 @@ gold("begin_setup_request", "explicit initialization intent before credentials o
 gold("begin_setup_response_result", "reserved setup and connection with exact public DPAPI protection context",
   responseEnvelope(REQUEST_ID, "begin_setup", { result: resultBody("begin_setup") }));
 
+gold("list_activity_request", "list_activity read-only request scoped to one connection with a continuation cursor (no operation id)",
+  requestEnvelope(REQUEST_ID, "list_activity",
+    requestBody("list_activity", { cursor: "activity:1" })));
+
+gold("list_activity_response_result", "list_activity result page with nested activity record and next_cursor",
+  responseEnvelope(REQUEST_ID, "list_activity", {
+    result: {
+      items: [sampleObject("activity_record")],
+      next_cursor: "activity:2",
+    },
+  }));
+
 gold("list_history_response_result", "list_history result with nested history changes",
   responseEnvelope(REQUEST_ID, "list_history", {
     result: {
@@ -443,6 +455,21 @@ gold("probe_storage_response_result", "probe_storage result with per-check expec
 gold("set_publication_credentials_response_result", "set_publication_credentials result (no secret material)",
   responseEnvelope(REQUEST_ID, "set_publication_credentials", {
     result: { stored: true, capability: "writable" },
+  }));
+
+gold("repair_storage_request",
+  "repair_storage request reusing one source setup reservation's verified publication credentials for an existing connected drive; no secret material travels on the wire",
+  requestEnvelope(REQUEST_ID, "repair_storage", requestBody("repair_storage")));
+
+gold("repair_storage_response_result",
+  "repair_storage result with the repaired connection status and the fresh probe/report identity (no secret material)",
+  responseEnvelope(REQUEST_ID, "repair_storage", {
+    result: resultBody("repair_storage", {
+      connection_id: uuidFor("connection_id"),
+      repaired: true,
+      run_id: uuidFor("run_id"),
+      report_path: "C:\\Users\\Public\\HFDriveTest\\capabilities.json",
+    }),
   }));
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,12 @@ pub enum Command {
         #[arg(long)] connection: Uuid,
         #[arg(long)] run_id: Uuid,
     },
+    /// Rebind verified publication credentials from a source setup reservation
+    /// to an existing connected drive and recheck its storage access.
+    RepairStorage {
+        #[arg(long)] connection: Uuid,
+        #[arg(long)] credentials_from: Uuid,
+    },
     Pause(ConnectionArgs),
     Resume(ConnectionArgs),
     Pin(ItemArgs),

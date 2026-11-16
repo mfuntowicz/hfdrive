@@ -24,11 +24,20 @@ Every external effect is preceded by a durable record on the account database
    (`IngestionCheckpoint` → `CasCommitCheckpoint` → exact key binding) in the
    transfer journal before the next external boundary; the entry becomes
    `PayloadReady` only with a bound `ObjectRef`.
+   A committed CAS checkpoint resumes at binding without another ingestion.
+   Bound bucket keys include the workspace prefix; `ObjectRef` construction
+   strips that exact validated prefix at a slash boundary, never another
+   workspace or a similarly named sibling prefix.
 4. **Publication** — the reconciliation plan's fresh commit/generation/version
    identifiers are persisted as `MetadataReady` candidate evidence before the
    single conditional `HEAD` write (`If-Match` on the preserved ETag, or
    `If-None-Match: *` for explicit initialization). An uncertain outcome parks
    the entry at `PublishUnknown`.
+   Reconciliation reads common-base records only for the exact Applied commit.
+   Historical and merely Observed commits never contribute duplicate or
+   prematurely adopted item states to that namespace.
+   File tombstones retain their content binding; digest caching uses immutable
+   `VersionId`, not `ItemId`, so different revisions cannot share stale bytes.
 5. **Resolution** — a dispatched candidate is resolved **by identity only**:
    the live `HEAD` commit, then a bounded committed-ancestry search for the
    entry's operation UUID. Absent candidates are never re-driven from
@@ -53,6 +62,9 @@ Deletion evidence: a disappearance becomes a deletion intent only after a
 fully completed, non-invalidated metadata scan. Watcher overflow, USN
 reset/wrap, denied directories and budget exhaustion void deletion inference
 until a fresh completed scan; none of them ever creates a tombstone.
+Repeated watcher removals, parent/child subtree removals, and replayed deletion
+work are idempotent: existing tombstones keep their provenance. They never
+recreate content or publish another deletion merely to close duplicate work.
 
 Read-only connections: committed state is materialized through the native
 bounded record reads and range streams without any S3 credential. Local edits
@@ -70,6 +82,67 @@ conditional write.
 | unlink (safe) | stopped | stopped | hydrated/exported, then converted + unregistered |
 | unlink (disconnect-keep-registration) | stopped | stopped | retained for explicit reconnect |
 | provider drain (exit/upgrade) | stopped | stopped | registration, state, snapshots retained |
+
+Finalized connections have durable event/scan bookkeeping before remote
+notifications are acknowledged. Reconciliation repairs a missing row from an
+interrupted or older setup without replacing an existing cursor, journal or
+scan result. Initial bookkeeping is not a completed scan and never authorizes
+deletion inference.
+
+The remote-event watcher has its own child cancellation scope. A notification
+persistence failure does not acknowledge its cursor or disconnect CFAPI;
+the connection's independent reconciliation remains available. Missing,
+cancelled or stopped CFAPI runtimes must not be reported as **Up to date**.
+Reconnect preserves the existing folder, workspace and registration rather
+than running setup or initializing remote storage again.
+
+The local observer starts only after CFAPI callbacks are attached and native
+notification arming succeeds. Its lifetime is owned and shutdown joins off the
+async worker; an unavailable observer is not healthy sync. Initial discovery,
+periodic scans, and removal/loss reconciliation inspect real metadata. A
+complete, non-invalidated scan is required before absence becomes deletion.
+New local item identity, generation, and outbox work commit in one transaction,
+so capture can resolve the file and a failed enqueue cannot orphan its create.
+
+After publication, captured bytes are bound to the committed placeholder
+identity without invalidating resident data. Normal files are converted; an
+existing placeholder's identity advances under the expected USN. The returned
+provider-owned USN is remembered without creating another edit. Newer local
+generations or refused capture guards never become falsely clean.
+
+The authenticated IPC listener binds before root restoration. An unavailable
+folder or remote endpoint must not prevent the desktop's Hello/GetStatus
+exchange. Restore failures are published without holding a status-watch read
+guard while acquiring its write lock.
+
+A registered cloud root is not an ordinary junction. Reconnection admits its
+cloud reparse tag only when the expected Windows sync-root registration ID
+resolves to the same root identity. Other reparse points, foreign registrations
+and reparse ancestors remain invalid; persisted volume checks still apply.
+Registration adoption normalizes DOS and extended-length path spellings before
+comparison; the registered file and volume identities remain authoritative.
+
+CFAPI callback paths are absolute from the volume root. The Windows adapter
+checks the connected root's component boundary and delivers root-relative paths
+to the sync engine; the root itself resolves to the managed root item. An empty
+directory transfer uses a null placeholder array and zero processed entries.
+
+Full population delivers the entire authoritative directory, not just names
+matching Windows' lookup pattern. Bounded transfers use the true request total
+and a terminal fully-populated flag only after all names are present. Empty
+directories need that terminal flag too; returning empty success alone leaves
+Windows repeating name resolution.
+
+Native directory notifications decode the flexible `FILE_NOTIFY_INFORMATION`
+name at its field offset, not at the padded structure size. Subtree names are
+validated component-by-component. Watch startup succeeds only after native
+arming; malformed/lost notifications void deletion evidence, and fatal native
+errors stop observation instead of masquerading as quiet timeouts.
+
+`hfdrive pause --connection <UUID>` and `hfdrive resume --connection <UUID>`
+operate on that existing connection. Resume restores its runtime and remote
+bindings before clearing the durable pause flag; it never initializes a new
+workspace or replaces the registered folder.
 
 Unlink (`engine::SyncEngine::prepare_unlink`/`execute_unlink`) counts
 online-only, partial, dirty and conflict content plus the required export

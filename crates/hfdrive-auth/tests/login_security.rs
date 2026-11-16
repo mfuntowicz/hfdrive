@@ -5,7 +5,6 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use hfdrive_auth::{
     AuthConfig, AuthError, AuthManager, LoginFlow, LoginPurpose, LoginRequest, LoginState,

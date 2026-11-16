@@ -35,6 +35,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>HfDrive.Desktop</RootNamespace>
     <AssemblyName>HfDrive.Desktop</AssemblyName>
+    <!-- Executable/window/taskbar icon, generated from the supplied
+         CatchingHuggy artwork by packaging/assets/Generate-HfDriveAssets.ps1
+         (16-256 px PNG-compressed entries). -->
+    <ApplicationIcon>Assets\CatchingHuggy.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <Product>HF Drive</Product>
     <!-- Packaging posture: publish must stay self-contained without NativeAOT,
@@ -64,14 +68,36 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Regenerated to CatchingHuggy by packaging/assets/Generate-HfDriveAssets.ps1;
+         linked at assets\Square44x44Logo.png because the native tray loader
+         (TrayService) loads it from that path beside the executable. -->
     <Content Include="..\..\packaging\assets\Square44x44Logo.png">
       <Link>assets\Square44x44Logo.png</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
-    <!-- Official Hugging Face logo mark (huggingface_logo-noborder.svg), used
-         by the setup header. -->
-    <Content Include="Assets\HuggingFace.svg">
+    <!-- Brand artwork and animation: CatchingHuggy identity (also compiled
+         into the executable as ApplicationIcon) and the Huggy animations used
+         by the desktop surfaces. The supplied originals are preserved as-is. -->
+    <Content Include="Assets\CatchingHuggy.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="Assets\CatchingHuggy.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="Assets\SuperHuggy.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="Assets\VibingHuggy.gif">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="Assets\HuggyPop.gif">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
 

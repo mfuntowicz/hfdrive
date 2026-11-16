@@ -150,12 +150,14 @@ pub fn scan_metadata(
                 report.complete = false;
                 return Ok(report);
             }
-            // Follow directories only when they are not reparse points of
-            // any kind (provider placeholders are files/dirs whose children
-            // are enumerated through population, not by following reparse
-            // handles).
-            if is_directory && name_valid && !state.identity.is_reparse_point() {
-                stack.push((path, item.relative_path.clone(), depth + 1));
+            // Cloud directories stay inside this connected namespace. Never
+            // follow name-surrogate links or claim their unseen children absent.
+            if is_directory && name_valid {
+                if !state.identity.is_reparse_point() || placeholder.is_placeholder() {
+                    stack.push((path, item.relative_path.clone(), depth + 1));
+                } else {
+                    report.complete = false;
+                }
             }
         }
     }

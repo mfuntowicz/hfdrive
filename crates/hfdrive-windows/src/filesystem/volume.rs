@@ -44,7 +44,6 @@ impl FileIdentity {
     /// recall-on-open/data-access data) instead of on local disk.
     pub fn may_not_be_materialized(&self) -> bool {
         self.attributes & (raw::ATTR_RECALL_ON_OPEN | raw::ATTR_RECALL_ON_DATA_ACCESS) != 0
-            || self.reparse_tag == IO_REPARSE_TAG_CLOUD
             || is_cloud_family_tag(self.reparse_tag)
     }
 }
@@ -52,13 +51,21 @@ impl FileIdentity {
 /// `IO_REPARSE_TAG_CLOUD` (ntifs.h, 0x9000001A — matches the generated
 /// `windows::Win32::System::SystemServices::IO_REPARSE_TAG_CLOUD` value).
 pub const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
-/// `IO_REPARSE_TAG_CLOUD_1..8` family (ntifs.h): numbered aliases at
-/// 0x1000 steps from the base tag.
-fn is_cloud_family_tag(tag: u32) -> bool {
-    match tag.checked_sub(IO_REPARSE_TAG_CLOUD) {
-        Some(delta) => delta != 0 && delta <= 8 * 0x1000 && delta % 0x1000 == 0,
-        None => false,
-    }
+
+/// True for the cloud-family reparse tags: the base `IO_REPARSE_TAG_CLOUD` or
+/// any `IO_REPARSE_TAG_CLOUD_1..8` numbered alias (0x1000 steps from the base
+/// tag). Junctions, mount points, symlinks and every other tag are never
+/// cloud family.
+///
+/// This is the **single** source of the cloud-tag rule: root admission in
+/// [`super::validate`] classifies through it instead of duplicating the tag
+/// arithmetic.
+pub(crate) fn is_cloud_family_tag(tag: u32) -> bool {
+    tag == IO_REPARSE_TAG_CLOUD
+        || match tag.checked_sub(IO_REPARSE_TAG_CLOUD) {
+            Some(delta) => delta != 0 && delta <= 8 * 0x1000 && delta % 0x1000 == 0,
+            None => false,
+        }
 }
 
 /// The observed state a capture or guard check binds to.
@@ -195,4 +202,40 @@ pub(crate) fn classify_open(path: &Path, code: u32) -> FsError {
 
 pub(crate) fn op(operation: &'static str) -> impl Fn(u32) -> FsError {
     move |code: u32| FsError::Win32 { operation, code }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_family_classification() {
+        assert!(is_cloud_family_tag(IO_REPARSE_TAG_CLOUD));
+        for step in 1..=8u32 {
+            assert!(
+                is_cloud_family_tag(IO_REPARSE_TAG_CLOUD + step * 0x1000),
+                "cloud_{step} alias is cloud family"
+            );
+        }
+        // Junctions, mount points, symlinks and other non-cloud tags are not
+        // cloud family; neither is the tag past the numbered family or a gap.
+        assert!(!is_cloud_family_tag(0xA000_0003));
+        assert!(!is_cloud_family_tag(0));
+        assert!(!is_cloud_family_tag(IO_REPARSE_TAG_CLOUD + 9 * 0x1000));
+        assert!(!is_cloud_family_tag(IO_REPARSE_TAG_CLOUD + 0x800));
+    }
+
+    #[test]
+    fn materialization_considers_the_whole_cloud_family() {
+        let mut identity = FileIdentity {
+            volume_serial_number: 1,
+            file_id: [0; 16],
+            link_count: 1,
+            attributes: raw::ATTR_REPARSE_POINT,
+            reparse_tag: IO_REPARSE_TAG_CLOUD + 3 * 0x1000,
+        };
+        assert!(identity.may_not_be_materialized());
+        identity.reparse_tag = 0xA000_0003;
+        assert!(!identity.may_not_be_materialized());
+    }
 }

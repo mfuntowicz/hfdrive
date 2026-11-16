@@ -51,7 +51,7 @@
                        Stretch="Uniform"
                        AutomationProperties.Name="Hugging Face">
                     <Image.Source>
-                        <SvgImageSource UriSource="ms-appx:///Assets/HuggingFace.svg" />
+                        <BitmapImage UriSource="ms-appx:///Assets/CatchingHuggy.png" DecodePixelWidth="96" />
                     </Image.Source>
                 </Image>
                 <StackPanel Grid.Column="1"
@@ -418,6 +418,18 @@
                          panel itself is wrapped rather than bound to IsOpen. -->
                     <StackPanel Spacing="0"
                                 Visibility="{x:Bind ViewModel.IsSuccessVisible, Mode=OneWay}">
+                        <Image x:Name="SetupCelebration"
+                               Width="112" Height="112" Margin="0,0,0,8"
+                               HorizontalAlignment="Center" Stretch="Uniform"
+                               Visibility="Collapsed" ImageOpened="OnSetupCelebrationOpened"
+                               AutomationProperties.AutomationId="SetupCompletionAnimation"
+                               AutomationProperties.Name="Your Hugging Face drive is ready">
+                            <Image.Source>
+                                <BitmapImage x:Name="SetupCelebrationSource"
+                                             UriSource="ms-appx:///Assets/HuggyPop.gif"
+                                             DecodePixelWidth="224" AutoPlay="False" />
+                            </Image.Source>
+                        </Image>
                         <InfoBar Severity="Success"
                                  IsClosable="False"
                                  IsOpen="True"

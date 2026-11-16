@@ -68,7 +68,7 @@ async fn async_main() -> ExitCode {
 
 async fn run() -> Result<(), HostError> {
     tracing_subscriber::fmt().json()
-        .with_env_filter("off,hfdrive_provider=info,hfdrive_windows=warn")
+        .with_env_filter("off,hfdrive_provider=info,hfdrive_windows=warn,hfdrive_publication=warn")
         .try_init().map_err(|_| HostError::Logging)?;
     let state_root = default_state_root()?;
     let policy = policy()?;
@@ -92,8 +92,8 @@ async fn run() -> Result<(), HostError> {
         Err(error) => return Err(error.into()),
     };
     let provider = Provider::open(StatePaths::new(state_root), std::env::var(hfdrive_auth::OAUTH_CLIENT_ID_ENV).ok(), _lease.user_sid().to_owned()).await?;
-    tokio::spawn(provider.clone().observe_accounts());
     let server = IpcServer::bind(policy)?;
+    tokio::spawn(provider.clone().observe_accounts());
     let permits = Arc::new(Semaphore::new(MAX_CLIENTS));
     let mut clients = JoinSet::new();
     tracing::info!(protocol_major = 1, protocol_minor = 0, "provider IPC ready");

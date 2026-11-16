@@ -118,8 +118,8 @@ pub(crate) fn handle_into_file(handle: OwnedHandle) -> std::fs::File {
     unsafe { std::fs::File::from_raw_handle(handle.into_raw_handle()) }
 }
 
-/// Open an existing regular file for read/write without following reparse
-/// points (used by `CfConvertToPlaceholder` on verified published files).
+/// Open metadata updates without following reparse points. Deny competing
+/// writes/deletes while captured bytes are guarded and bound to publication.
 pub(crate) fn open_read_write(path: &Path) -> Result<OwnedHandle, u32> {
     let w = wide(path);
     // SAFETY: `w` is NUL-terminated; the returned handle is owned exactly
@@ -128,10 +128,13 @@ pub(crate) fn open_read_write(path: &Path) -> Result<OwnedHandle, u32> {
         let raw = CreateFileW(
             windows::core::PCWSTR(w.as_ptr()),
             GENERIC_READ.0 | GENERIC_WRITE.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0),
+            FILE_FLAGS_AND_ATTRIBUTES(
+                FILE_FLAG_BACKUP_SEMANTICS.0
+                    | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0,
+            ),
             None,
         )
         .map_err(|e| error_code(&e))?;

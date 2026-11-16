@@ -149,6 +149,22 @@
       }
     },
     {
+      "name": "list_activity_request",
+      "file": "golden/list_activity_request.json",
+      "description": "list_activity read-only request scoped to one connection with a continuation cursor (no operation id)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "list_activity_response_result",
+      "file": "golden/list_activity_response_result.json",
+      "description": "list_activity result page with nested activity record and next_cursor",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
       "name": "list_history_response_result",
       "file": "golden/list_history_response_result.json",
       "description": "list_history result with nested history changes",
@@ -208,6 +224,22 @@
       "name": "set_publication_credentials_response_result",
       "file": "golden/set_publication_credentials_response_result.json",
       "description": "set_publication_credentials result (no secret material)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "repair_storage_request",
+      "file": "golden/repair_storage_request.json",
+      "description": "repair_storage request reusing one source setup reservation's verified publication credentials for an existing connected drive; no secret material travels on the wire",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "repair_storage_response_result",
+      "file": "golden/repair_storage_response_result.json",
+      "description": "repair_storage result with the repaired connection status and the fresh probe/report identity (no secret material)",
       "expectation": {
         "parse": "accept"
       }

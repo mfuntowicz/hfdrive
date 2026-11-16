@@ -326,6 +326,48 @@ public sealed record ProbeStorageResult
     public string? ReportPath { get; init; }
 }
 
+/// <summary>
+/// repair_storage request.
+/// Repairs one existing connected drive's supplemental publication access by
+/// rebinding the verified publication credentials recorded for a source setup
+/// reservation to the target's existing protection context. No secret travels
+/// on the pipe; the source setup reservation is never modified.
+/// </summary>
+public sealed record RepairStorageRequest
+{
+    /// <summary>Unique durable operation identifier for this mutation.</summary>
+    public required Guid OperationId { get; init; }
+
+    /// <summary>Existing connected connection whose storage access is repaired.</summary>
+    public required Guid ConnectionId { get; init; }
+
+    /// <summary>Source setup reservation whose verified protected credentials are reused.</summary>
+    public required Guid CredentialsFromConnectionId { get; init; }
+}
+
+/// <summary>repair_storage result.</summary>
+public sealed record RepairStorageResult
+{
+    /// <summary>The repaired target connection identifier.</summary>
+    public required Guid ConnectionId { get; init; }
+
+    /// <summary>
+    /// True only when the repaired credentials are committed and the live
+    /// binding is active with the fresh proof recorded below. A committed
+    /// repair whose runtime refresh failed is reported honestly as false.
+    /// </summary>
+    public required bool Repaired { get; init; }
+
+    /// <summary>Fresh probe run identity of the required storage check.</summary>
+    public required Guid RunId { get; init; }
+
+    /// <summary>Non-secret capability report artifact identity.</summary>
+    public string? ReportPath { get; init; }
+
+    /// <summary>Current status of the repaired connection.</summary>
+    public required ConnectionStatus Status { get; init; }
+}
+
 /// <summary>preview_connect request.</summary>
 public sealed record PreviewConnectRequest
 {
@@ -532,6 +574,29 @@ public sealed record UpdateSettingsResult
 
     /// <summary>Fully resolved settings after applying the patch.</summary>
     public IReadOnlyList<SettingsEntry> Settings { get; init; } = Array.Empty<SettingsEntry>();
+}
+
+/// <summary>list_activity request.</summary>
+public sealed record ListActivityRequest
+{
+    /// <summary>Connection whose activity is listed.</summary>
+    public required Guid ConnectionId { get; init; }
+
+    /// <summary>Optional continuation cursor from a previous page; the cursor is bound to the connection that produced it.</summary>
+    public string? Cursor { get; init; }
+
+    /// <summary>Maximum records to return (max 200).</summary>
+    public required int Limit { get; init; }
+}
+
+/// <summary>list_activity result.</summary>
+public sealed record ListActivityResult
+{
+    /// <summary>One page of activity records.</summary>
+    public IReadOnlyList<ActivityRecord> Items { get; init; } = Array.Empty<ActivityRecord>();
+
+    /// <summary>Continuation cursor, null on the last page.</summary>
+    public string? NextCursor { get; init; }
 }
 
 /// <summary>list_history request.</summary>
@@ -820,6 +885,9 @@ public static class Commands
     /// <summary>probe_storage.</summary>
     public static readonly CommandSpec<ProbeStorageRequest, ProbeStorageResult> ProbeStorage = new("probe_storage");
 
+    /// <summary>repair_storage.</summary>
+    public static readonly CommandSpec<RepairStorageRequest, RepairStorageResult> RepairStorage = new("repair_storage");
+
     /// <summary>preview_connect.</summary>
     public static readonly CommandSpec<PreviewConnectRequest, PreviewConnectResult> PreviewConnect = new("preview_connect");
 
@@ -843,6 +911,9 @@ public static class Commands
 
     /// <summary>update_settings.</summary>
     public static readonly CommandSpec<UpdateSettingsRequest, UpdateSettingsResult> UpdateSettings = new("update_settings");
+
+    /// <summary>list_activity.</summary>
+    public static readonly CommandSpec<ListActivityRequest, ListActivityResult> ListActivity = new("list_activity");
 
     /// <summary>list_history.</summary>
     public static readonly CommandSpec<ListHistoryRequest, ListHistoryResult> ListHistory = new("list_history");
@@ -876,20 +947,24 @@ public static class Commands
     [
         "hello", "get_status", "subscribe_status", "cancel_request",
         "start_login", "cancel_login", "sign_out", "list_owners", "list_buckets", "create_bucket",
-        "inspect_drive", "begin_setup", "set_publication_credentials", "probe_storage", "preview_connect",
-        "connect", "pause", "resume", "set_pin", "free_space", "set_selective_sync",
-        "update_settings", "list_history", "restore", "list_conflicts", "resolve_conflict",
+        "inspect_drive", "begin_setup", "set_publication_credentials", "probe_storage",
+        "repair_storage", "preview_connect", "connect", "pause", "resume", "set_pin", "free_space",
+        "set_selective_sync", "update_settings", "list_activity", "list_history", "restore",
+        "list_conflicts", "resolve_conflict",
         "export_diagnostics", "prepare_unlink", "unlink", "prepare_upgrade", "exit_provider",
     ];
 
     /// <summary>
     /// True when the method is a durable mutation whose requests carry an
     /// operation_id (unique per operation; reuse must not duplicate it).
+    /// Read-only query methods — including the optional list_activity — are
+    /// not mutations and never carry an operation_id.
     /// </summary>
     public static bool IsMutation(string method) => method switch
     {
         "get_status" or "subscribe_status" or "cancel_request" or
-        "list_owners" or "list_buckets" or "inspect_drive" or "list_history" or "list_conflicts" or
+        "list_owners" or "list_buckets" or "inspect_drive" or "list_activity" or
+        "list_history" or "list_conflicts" or
         "hello" => false,
         _ => AllMethods.Contains(method),
     };

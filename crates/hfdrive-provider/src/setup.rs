@@ -747,9 +747,9 @@ fn validate_preview_evidence(setup: &SetupRecord, mode: wire::ConnectionMode) ->
 }
 
 /// Structural validation of the persisted probe report for a writable
-/// preview: full mode, every measured check passed, and full write/Xet/S3/
-/// conditional-publication capability flags.
-fn probe_proves_writable(evidence: &serde_json::Value, connection: ConnectionId) -> bool {
+/// preview or repair commit: full mode, every measured check passed, and full
+/// write/Xet/S3/conditional-publication capability flags.
+pub(crate) fn probe_proves_writable(evidence: &serde_json::Value, connection: ConnectionId) -> bool {
     if evidence.get("connection_id").and_then(serde_json::Value::as_str) != Some(connection.to_string().as_str()) {
         return false;
     }

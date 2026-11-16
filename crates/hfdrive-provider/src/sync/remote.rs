@@ -514,7 +514,8 @@ where
         snapshot: &StableSnapshot,
         cancel: &CancellationToken,
     ) -> Result<IngestionCheckpoint, RemoteError> {
-        let (_ingested, checkpoint) = self.reingest_verified(snapshot, None, cancel).await?;
+        let (ingested, checkpoint) = self.reingest_verified(snapshot, None, cancel).await?;
+        ingested.abort()?;
         Ok(checkpoint)
     }
 
@@ -536,17 +537,10 @@ where
         committed: &CasCommitCheckpoint,
         cancel: &CancellationToken,
     ) -> Result<ObjectRef, RemoteError> {
-        let (ingested_stage, _ingested) = self.reingest_verified(snapshot, None, cancel).await?;
-        let (committed_stage, checkpoint) = ingested_stage.commit_cas(cancel).await?;
-        if checkpoint.target_key != committed.target_key
-            || checkpoint.xet_file_id != committed.xet_file_id
-            || checkpoint.size != committed.size
-            || checkpoint.sha256 != committed.sha256
-        {
-            return Err(RemoteError::SourceChanged);
-        }
-        let bound = committed_stage.bind(cancel).await?;
-        bound.payload_ref().map_err(Into::into)
+        let lease = self.lease()?;
+        let staged = self.native.resume_committed(&lease, snapshot, committed)?;
+        let bound = staged.bind(cancel).await?;
+        bound.payload_ref(&self.native.binding().prefix).map_err(Into::into)
     }
 
     async fn open_range(

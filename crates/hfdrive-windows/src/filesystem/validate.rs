@@ -8,13 +8,23 @@
 //! or any sync root registered with Windows (`GetCurrentSyncRoots`).
 //! Everything is checked through open handles; nothing is inferred from
 //! strings alone.
+//!
+//! Reconnect is the single exception to "no reparse points": the root of an
+//! already registered HF Drive connection carries the cloud-family reparse
+//! tag at the root directory itself. Such a root is admitted only when the
+//! exact expected sync-root id is registered with Windows at this exact root,
+//! proven through handle identity and canonical path; that one registration
+//! is also the only overlap exemption. A missing, wrong or foreign
+//! registration id, and any junction, mount point or symlink, is refused even
+//! when an id is supplied. Every ancestor of the root still rejects every
+//! reparse point, owned root or not.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::ffi::volume as raw;
 
 use super::names::validate_component;
-use super::volume::{query_volume, FileIdentity, VolumeIdentity};
+use super::volume::{is_cloud_family_tag, query_volume, FileIdentity, VolumeIdentity};
 use super::{FsError, FsResult};
 
 /// Inputs the caller supplies for overlap and state-directory checks.
@@ -23,9 +33,10 @@ pub struct RootContext {
     pub state_dir: PathBuf,
     /// Roots configured for other connections of this application.
     pub configured_roots: Vec<PathBuf>,
-    /// The connection's own previous registration root (reconnect), which is
-    /// allowed to equal the candidate root.
-    pub ignored_existing_root: Option<PathBuf>,
+    /// Expected Windows registration ID on reconnect. Only that registration,
+    /// at the same handle-verified root, may own a cloud reparse point or be
+    /// exempt from overlap checks. New roots pass `None`.
+    pub existing_sync_root_id: Option<String>,
 }
 
 /// A validated root plus the identity evidence captured at validation time.
@@ -44,18 +55,19 @@ pub fn validate_sync_root(root: &Path, context: &RootContext) -> FsResult<Valida
     // 1. Every path component must be a supported final-component name.
     validate_components(root)?;
 
-    // 2. Open the root through a handle (no reparse following) and classify
-    //    it: directory, not a reparse point, not case-sensitive.
+    // 2. Open without following reparse points. A claimed cloud root still
+    //    needs exact registration and identity proof below.
     let handle = raw::open_query(root, true).map_err(|code| raw_classify(root, code))?;
     let attrs = raw::attr_tag(&handle).map_err(op("GetFileInformationByHandleEx(FileAttributeTagInfo)"))?;
-    if attrs.reparse_tag != 0 || attrs.attributes & raw::ATTR_REPARSE_POINT != 0 {
-        return Err(FsError::ReparsePoint {
-            path: root.to_path_buf(),
-        });
-    }
     if attrs.attributes & raw::ATTR_DIRECTORY == 0 {
         return Err(FsError::UnsupportedFileType);
     }
+    check_root_reparse(
+        root,
+        attrs.attributes,
+        attrs.reparse_tag,
+        context.existing_sync_root_id.is_some(),
+    )?;
     let case_flags = raw::case_sensitive_flags(&handle)
         .map_err(op("GetFileInformationByHandleEx(FileCaseSensitiveInfo)"))?;
     if case_flags & raw::CS_FLAG_CASE_SENSITIVE_DIR != 0 {
@@ -83,11 +95,11 @@ pub fn validate_sync_root(root: &Path, context: &RootContext) -> FsResult<Valida
         raw::final_path(&handle).map_err(op("GetFinalPathNameByHandleW"))?,
     );
 
-    // 6. Overlap checks against the state directory, configured roots and
-    //    every sync root registered with Windows.
-    check_overlaps(&final_path, context)?;
-
     let id = raw::id_info(&handle).map_err(op("GetFileInformationByHandleEx(FileIdInfo)"))?;
+    // 6. Only the exact owned registration can exempt this root from overlap
+    //    and cloud-reparse rejection.
+    let owned = check_overlaps(&final_path, context, &id)?;
+    check_root_reparse(root, attrs.attributes, attrs.reparse_tag, owned)?;
     let std = raw::standard_info(&handle)
         .map_err(op("GetFileInformationByHandleEx(FileStandardInfo)"))?;
     Ok(ValidatedRoot {
@@ -155,13 +167,37 @@ fn check_reparse_ancestors(root: &Path) -> FsResult<()> {
     Ok(())
 }
 
-fn check_overlaps(final_path: &Path, context: &RootContext) -> FsResult<()> {
-    let ignored = context
-        .ignored_existing_root
-        .as_deref()
-        .map(canonicalize_existing)
-        .transpose()?
-        .flatten();
+fn check_root_reparse(path: &Path, attributes: u32, tag: u32, allow_cloud: bool) -> FsResult<()> {
+    if (attributes & raw::ATTR_REPARSE_POINT != 0 || tag != 0)
+        && !(allow_cloud && is_cloud_family_tag(tag))
+    {
+        return Err(FsError::ReparsePoint { path: path.to_path_buf() });
+    }
+    Ok(())
+}
+
+fn registration_matches(
+    expected_id: Option<&str>,
+    registered_id: &str,
+    candidate_path: &Path,
+    candidate_id: &raw::IdInfo,
+    registered_path: &Path,
+    registered_identity: &raw::IdInfo,
+) -> bool {
+    expected_id == Some(registered_id)
+        && candidate_id.volume_serial_number == registered_identity.volume_serial_number
+        && candidate_id.file_id == registered_identity.file_id
+        && super::names::windows_case_equivalent(
+            candidate_path.to_string_lossy().trim_end_matches(['\\', '/']),
+            registered_path.to_string_lossy().trim_end_matches(['\\', '/']),
+        )
+}
+
+fn check_overlaps(
+    final_path: &Path,
+    context: &RootContext,
+    identity: &raw::IdInfo,
+) -> FsResult<bool> {
 
     // State/cache/staging must not live inside (or contain) a sync root.
     if let Ok(Some(state)) = canonicalize_existing(&context.state_dir) {
@@ -175,9 +211,6 @@ fn check_overlaps(final_path: &Path, context: &RootContext) -> FsResult<()> {
             Some(other) => other,
             None => continue,
         };
-        if Some(&other) == ignored.as_ref() {
-            continue;
-        }
         if overlaps(final_path, &other) {
             return Err(FsError::OverlapsConfiguredRoot { other });
         }
@@ -186,19 +219,44 @@ fn check_overlaps(final_path: &Path, context: &RootContext) -> FsResult<()> {
     // Registered sync roots (any provider) must not overlap.
     let registered = crate::ffi::syncroot::current_roots()
         .map_err(|code| FsError::Win32 { operation: "GetCurrentSyncRoots", code })?;
+    let mut owned = false;
     for root in registered {
-        let other = match root.path.as_deref().map(canonicalize_existing).transpose()? {
-            Some(Some(other)) => other,
-            _ => continue,
-        };
-        if Some(&other) == ignored.as_ref() {
+        let claimed = context.existing_sync_root_id.as_deref() == Some(root.id.as_str());
+        let Some(path) = root.path.as_deref() else {
+            if claimed {
+                return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
+            }
             continue;
+        };
+        let handle = match raw::open_query(path, true) {
+            Ok(handle) => handle,
+            Err(code) if !claimed && (code == 2 || code == 3) => continue,
+            Err(code) => return Err(raw_classify(path, code)),
+        };
+        let other = PathBuf::from(
+            raw::final_path(&handle).map_err(op("GetFinalPathNameByHandleW"))?,
+        );
+        if claimed {
+            let other_id = raw::id_info(&handle)
+                .map_err(op("GetFileInformationByHandleEx(FileIdInfo)"))?;
+            if registration_matches(
+                context.existing_sync_root_id.as_deref(),
+                &root.id,
+                final_path,
+                identity,
+                &other,
+                &other_id,
+            ) {
+                owned = true;
+                continue;
+            }
+            return Err(FsError::OverlapsSyncRoot { other });
         }
         if overlaps(final_path, &other) {
             return Err(FsError::OverlapsSyncRoot { other });
         }
     }
-    Ok(())
+    Ok(owned)
 }
 
 /// Canonicalize an existing path through a handle; `Ok(None)` when absent.
@@ -275,5 +333,78 @@ mod tests {
     #[test]
     fn segment_splitting_normalizes_separators() {
         assert_eq!(segments(Path::new("C:\\a/b")), vec!["C:", "a", "b"]);
+    }
+
+    #[test]
+    fn only_the_exact_registered_cloud_root_is_admitted() {
+        let path = Path::new("C:\\Data\\Drive");
+        let id = raw::IdInfo { volume_serial_number: 7, file_id: [1; 16] };
+        let owned = registration_matches(
+            Some("HFDrive!owner!connection"),
+            "HFDrive!owner!connection",
+            path,
+            &id,
+            Path::new("c:\\data\\DRIVE\\"),
+            &id,
+        );
+        assert!(owned);
+        for tag in [super::super::volume::IO_REPARSE_TAG_CLOUD, 0x9000_101A] {
+            check_root_reparse(path, raw::ATTR_DIRECTORY | raw::ATTR_REPARSE_POINT, tag, owned)
+                .expect("the exact owned cloud root reconnects");
+        }
+    }
+
+    #[test]
+    fn a_claimed_id_cannot_adopt_a_foreign_or_replaced_cloud_root() {
+        let path = Path::new("C:\\Data\\Drive");
+        let id = raw::IdInfo { volume_serial_number: 7, file_id: [1; 16] };
+        let other_volume = raw::IdInfo { volume_serial_number: 8, file_id: [1; 16] };
+        let replacement = raw::IdInfo { volume_serial_number: 7, file_id: [2; 16] };
+        for (expected, registered, registered_path, registered_identity) in [
+            (None, "HFDrive!owner!connection", path, &id),
+            (Some("HFDrive!owner!connection"), "OtherProvider!root", path, &id),
+            (Some("HFDrive!owner!wrong"), "HFDrive!owner!connection", path, &id),
+            (Some("HFDrive!owner!connection"), "HFDrive!owner!connection", Path::new("C:\\Data\\Other"), &id),
+            (Some("HFDrive!owner!connection"), "HFDrive!owner!connection", path, &other_volume),
+            (Some("HFDrive!owner!connection"), "HFDrive!owner!connection", path, &replacement),
+        ] {
+            let owned = registration_matches(
+                expected, registered, path, &id, registered_path, registered_identity,
+            );
+            assert!(!owned);
+            assert!(matches!(
+                check_root_reparse(path, raw::ATTR_DIRECTORY | raw::ATTR_REPARSE_POINT, 0x9000_101A, owned),
+                Err(FsError::ReparsePoint { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn ownership_never_permits_junctions_symlinks_or_unknown_reparse_tags() {
+        for tag in [0xA000_0003, 0xA000_000C, 0] {
+            assert!(matches!(
+                check_root_reparse(Path::new("C:\\Data\\Drive"), raw::ATTR_DIRECTORY | raw::ATTR_REPARSE_POINT, tag, true),
+                Err(FsError::ReparsePoint { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_reparse_ancestor_is_rejected_even_for_a_cloud_root_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let junction = temp.path().join("junction");
+        std::fs::create_dir(&target).unwrap();
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "failed to create isolated junction");
+        assert!(matches!(
+            check_reparse_ancestors(&junction.join("candidate")),
+            Err(FsError::ReparsePoint { path }) if path == junction
+        ));
     }
 }

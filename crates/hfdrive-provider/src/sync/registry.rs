@@ -35,7 +35,7 @@ use hfdrive_windows::filesystem::volume::VolumeIdentity;
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
     #[error("the local root is invalid: {0}")]
-    LocalRoot(&'static str),
+    LocalRoot(String),
     #[error("the local root overlaps an existing HF Drive path")]
     Overlap,
     #[error("the remote prefix overlaps another configured connection")]
@@ -75,15 +75,15 @@ fn admit_root_internal(
     state_dir: &Path,
     configured: &[(PathBuf, DriveBinding)],
     user_sid: &str,
-    ignored_existing_root: Option<PathBuf>,
+    existing_sync_root_id: Option<String>,
 ) -> Result<AdmissionEvidence, AdmissionError> {
     let context = RootContext {
         state_dir: state_dir.to_path_buf(),
         configured_roots: configured.iter().map(|(path, _)| path.clone()).collect(),
-        ignored_existing_root,
+        existing_sync_root_id,
     };
     let validated = validate_sync_root(root, &context)
-        .map_err(|_| AdmissionError::LocalRoot("root validation failed"))?;
+        .map_err(|error| AdmissionError::LocalRoot(error.to_string()))?;
 
     // Remote prefix overlap for the same canonical bucket, by path-segment
     // containment.
@@ -94,7 +94,10 @@ fn admit_root_internal(
             return Err(AdmissionError::RemoteOverlap);
         }
     }
-    let id = sync_root_id(user_sid, connection).map_err(|_| AdmissionError::Registration)?;
+    let id = match context.existing_sync_root_id {
+        Some(id) => id,
+        None => sync_root_id(user_sid, connection).map_err(|_| AdmissionError::Registration)?,
+    };
     Ok(AdmissionEvidence { validated, sync_root_id: id })
 }
 
@@ -241,13 +244,18 @@ pub async fn restore_connections(
             .get("root_item_id")
             .and_then(serde_json::Value::as_str)
             .and_then(|value| value.parse::<ItemId>().ok())
-            .ok_or(AdmissionError::LocalRoot("durable root item identity is missing"))?;
+            .ok_or_else(|| AdmissionError::LocalRoot("durable root item identity is missing".to_owned()))?;
         let configured = all
             .iter()
             .filter(|other| other.connection_id != record.connection_id)
             .map(|other| (other.root_path.clone(), other.binding.clone()))
             .collect::<Vec<_>>();
         let registration = load_registration(state, record.connection_id).await?;
+        let expected = sync_root_id(user_sid, record.connection_id)
+            .map_err(|_| AdmissionError::Registration)?;
+        if registration.as_ref().is_some_and(|registration| registration.sync_root_id != expected) {
+            return Err(AdmissionError::Registration);
+        }
         let evidence = admit_root_internal(
             record.connection_id,
             &record.root_path,
@@ -255,15 +263,10 @@ pub async fn restore_connections(
             state_dir,
             &configured,
             user_sid,
-            Some(record.root_path.clone()),
+            Some(expected),
         )?;
         if let Some(registration) = &registration {
             verify_volume(registration, &evidence.validated.volume)?;
-            let expected = sync_root_id(user_sid, record.connection_id)
-                .map_err(|_| AdmissionError::Registration)?;
-            if registration.sync_root_id != expected {
-                return Err(AdmissionError::Registration);
-            }
         }
         restored.push(RestoredConnection {
             record: record.clone(),

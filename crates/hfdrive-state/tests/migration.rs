@@ -41,7 +41,7 @@ async fn fresh_creation_sets_schema_identity() {
     let account_db = paths.account(key).database();
     assert!(account_db.exists());
     assert_eq!(application_id(&account_db), ACCOUNT_APPLICATION_ID);
-    assert_eq!(user_version(&account_db), 2);
+    assert_eq!(user_version(&account_db), 3);
     store.close().await.unwrap();
 }
 
@@ -196,4 +196,113 @@ async fn corrupt_database_is_refused_and_preserved() {
         damaged,
         "the damaged file must be preserved for recovery, never recreated"
     );
+}
+
+/// A real v2 account database (the schema this build must upgrade) migrates to
+/// version 3 with a pre-migration backup: work evidence, snapshot operation
+/// bindings and the paging indexes appear, and the v2 rows keep working.
+#[tokio::test]
+async fn v2_account_database_migrates_to_v3_with_backup() {
+    use hfdrive_core::ids::{ConnectionId, SnapshotId, WorkspaceId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(tmp.path().to_path_buf());
+    let key = account_key();
+
+    // The control database is created fresh; the account database is built by
+    // hand at exactly schema version 2 with real v2 rows.
+    let store = StateStore::open(paths.clone()).await.unwrap();
+    store.record_account(account_record(key)).await.unwrap();
+    let account_db = paths.account(key).database();
+    std::fs::create_dir_all(account_db.parent().unwrap()).unwrap();
+    let connection_id = ConnectionId::new();
+    let snapshot_id = SnapshotId::new();
+    {
+        let conn = Connection::open(&account_db).unwrap();
+        conn.pragma_update(None, "application_id", ACCOUNT_APPLICATION_ID).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/0002.sql")).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO connections
+               (connection_id, account_key, workspace_id, owner_kind, owner_id, owner_namespace,
+                bucket_id, bucket_name, prefix, root_path, schema_version, mode, config_json,
+                created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, 'personal', 'owner-1', 'test-user', 'bucket-1', 'bucket-test-1',
+                     'hfdrive/ws', 'C:\\root', 1, 'writable', '{}', 1000, 1000)",
+            rusqlite::params![
+                connection_id.as_bytes().as_slice(),
+                key.as_bytes().as_slice(),
+                WorkspaceId::new().as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (connection_id, snapshot_id, path, size, sha256, status, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'C:\\staging\\snap', NULL, NULL, 'capturing', 1000, 1000)",
+            rusqlite::params![connection_id.as_bytes().as_slice(), snapshot_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT operation_id FROM snapshots").is_err(),
+            "a real v2 database has no snapshots.operation_id column yet"
+        );
+    }
+
+    // Touching the account database runs the forward migration.
+    let account = store.open_account(key).await.unwrap();
+    let snapshots = account.list_snapshots(connection_id).await.unwrap();
+    store.close().await.unwrap();
+
+    assert_eq!(user_version(&account_db), 3, "the account database must land on schema 3");
+    let conn = Connection::open(&account_db).unwrap();
+    for table in ["work_errors"] {
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "{table} must exist after the migration");
+    }
+    for index in ["items_by_version", "outbox_work_page", "local_actions_work_page", "transfers_work_page"] {
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "{index} must exist after the migration");
+    }
+    drop(conn);
+
+    // The v2 snapshot row survives with the new column unbound.
+    assert_eq!(snapshots.len(), 1, "the v2 row must survive the migration");
+    assert_eq!(snapshots[0].snapshot_id, snapshot_id);
+    assert_eq!(snapshots[0].operation_id, None);
+
+    // The pre-migration backup exists and predates the new schema.
+    let backup = std::fs::read_dir(account_db.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("state.sqlite3.") && n.ends_with(".bak"))
+        })
+        .expect("a timestamped backup must exist before the forward migration");
+    let backup_conn = Connection::open(&backup).unwrap();
+    assert!(
+        backup_conn
+            .prepare("SELECT operation_id FROM snapshots")
+            .is_err(),
+        "the backup must be the pre-migration v2 database"
+    );
+    let rows: i64 = backup_conn
+        .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the backup must hold the pre-migration data");
 }

@@ -1,24 +1,30 @@
 //! `ReadDirectoryChangesW` adapter: one overlapped watch session per sync
 //! root, with a completion event and a bounded batch buffer.
 //!
-//! The session never blocks a callback thread and never allocates per event:
-//! the OS writes whole `FILE_NOTIFY_INFORMATION` chains into the fixed
-//! buffer, which this module decodes into plain `RawNotify` records. A zero
-//! byte completion means the directory changed faster than the buffer could
-//! report and is surfaced as an overflow outcome — never silently dropped.
+//! The OS writes whole `FILE_NOTIFY_INFORMATION` chains into the fixed
+//! buffer, which this module decodes into plain `RawNotify` records; decoding
+//! allocates only the per-batch record list and the per-name units. The buffer
+//! and `OVERLAPPED` are heap-owned by the session, so their addresses stay
+//! valid while the request is pending and through cancellation; the session is
+//! created and lives entirely on its worker thread.
+//!
+//! Nothing is hidden: a zero-byte completion (`ERROR_NOTIFY_ENUM_DIR`) and any
+//! malformed chain are surfaced as [`BatchOutcome::Overflow`], a genuine
+//! completion failure is returned as an error, and only
+//! `WaitForSingleObject`'s `WAIT_TIMEOUT` is reported as
+//! [`BatchOutcome::TimedOut`].
 
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::{offset_of, zeroed};
 use std::path::Path;
 
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE,
-    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, ReadDirectoryChangesW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -30,8 +36,25 @@ use super::{error_code, last_error_code};
 /// directory-watch buffer size; overflow is surfaced, never hidden).
 const WATCH_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Overflow completion for an overlapped `ReadDirectoryChangesW`: the
+/// directory changed faster than the buffer could report. The request
+/// completed successfully with zero bytes and must be re-armed; it is **not**
+/// a watch failure.
+const ERROR_NOTIFY_ENUM_DIR: u32 = 1022;
+
+/// Layout of one `FILE_NOTIFY_INFORMATION` record, taken from the generated
+/// projection struct with `offset_of!` (never restated by hand). A record ends
+/// at `FileName` plus `FileNameLength` bytes, so the tail record of a batch
+/// can be **shorter** than `size_of` (which counts the placeholder name unit
+/// and tail padding): fields are read individually and never past the
+/// transferred bytes.
+const NOTIFY_NEXT_OFFSET: usize = offset_of!(FILE_NOTIFY_INFORMATION, NextEntryOffset);
+const NOTIFY_ACTION_OFFSET: usize = offset_of!(FILE_NOTIFY_INFORMATION, Action);
+const NOTIFY_LENGTH_OFFSET: usize = offset_of!(FILE_NOTIFY_INFORMATION, FileNameLength);
+const NOTIFY_NAME_OFFSET: usize = offset_of!(FILE_NOTIFY_INFORMATION, FileName);
+
 /// One decoded change notification: the raw `FILE_ACTION` code and the
-/// relative wide name.
+/// root-relative wide name (`\`-separated components for subtree changes).
 pub(crate) struct RawNotify {
     pub action: u32,
     pub name: Vec<u16>,
@@ -40,9 +63,10 @@ pub(crate) struct RawNotify {
 /// Outcome of one `next_batch` wait.
 pub(crate) enum BatchOutcome {
     Events(Vec<RawNotify>),
-    /// The directory changed faster than the buffer could report: deletion
-    /// evidence is void until a rescan.
+    /// The directory changed faster than the buffer could report (or a chain
+    /// was malformed): deletion evidence is void until a rescan.
     Overflow,
+    /// Nothing happened within the timeout; the request stays armed.
     TimedOut,
 }
 
@@ -52,13 +76,20 @@ pub(crate) enum BatchOutcome {
 pub(crate) struct WatchSession {
     dir: OwnedHandle,
     event: OwnedHandle,
+    /// Heap-stable: the kernel holds this pointer while a request is pending,
+    /// so it must not move with the session.
     overlapped: Box<OVERLAPPED>,
+    /// Heap-stable for the same reason as `overlapped`.
     buffer: Vec<u8>,
     pending: bool,
 }
 
 impl WatchSession {
     /// Open `root` and arm the first notification request (whole subtree).
+    ///
+    /// `Ok` is returned **only** after the OS accepted the first overlapped
+    /// request: an unarmed watch must surface as a start failure, never as a
+    /// silently dead session.
     pub(crate) fn start(root: &Path) -> Result<WatchSession, u32> {
         use std::os::windows::ffi::OsStrExt;
         let w: Vec<u16> = std::ffi::OsStr::new(root.as_os_str())
@@ -130,9 +161,9 @@ impl WatchSession {
 
     /// Wait up to `timeout_ms` for the next batch.
     ///
-    /// `Events` is a decoded change batch; `Overflow` is a buffer overflow —
-    /// the caller must invalidate its deletion evidence and rescan;
-    /// `TimedOut` means nothing happened within the timeout.
+    /// `Events` is a decoded batch; `Overflow` voids deletion evidence until
+    /// rescan. Only `WAIT_TIMEOUT` is quiet; wait and completion failures stop
+    /// the watch rather than silently retrying a failed handle.
     pub(crate) fn next_batch(&mut self, timeout_ms: u32) -> Result<BatchOutcome, u32> {
         if !self.pending {
             self.arm()?;
@@ -144,32 +175,54 @@ impl WatchSession {
                 timeout_ms,
             )
         };
-        if wait != WAIT_OBJECT_0 {
-            // Auto-reset event: timeout or failure leaves the request armed.
+        if wait == WAIT_OBJECT_0 {
+            // The request completed; fall through to collecting it.
+        } else if wait == WAIT_TIMEOUT {
+            // Timeout: the request stays armed.
             return Ok(BatchOutcome::TimedOut);
+        } else if wait == WAIT_FAILED {
+            return Err(last_error_code());
+        } else {
+            // Abandoned/APC-type codes cannot happen for a plain event; the raw
+            // code is surfaced rather than mistaken for a timeout.
+            return Err(wait.0);
         }
         let mut transferred = 0u32;
-        // SAFETY: the overlapped request just completed via its event.
-        unsafe {
+        // SAFETY: the overlapped request just completed via its event; the
+        // buffer and `overlapped` stay valid until the request is drained.
+        let completed = unsafe {
             GetOverlappedResult(
                 super::volume::as_handle(&self.dir),
                 &*self.overlapped,
                 &mut transferred,
                 true,
             )
-            .map_err(|e| {
-                self.pending = false;
-                error_code(&e)
-            })?;
-        }
+        };
+        // Whatever the outcome, the request is complete now: the buffer and
+        // `overlapped` may be re-armed.
         self.pending = false;
+        if let Err(err) = completed {
+            let code = error_code(&err);
+            if code == ERROR_NOTIFY_ENUM_DIR && transferred == 0 {
+                // Zero-byte completion = buffer overflow: the watch is healthy
+                // but records were lost. Re-arm and surface the overflow.
+                self.arm()?;
+                return Ok(BatchOutcome::Overflow);
+            }
+            return Err(code);
+        }
         if transferred == 0 {
-            // Directory overflow: no records retained.
+            // Defensive: a successful zero-byte completion is still an
+            // overflow, never an empty batch or a timeout.
             self.arm()?;
             return Ok(BatchOutcome::Overflow);
         }
-        let batch = decode_batch(&self.buffer[..transferred as usize]);
+        let (batch, complete) = decode_batch(&self.buffer[..transferred as usize]);
         self.arm()?;
+        if !complete {
+            // A malformed chain means records were lost: overflow semantics.
+            return Ok(BatchOutcome::Overflow);
+        }
         Ok(BatchOutcome::Events(batch))
     }
 
@@ -184,7 +237,8 @@ impl WatchSession {
                 );
             }
             let mut transferred = 0u32;
-            // SAFETY: draining the cancelled request keeps the buffer valid.
+            // SAFETY: draining the cancelled request keeps the buffer valid
+            // until the kernel is done with it, before the handles close.
             unsafe {
                 let _ = GetOverlappedResult(
                     super::volume::as_handle(&self.dir),
@@ -205,44 +259,168 @@ impl Drop for WatchSession {
     }
 }
 
-/// Decode a `FILE_NOTIFY_INFORMATION` chain. Malformed tails stop decoding.
-fn decode_batch(buffer: &[u8]) -> Vec<RawNotify> {
+/// Decode a `FILE_NOTIFY_INFORMATION` chain.
+///
+/// Returns the decoded records plus whether the chain was complete (ended by a
+/// `NextEntryOffset` of zero within the transferred bytes). A malformed tail
+/// keeps the records decoded before it and reports `complete == false`, which
+/// the caller surfaces as an overflow — a lost record must never be silently
+/// ignored.
+fn decode_batch(buffer: &[u8]) -> (Vec<RawNotify>, bool) {
     let mut out = Vec::new();
     let mut offset = 0usize;
-    let header = size_of::<FILE_NOTIFY_INFORMATION>();
     loop {
-        if buffer.len() < offset + header {
-            break;
-        }
-        // SAFETY: bounds checked; unaligned read of the generated struct.
-        let info: FILE_NOTIFY_INFORMATION =
-            unsafe { (buffer.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION).read_unaligned() };
-        let name_bytes = info.FileNameLength as usize;
-        let name_offset = offset + header - size_of::<u16>();
-        let name_end = name_offset.checked_add(name_bytes);
-        let name = match name_end {
-            Some(end) if end <= buffer.len() && name_bytes % 2 == 0 => buffer[name_offset..end]
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect(),
-            _ => break,
+        let Some(header) = buffer
+            .get(offset..)
+            .filter(|rest| rest.len() >= NOTIFY_NAME_OFFSET)
+        else {
+            // Ran past the transferred bytes without a terminating record.
+            return (out, false);
         };
-        out.push(RawNotify {
-            action: action_code(info.Action),
-            name,
-        });
-        let step = info.NextEntryOffset as usize;
-        if step == 0 {
-            break;
+        let action = read_u32(header, NOTIFY_ACTION_OFFSET);
+        let name_bytes = read_u32(header, NOTIFY_LENGTH_OFFSET) as usize;
+        let Some(name_end) = NOTIFY_NAME_OFFSET.checked_add(name_bytes) else {
+            return (out, false);
+        };
+        if name_bytes % 2 != 0 || name_end > header.len() {
+            return (out, false);
         }
-        if step < header || offset + step >= buffer.len() {
-            break;
+        let name = header[NOTIFY_NAME_OFFSET..name_end]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        out.push(RawNotify { action, name });
+        let step = read_u32(header, NOTIFY_NEXT_OFFSET) as usize;
+        if step == 0 {
+            return (out, true);
+        }
+        // A record must move strictly forward and stay inside the batch.
+        if step < name_end || step > header.len() {
+            return (out, false);
         }
         offset += step;
     }
-    out
 }
 
-fn action_code(action: FILE_ACTION) -> u32 {
-    action.0
+/// Read one fixed field at its projection offset. `header` is always at least
+/// [`NOTIFY_NAME_OFFSET`] bytes, which covers all three fixed fields.
+fn read_u32(header: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(header[at..at + 4].try_into().expect("field inside record header"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode the documented 12-byte wire header independently of the decoder.
+    /// Keeping fixture offsets separate catches flexible-array padding mistakes.
+    fn record(action: u32, name: &str) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut bytes = vec![0u8; 12 + units.len() * 2];
+        bytes[4..8].copy_from_slice(&action.to_le_bytes());
+        bytes[8..12].copy_from_slice(&((units.len() * 2) as u32).to_le_bytes());
+        for (slot, unit) in bytes[12..].chunks_exact_mut(2).zip(units) {
+            slot.copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Concatenate records with `NextEntryOffset` pointing at the next record
+    /// (zero for the last, exactly as the OS terminates a chain).
+    fn chain(mut records: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let count = records.len();
+        for (index, record) in records.iter_mut().enumerate() {
+            let step = if index + 1 == count {
+                0u32
+            } else {
+                let aligned = (record.len() + 3) & !3;
+                record.resize(aligned, 0);
+                aligned as u32
+            };
+            record[..4].copy_from_slice(&step.to_le_bytes());
+            out.extend_from_slice(record);
+        }
+        out
+    }
+
+    fn names(records: &[RawNotify]) -> Vec<String> {
+        records
+            .iter()
+            .map(|record| String::from_utf16(&record.name).expect("test names are valid UTF-16"))
+            .collect()
+    }
+
+    #[test]
+    fn record_layout_matches_the_flexible_name_field() {
+        // The name begins immediately after `FileNameLength`, and a tail
+        // record can be shorter than `size_of` (tail padding after the
+        // placeholder name unit).
+        assert_eq!(NOTIFY_NAME_OFFSET, NOTIFY_LENGTH_OFFSET + 4);
+        assert!(std::mem::size_of::<FILE_NOTIFY_INFORMATION>() >= NOTIFY_NAME_OFFSET + 2);
+    }
+
+    #[test]
+    fn decodes_the_single_record_batch_of_a_copied_file() {
+        // Regression: `File.Copy` produces exactly one record; it must not
+        // vanish at the end-of-batch boundary of the flexible `FileName` field.
+        let batch = chain(vec![record(1, "hello.txt")]);
+        let (records, complete) = decode_batch(&batch);
+        assert!(complete, "a well-formed chain terminates its last record");
+        assert_eq!(names(&records), ["hello.txt"]);
+        assert_eq!(records[0].action, 1);
+    }
+
+    #[test]
+    fn decodes_every_record_of_a_chain_with_subtree_names() {
+        // Regression: each record's name starts at `FileName`'s offset — a
+        // tail-padded offset would strip the first UTF-16 unit of every name.
+        let batch = chain(vec![
+            record(1, "sub\\file.bin"),
+            record(3, "sub"),
+            record(4, "old.txt"),
+            record(5, "new.txt"),
+        ]);
+        let (records, complete) = decode_batch(&batch);
+        assert!(complete);
+        assert_eq!(names(&records), ["sub\\file.bin", "sub", "old.txt", "new.txt"]);
+        assert_eq!(
+            records.iter().map(|record| record.action).collect::<Vec<_>>(),
+            [1, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn short_tail_record_is_decoded() {
+        // A one-unit name yields a 14-byte record, shorter than
+        // `size_of::<FILE_NOTIFY_INFORMATION>()`; it must still decode.
+        let batch = chain(vec![record(1, "a"), record(2, "b")]);
+        let (records, complete) = decode_batch(&batch);
+        assert!(complete);
+        assert_eq!(names(&records), ["a", "b"]);
+    }
+
+    #[test]
+    fn malformed_tail_keeps_prior_records_and_reports_loss() {
+        // A record whose `NextEntryOffset` lands on a header cut after two
+        // bytes: the good record survives, the tail is reported as incomplete
+        // (the caller surfaces it as an overflow).
+        let mut batch = record(1, "good.txt");
+        let step = batch.len() as u32;
+        batch[NOTIFY_NEXT_OFFSET..NOTIFY_NEXT_OFFSET + 4]
+            .copy_from_slice(&step.to_le_bytes());
+        batch.extend_from_slice(&[0, 0]);
+        let (records, complete) = decode_batch(&batch);
+        assert!(!complete);
+        assert_eq!(names(&records), ["good.txt"]);
+
+        // A name length that runs past the batch is malformed too.
+        let mut lying = record(3, "xy");
+        lying[NOTIFY_LENGTH_OFFSET..NOTIFY_LENGTH_OFFSET + 4]
+            .copy_from_slice(&8u32.to_le_bytes()); // claims 4 units, carries 2
+        let batch = chain(vec![lying]);
+        let (records, complete) = decode_batch(&batch);
+        assert!(!complete);
+        assert!(records.is_empty());
+    }
 }

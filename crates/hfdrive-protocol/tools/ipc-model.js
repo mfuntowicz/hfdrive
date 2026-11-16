@@ -91,6 +91,7 @@ const REQUESTS = {
   begin_setup: ["operation_id:uuid", "account_key:string", "binding:obj:remote_binding", "initialize:bool", "bucket_creation_operation_id:opt:uuid"],
   set_publication_credentials: ["operation_id:uuid", "connection_id:uuid", "protected_credentials:string"],
   probe_storage: ["operation_id:uuid", "connection_id:uuid", "run_id:uuid"],
+  repair_storage: ["operation_id:uuid", "connection_id:uuid", "credentials_from_connection_id:uuid"],
   preview_connect: ["operation_id:uuid", "connection_id:uuid", "root_path:string", "mode:enum:connection_mode"],
   connect: ["operation_id:uuid", "preview_id:uuid"],
   pause: ["operation_id:uuid", "connection_id:opt:uuid"],
@@ -99,6 +100,7 @@ const REQUESTS = {
   free_space: ["operation_id:uuid", "connection_id:uuid", "item_id:opt:uuid", "mode:enum:free_space_mode"],
   set_selective_sync: ["operation_id:uuid", "connection_id:uuid", "exclude_item_ids:arr:uuid"],
   update_settings: ["operation_id:uuid", "scope_id:string", "expected_revision:dec64", "settings:arr:obj:settings_patch"],
+  list_activity: ["connection_id:uuid", "cursor:opt:string", "limit:u32limit"],
   list_history: ["connection_id:uuid", "item_id:opt:uuid", "cursor:opt:string", "limit:u32limit"],
   restore: ["operation_id:uuid", "connection_id:uuid", "item_id:uuid", "version_id:uuid"],
   list_conflicts: ["connection_id:uuid", "cursor:opt:string", "limit:u32limit"],
@@ -125,6 +127,7 @@ const RESULTS = {
   begin_setup: ["setup_id:uuid", "connection_id:uuid", "binding:obj:remote_binding", "protection_context:obj:publication_protection_context"],
   set_publication_credentials: ["stored:bool", "capability:enum:capability_state"],
   probe_storage: ["run_id:uuid", "capability:enum:capability_state", "checks:arr:obj:probe_check", "report_path:opt:string"],
+  repair_storage: ["connection_id:uuid", "repaired:bool", "run_id:uuid", "report_path:opt:string", "status:obj:connection_status"],
   preview_connect: ["preview_id:uuid", "connection_id:uuid", "binding:obj:remote_binding", "visibility:enum:visibility", "head_generation:opt:uuid", "local_scan_generation:dec64", "collision_summary:arr:obj:collision_category_summary", "collisions:arr:obj:collision", "proposed_action_count:dec64", "proposed_actions:arr:obj:proposed_action_record", "requires_review:bool"],
   connect: ["connection_id:uuid", "status:obj:connection_status"],
   pause: ["paused_connection_ids:arr:uuid"],
@@ -133,6 +136,7 @@ const RESULTS = {
   free_space: ["freed_bytes:dec64", "dehydrated_files:u32"],
   set_selective_sync: ["excluded_item_ids:arr:uuid", "retained_dirty_item_ids:arr:uuid"],
   update_settings: ["revision:dec64", "settings:arr:obj:settings_entry"],
+  list_activity: ["items:arr:obj:activity_record", "next_cursor:opt:string"],
   list_history: ["items:arr:obj:history_record", "next_cursor:opt:string"],
   restore: ["operation_id:uuid", "status:obj:connection_status"],
   list_conflicts: ["items:arr:obj:conflict_record", "next_cursor:opt:string"],
@@ -152,7 +156,7 @@ const EVENTS = {
 
 const MUTATION_REQUESTS = new Set([
   "start_login", "cancel_login", "sign_out", "create_bucket", "begin_setup", "set_publication_credentials",
-  "probe_storage", "preview_connect", "connect", "pause", "resume", "set_pin", "free_space",
+  "probe_storage", "repair_storage", "preview_connect", "connect", "pause", "resume", "set_pin", "free_space",
   "set_selective_sync", "update_settings", "restore", "resolve_conflict", "export_diagnostics",
   "prepare_unlink", "unlink", "prepare_upgrade", "exit_provider",
 ]);

@@ -113,8 +113,9 @@ pub enum CancelTarget {
 #[derive(Clone, Debug)]
 pub struct PlaceholdersRequest {
     pub ack: AckToken,
-    /// Current (normalized) path of the directory inside the sync root — the
-    /// same spelling as [`RenameNotification::normalized_path`].
+    /// Sync-root-relative path of the directory inside the sync root — the
+    /// same spelling as [`RenameNotification::normalized_path`]. The sync
+    /// root directory itself is the empty spelling.
     pub normalized_path: String,
     /// Optional search pattern supplied by the OS.
     pub pattern: Option<String>,
@@ -125,9 +126,13 @@ pub struct PlaceholdersRequest {
 #[derive(Clone, Debug)]
 pub struct RenameNotification {
     pub ack: AckToken,
-    /// Current (normalized) path of the item inside the sync root.
+    /// Current path of the item: sync-root-relative when it is inside the
+    /// sync root (the root itself is the empty spelling), otherwise the
+    /// OS's absolute spelling with `source_in_scope` false — an outside
+    /// spelling is kept meaningful and never reinterpreted.
     pub normalized_path: String,
-    /// Requested target path (may be outside the sync root).
+    /// Requested target: sync-root-relative when inside the sync root,
+    /// otherwise the OS's absolute spelling (`target_in_scope` false).
     pub target_path: String,
     pub is_directory: bool,
     pub source_in_scope: bool,
@@ -138,6 +143,8 @@ pub struct RenameNotification {
 #[derive(Clone, Debug)]
 pub struct DeleteNotification {
     pub ack: AckToken,
+    /// Sync-root-relative path of the item inside the sync root (the root
+    /// directory itself is the empty spelling).
     pub normalized_path: String,
     pub is_directory: bool,
     pub is_undelete: bool,
@@ -146,6 +153,8 @@ pub struct DeleteNotification {
 /// A `NOTIFY_RENAME_COMPLETION` outcome (already completed by the OS).
 #[derive(Clone, Debug)]
 pub struct RenameCompletion {
+    /// The pre-rename source: sync-root-relative when it was inside the
+    /// sync root, otherwise the OS's absolute spelling.
     pub source_path: String,
 }
 

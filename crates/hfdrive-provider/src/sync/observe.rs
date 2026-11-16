@@ -295,7 +295,6 @@ pub fn scan_outcome(report: &ScanReport) -> ScanOutcome {
 pub struct ObserverConfig {
     pub root: PathBuf,
     pub coalesce: std::time::Duration,
-    pub scan_interval: std::time::Duration,
 }
 
 /// Batches of raw local observations delivered to the connection controller,
@@ -314,6 +313,7 @@ pub struct ObservationBatch {
 pub struct LocalObserver {
     watcher: Option<hfdrive_windows::filesystem::DirectoryWatcher>,
     cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct PendingRaw {
@@ -323,16 +323,18 @@ struct PendingRaw {
 
 impl LocalObserver {
     /// Starts the directory watcher and the debounce loop.
-    pub fn start(
+    pub async fn start(
         config: ObserverConfig,
         cancel: CancellationToken,
         events: mpsc::Sender<ObservationBatch>,
     ) -> Result<Self, hfdrive_windows::filesystem::FsError> {
         let (watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(1024);
-        let watcher =
-            hfdrive_windows::filesystem::DirectoryWatcher::start(&config.root, watch_tx)?;
+        let root = config.root.clone();
+        let watcher = tokio::task::spawn_blocking(move ||
+            hfdrive_windows::filesystem::DirectoryWatcher::start(&root, watch_tx)
+        ).await.map_err(|error| hfdrive_windows::filesystem::FsError::Io(std::io::Error::other(error)))??;
         let loop_cancel = cancel.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Keyed by lowercase spelling so case-only renames stay visible
             // as distinct facts while exact repeats merge.
             let mut pending: HashMap<String, PendingRaw> = HashMap::new();
@@ -383,11 +385,12 @@ impl LocalObserver {
                                 true
                             }
                         });
-                        if !ready.is_empty() || std::mem::take(&mut overflowed) {
+                        let rescan_required = std::mem::take(&mut overflowed);
+                        if !ready.is_empty() || rescan_required {
                             let _ = events
                                 .send(ObservationBatch {
                                     observations: ready,
-                                    rescan_required: false,
+                                    rescan_required,
                                 })
                                 .await;
                         }
@@ -395,21 +398,40 @@ impl LocalObserver {
                 }
             }
         });
-        Ok(Self { watcher: Some(watcher), cancel })
+        Ok(Self { watcher: Some(watcher), cancel, task: Some(task) })
     }
 
-    /// Stops the watcher thread. Bounded and idempotent.
-    pub fn shutdown(&mut self) {
+    pub fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub fn begin_scan(&self) {
+        if let Some(watcher) = &self.watcher { watcher.clear_overflowed(); }
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.watcher.as_ref().is_none_or(|watcher| watcher.overflowed())
+    }
+
+    pub async fn shutdown(mut self) {
         self.cancel.cancel();
+        if let Some(task) = self.task.take() { let _ = task.await; }
         if let Some(mut watcher) = self.watcher.take() {
-            watcher.shutdown();
+            let _ = tokio::task::spawn_blocking(move || watcher.shutdown()).await;
         }
     }
 }
 
 impl Drop for LocalObserver {
     fn drop(&mut self) {
-        self.shutdown();
+        self.cancel.cancel();
+        if let Some(mut watcher) = self.watcher.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || watcher.shutdown());
+            } else {
+                watcher.shutdown();
+            }
+        }
     }
 }
 
@@ -463,6 +485,24 @@ pub async fn classify_observation(
         }
     }
 
+
+    if !matches!(action, WatchAction::Removed | WatchAction::RenamedFrom | WatchAction::RenamedTo) {
+        if let (Some(item_id), Some(live)) = (item_id, live.as_ref()) {
+            if hfdrive_windows::filesystem::volume::placeholder_state(
+                live.identity.attributes, live.identity.reparse_tag,
+            ).is_in_sync() {
+                return Classification::Ignored;
+            }
+            if let (Some(usn), Ok(Some(observation))) = (
+                live.usn.and_then(|usn| u64::try_from(usn).ok()),
+                state.observation(connection, item_id).await,
+            ) {
+                if observation.observed_usn == Some(usn) {
+                    return Classification::Ignored;
+                }
+            }
+        }
+    }
     // 4. Disappearances require scan evidence.
     if matches!(action, WatchAction::Removed) || live.is_none() {
         return match item_id {
@@ -567,41 +607,6 @@ fn is_supported_new_entry(state: &FileState, components: &[String]) -> bool {
         && !state.identity.has_multiple_links()
 }
 
-/// Drives one full metadata scan and applies its evidence to the durable
-/// scan state. Completion grants deletion evidence; anything less voids it.
-pub async fn run_scan(
-    state: &AccountStore,
-    connection: hfdrive_core::ids::ConnectionId,
-    root: &Path,
-    volume_id: String,
-    journal_id: String,
-    cancel: std::sync::Arc<AtomicBool>,
-) -> Result<ScanOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    state.begin_scan(connection, volume_id, journal_id).await?;
-    let root_path = root.to_path_buf();
-    let cancel_flag = cancel;
-    let outcome = tokio::task::spawn_blocking(move || enumerate_metadata(&root_path, &cancel_flag))
-        .await?;
-    match outcome {
-        Ok((_entries, report)) => {
-            let outcome = scan_outcome(&report);
-            match outcome {
-                ScanOutcome::Complete { .. } => {
-                    state.complete_scan(connection, None).await?;
-                }
-                ScanOutcome::Incomplete { .. } => {
-                    state.invalidate_scan(connection).await?;
-                }
-            }
-            Ok(outcome)
-        }
-        Err(error) => {
-            // Cancelled or failed scans never grant deletion evidence.
-            state.invalidate_scan(connection).await?;
-            Err(error.into())
-        }
-    }
-}
 
 /// Classifies one USN catch-up result against the scan evidence rules.
 pub fn usn_catchup_outcome(catch_up: &hfdrive_windows::filesystem::CatchUp) -> ScanOutcome {

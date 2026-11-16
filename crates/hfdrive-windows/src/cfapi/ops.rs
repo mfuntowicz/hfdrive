@@ -262,9 +262,11 @@ pub fn update_placeholder(
     }
     let usn = raw::update_placeholder(
         &handle,
-        &to_metadata(&spec.metadata),
+        Some(&to_metadata(&spec.metadata)),
         &identity,
         &invalidate,
+        expect.usn.expect("the strict guard verified a known USN"),
+        true,
     )
     .map_err(|code| CfError::Win32 {
         operation: "CfUpdatePlaceholder",
@@ -273,8 +275,9 @@ pub fn update_placeholder(
     Ok(GuardOutcome::Applied { usn: Some(usn) })
 }
 
-/// Convert a verified, already-published local file into a placeholder.
-/// Requires the strict guard so identity/generation evidence is preserved.
+/// Bind a verified, already-published local version without invalidating bytes.
+/// Normal files become resident placeholders; existing placeholders receive
+/// the newly committed identity. A drifted capture is never marked in-sync.
 pub fn convert_published(
     path: &Path,
     identity: &PlaceholderIdentity,
@@ -284,11 +287,25 @@ pub fn convert_published(
     if let Err(mismatch) = guard_check(&handle, expect, true) {
         return Ok(GuardOutcome::Mismatch(mismatch));
     }
+    let tag = raw_volume::attr_tag(&handle).map_err(map_open)?;
+    let placeholder = crate::filesystem::volume::placeholder_state(tag.attributes, tag.reparse_tag);
     let bytes = identity.encode();
-    let usn = raw::convert_to_placeholder(&handle, &bytes).map_err(|code| CfError::Win32 {
-        operation: "CfConvertToPlaceholder",
-        code,
-    })?;
+    let (result, operation) = if placeholder.is_placeholder() {
+        (
+            raw::update_placeholder(
+                &handle,
+                None,
+                &bytes,
+                &[],
+                expect.usn.expect("the strict guard verified a known USN"),
+                false,
+            ),
+            "CfUpdatePlaceholder(published identity)",
+        )
+    } else {
+        (raw::convert_to_placeholder(&handle, &bytes), "CfConvertToPlaceholder")
+    };
+    let usn = result.map_err(|code| CfError::Win32 { operation, code })?;
     Ok(GuardOutcome::Applied { usn: Some(usn) })
 }
 
@@ -587,4 +604,32 @@ fn validate_placeholder_name(name: &str) -> CfResult<()> {
     crate::filesystem::names::validate_component(name).map_err(|_| {
         CfError::Precondition("placeholder name is not a supported final component")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hfdrive_core::ids::{ItemId, VersionId, WorkspaceId};
+
+    #[test]
+    fn published_binding_preserves_a_file_when_capture_identity_is_wrong() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replacement.txt");
+        std::fs::write(&path, b"newer local bytes").unwrap();
+        let mut expected = crate::filesystem::volume::query_file_state(&path).unwrap();
+        let actual_id = expected.identity.file_id;
+        expected.identity.file_id[0] ^= 1;
+        let identity = PlaceholderIdentity::file(WorkspaceId::new(), ItemId::new(), VersionId::new());
+        assert_eq!(
+            convert_published(&path, &identity, &expected).unwrap(),
+            GuardOutcome::Mismatch(GuardMismatch::IdentityChanged)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer local bytes");
+        let after = crate::filesystem::volume::query_file_state(&path).unwrap();
+        assert_eq!(after.identity.file_id, actual_id);
+        assert!(!crate::filesystem::volume::placeholder_state(
+            after.identity.attributes,
+            after.identity.reparse_tag,
+        ).is_placeholder());
+    }
 }

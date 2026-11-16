@@ -1,8 +1,9 @@
 use hfdrive_auth::AuthManager;
 use hfdrive_core::ids::{AccountKey, ConnectionId};
 use hfdrive_protocol::{
-    Envelope, Event, ExitProviderResult, GetStatusResult, HelloRequest, HelloResult,
-    ProtocolError, ProtocolErrorCode, Request, ResponseResult, StatusChangedEvent, StatusSnapshot,
+    AuthenticationState, Envelope, Event, ExitProviderResult, GetStatusResult, HelloRequest,
+    HelloResult, ProtocolError, ProtocolErrorCode, Request, ResponseResult, StatusChangedEvent,
+    StatusSnapshot,
 };
 use hfdrive_state::{StatePaths, StateStore};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 mod account;
 mod account_runtime;
+mod activity;
 mod conflicts;
 mod connect;
 mod controls;
@@ -20,6 +22,7 @@ mod history;
 mod inspect;
 mod operations;
 mod probe;
+mod repair;
 mod requests;
 pub mod scheduler;
 pub mod remote_watch;
@@ -44,6 +47,14 @@ impl OutgoingEnvelope {
     fn new(envelope: Envelope) -> Self {
         Self { envelope, after: AfterReply::default() }
     }
+}
+
+/// How an account-runtime failure changes the published session state.
+pub(crate) enum AccountFailure {
+    /// The token epoch is gone: the session needs a new interactive grant.
+    SignInRequired,
+    /// The session is intact; only its restoration failed.
+    Restore,
 }
 
 pub struct Provider {
@@ -137,14 +148,10 @@ impl Provider {
         });
         // A selected credential envelope does not establish a usable token epoch until
         // its public identity and account binding have been persisted in this provider.
-        let startup = match provider.synchronize_account().await {
-            Ok(_) => provider.restore_connections().await.map(|_| ()),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = startup {
-            let mut status = provider.status.borrow().account.clone();
-            status.last_error = Some(error);
-            provider.status.send_replace(StatusSnapshot { account: status, ..provider.status.borrow().clone() });
+        // Root restoration runs in observe_accounts after the host binds IPC;
+        // network or inaccessible storage must not block Hello/GetStatus.
+        if let Err(error) = provider.synchronize_account().await {
+            let _ = provider.publish_account_error(AccountFailure::SignInRequired, error);
         }
         Ok(provider)
     }
@@ -200,7 +207,7 @@ impl Provider {
             protocol_major: 1,
             protocol_minor: 0,
             provider_version: env!("CARGO_PKG_VERSION").to_owned(),
-            supported_features: ["get_status", "subscribe_status", "cancel_request", "start_login", "cancel_login", "sign_out", "list_owners", "list_buckets", "create_bucket", "inspect_drive", "list_conflicts", "resolve_conflict", "list_history", "restore", "begin_setup", "set_publication_credentials", "preview_connect", "connect", "probe_storage", "pause", "resume", "set_pin", "free_space", "set_selective_sync", "export_diagnostics", "prepare_unlink", "unlink", "update_settings", "prepare_upgrade", "exit_provider"]
+            supported_features: ["get_status", "subscribe_status", "cancel_request", "start_login", "cancel_login", "sign_out", "list_owners", "list_buckets", "create_bucket", "inspect_drive", "list_conflicts", "resolve_conflict", "list_history", "restore", "begin_setup", "set_publication_credentials", "preview_connect", "connect", "probe_storage", "repair_storage", "pause", "resume", "set_pin", "free_space", "set_selective_sync", "export_diagnostics", "prepare_unlink", "unlink", "update_settings", "list_activity", "prepare_upgrade", "exit_provider"]
                 .into_iter().map(str::to_owned).collect(),
             supported_min_protocol_minor: 0,
         })
@@ -210,6 +217,28 @@ impl Provider {
         let mut receiver = self.status.subscribe();
         let snapshot = receiver.borrow_and_update().clone();
         (snapshot, receiver)
+    }
+
+    /// The one account-status error publication boundary, shared by startup and
+    /// the account observer. It publishes through the same watch/sequence path
+    /// as every other account status change — never a parallel status writer —
+    /// and never holds a watch read guard across the write.
+    ///
+    /// [`AccountFailure::SignInRequired`] marks the session as needing a new
+    /// interactive grant because its token epoch is gone; [`AccountFailure::Restore`]
+    /// only annotates a session that remains intact. Both preserve the projected
+    /// account profile and the retained connection records.
+    pub(crate) fn publish_account_error(
+        &self,
+        failure: AccountFailure,
+        error: ProtocolError,
+    ) -> Result<(), ProtocolError> {
+        let mut account = self.status.borrow().account.clone();
+        if matches!(failure, AccountFailure::SignInRequired) {
+            account.state = AuthenticationState::NeedsSignIn;
+        }
+        account.last_error = Some(error);
+        self.publish_account(account)
     }
 
     async fn dispatch(self: &Arc<Self>, request: Request, cancellation: CancellationToken) -> DispatchReply {
@@ -233,6 +262,7 @@ impl Provider {
             Request::ListBuckets(request) => self.list_buckets(request).await.map(ResponseResult::ListBuckets).into(),
             Request::InspectDrive(request) => self.inspect_drive(request).await.map(ResponseResult::InspectDrive).into(),
             Request::ListConflicts(request) => self.list_conflicts(request).await.map(ResponseResult::ListConflicts).into(),
+            Request::ListActivity(request) => self.list_activity(request).await.map(ResponseResult::ListActivity).into(),
             Request::ListHistory(request) => self.list_history(request).await.map(ResponseResult::ListHistory).into(),
             request => self.dispatch_mutation(request, cancellation).await,
         }
@@ -272,6 +302,16 @@ impl Provider {
                         ProtocolErrorCode::Cancelled | ProtocolErrorCode::Timeout | ProtocolErrorCode::Internal));
                 operations::MutationOutcome {
                     reply: outcome.map(ResponseResult::ProbeStorage).into(),
+                    uncertain,
+                }
+            }
+            Request::RepairStorage(request) => {
+                let outcome = self.repair_storage(request).await;
+                let uncertain = self.operations.cancellation.is_cancelled()
+                    || outcome.as_ref().is_err_and(|error| matches!(error.code,
+                        ProtocolErrorCode::Cancelled | ProtocolErrorCode::Timeout | ProtocolErrorCode::Internal));
+                operations::MutationOutcome {
+                    reply: outcome.map(ResponseResult::RepairStorage).into(),
                     uncertain,
                 }
             }
@@ -340,6 +380,7 @@ impl Provider {
                 let id = match request {
                     Request::SetPublicationCredentials(r) => Some(connection(r.connection_id)?),
                     Request::ProbeStorage(r) => Some(connection(r.connection_id)?),
+                    Request::RepairStorage(r) => Some(connection(r.connection_id)?),
                     Request::PreviewConnect(r) => Some(connection(r.connection_id)?),
                     Request::Pause(r) => r.connection_id.map(&connection).transpose()?,
                     Request::Resume(r) => r.connection_id.map(&connection).transpose()?,
@@ -420,5 +461,186 @@ async fn stream_status(
             _ = cancellation.cancelled() => break,
             sent = outgoing.send(OutgoingEnvelope::new(event)) => if sent.is_err() { break; },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hfdrive_protocol::{
+        AccountProfile, AccountStatus, Body, Bucket, CapabilityState, ConnectionMode,
+        ConnectionState, ConnectionStatus, GetStatusRequest, HydrationState, Owner, OwnerKind,
+        PinState, Visibility,
+    };
+
+    fn account() -> AccountStatus {
+        AccountStatus {
+            state: AuthenticationState::SignedIn,
+            profile: Some(AccountProfile {
+                account_key: "fixture-account-key".to_owned(),
+                issuer: "https://huggingface.co".to_owned(),
+                subject: "fixture-subject".to_owned(),
+                namespace: "fixture-person".to_owned(),
+                display_name: "fixture-person".to_owned(),
+                granted_scopes: Some(vec!["openid".to_owned()]),
+            }),
+            login: None,
+            last_error: None,
+        }
+    }
+
+    fn connection() -> ConnectionStatus {
+        ConnectionStatus {
+            connection_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            owner: Owner {
+                owner_kind: OwnerKind::Personal,
+                owner_id: "stable-owner".to_owned(),
+                namespace: Some("fixture-person".to_owned()),
+                display_name: "fixture-person".to_owned(),
+                role: None,
+                restrictions: Vec::new(),
+                can_create: false,
+            },
+            bucket: Bucket {
+                bucket_id: "bucket-01".to_owned(),
+                name: "fixture-bucket".to_owned(),
+                namespace: "fixture-person".to_owned(),
+                visibility: Visibility::Private,
+            },
+            prefix: "hfdrive/fixture".to_owned(),
+            root_path: "C:\\fixture-root".to_owned(),
+            mode: ConnectionMode::ReadOnly,
+            capability: CapabilityState::ReadOnly,
+            state: ConnectionState::UpToDate,
+            pin: PinState::Unpinned,
+            hydration: HydrationState::OnlineOnly,
+            observed_commit: None,
+            published_commit: None,
+            applied_commit: None,
+            observed_generation: Some(9),
+            pending_files: 0,
+            dirty_files: 0,
+            conflict_files: 0,
+            online_only_files: 2,
+            pinned_files: 0,
+            pending_upload_bytes: 0,
+            local_bytes: 4096,
+            staging_used_bytes: 0,
+            range_cache_used_bytes: 0,
+            transfer_memory_used_bytes: 0,
+            last_error: None,
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// The startup/observer failure path must reach the real status consumer
+    /// without blocking on the watch (the former borrow-into-write deadlock)
+    /// and without rewriting any account field but the error.
+    #[tokio::test]
+    async fn restore_failure_reaches_the_status_stream_and_get_status() {
+        let provider = Arc::new(Provider::new(StatusSnapshot {
+            sequence: 11,
+            account: account(),
+            connections: Vec::new(),
+        }));
+        let (snapshot, receiver) = provider.subscribe();
+        assert_eq!(snapshot.sequence, 11);
+        let (outgoing, mut incoming) = mpsc::channel(4);
+        let cancellation = CancellationToken::new();
+        let _stream_task = tokio::spawn(stream_status(receiver, cancellation.clone(), outgoing));
+
+        provider
+            .publish_account_error(
+                AccountFailure::Restore,
+                error(ProtocolErrorCode::Timeout, "the persisted root could not be restored"),
+            )
+            .unwrap();
+
+        // The same watch consumer that serves subscribed IPC clients observes
+        // the failure as an ordinary status event, promptly and exactly once.
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+            .await
+            .expect("the status event is delivered promptly")
+            .expect("the status stream stays open");
+        let Body::Event(Event::StatusChanged(event)) = envelope.envelope.body else {
+            panic!("the status stream emits status events");
+        };
+        assert!(event.snapshot);
+        assert_eq!(event.sequence, 12, "the published change advances the sequence exactly once");
+        assert_eq!(event.account.state, AuthenticationState::SignedIn, "a restore failure does not require sign-in");
+        assert_eq!(event.account.profile, account().profile, "the profile is retained");
+        assert_eq!(event.account.last_error.as_ref().map(|failure| failure.code), Some(ProtocolErrorCode::Timeout));
+        assert!(event.changes.is_empty());
+
+        // GetStatus answers with the same published account and sequence; the
+        // failure changed nothing else and did not block the request path.
+        let reply = provider
+            .dispatch(Request::GetStatus(GetStatusRequest {}), CancellationToken::new())
+            .await;
+        let ResponseResult::GetStatus(status) = reply.result.expect("status reply") else {
+            panic!("get_status answers");
+        };
+        assert_eq!(status.event_sequence, 12);
+        assert_eq!(status.account.state, AuthenticationState::SignedIn);
+        assert_eq!(status.account.profile, account().profile);
+        assert_eq!(status.account.last_error.as_ref().map(|failure| failure.code), Some(ProtocolErrorCode::Timeout));
+        cancellation.cancel();
+    }
+
+    /// Account error publication must retain the existing snapshot even when
+    /// no consumer is attached: existing account and connection data survive,
+    /// the sequence stays monotonic, and a later subscriber sees the changes.
+    #[tokio::test]
+    async fn error_publication_retains_snapshots_without_current_subscribers() {
+        let connection = connection();
+        let provider = Provider::new(StatusSnapshot {
+            sequence: 40,
+            account: account(),
+            connections: vec![connection.clone()],
+        });
+
+        // No subscriber exists; both observer failure kinds are published
+        // through the same account-status path.
+        provider
+            .publish_account_error(
+                AccountFailure::Restore,
+                error(ProtocolErrorCode::Timeout, "the persisted root could not be restored"),
+            )
+            .unwrap();
+        provider
+            .publish_account_error(
+                AccountFailure::SignInRequired,
+                error(ProtocolErrorCode::NeedsSignIn, "the account must sign in again"),
+            )
+            .unwrap();
+
+        let mut receiver = provider.status.subscribe();
+        {
+            let snapshot = receiver.borrow_and_update().clone();
+            assert_eq!(snapshot.sequence, 42, "each published change advances the sequence exactly once");
+            assert_eq!(snapshot.account.state, AuthenticationState::NeedsSignIn);
+            assert_eq!(
+                snapshot.account.last_error.as_ref().map(|failure| failure.code),
+                Some(ProtocolErrorCode::NeedsSignIn)
+            );
+            assert_eq!(snapshot.account.profile, account().profile);
+            assert_eq!(snapshot.connections, vec![connection.clone()], "connection rows survive account error publication");
+        }
+        assert!(!receiver.has_changed().expect("watch stays open"), "the late subscriber already owns the retained snapshot");
+
+        // The watch remains responsive for that subscriber afterwards.
+        provider
+            .publish_account_error(
+                AccountFailure::Restore,
+                error(ProtocolErrorCode::Timeout, "restoration failed again"),
+            )
+            .unwrap();
+        assert!(receiver.has_changed().expect("watch stays open"));
+        let snapshot = receiver.borrow_and_update().clone();
+        assert_eq!(snapshot.sequence, 43);
+        assert_eq!(snapshot.account.state, AuthenticationState::NeedsSignIn, "a restore failure never relaxes an established state");
+        assert_eq!(snapshot.account.profile, account().profile);
+        assert_eq!(snapshot.connections, vec![connection]);
     }
 }

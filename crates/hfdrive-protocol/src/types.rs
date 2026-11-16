@@ -1052,6 +1052,43 @@ pub struct ProbeStorageResult {
     pub report_path: Option<String>,
 }
 
+/// `repair_storage` request.
+///
+/// Repairs one existing connected drive's supplemental publication access by
+/// rebinding the verified publication credentials recorded for a source setup
+/// reservation to the target's existing protection context. No secret travels
+/// on the pipe: the provider loads, re-protects and stores the pair internally,
+/// and the source setup reservation is never modified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RepairStorageRequest {
+    /// Unique durable operation identifier for this mutation.
+    pub operation_id: Uuid,
+    /// Existing connected connection whose storage access is repaired.
+    pub connection_id: Uuid,
+    /// Source setup reservation whose verified protected credentials are reused.
+    pub credentials_from_connection_id: Uuid,
+}
+request_method!(RepairStorageRequest, "repair_storage");
+
+/// `repair_storage` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RepairStorageResult {
+    /// The repaired target connection identifier.
+    pub connection_id: Uuid,
+    /// True only when the repaired credentials are committed and the live
+    /// binding is active with the fresh proof recorded below. A committed
+    /// repair whose runtime refresh failed is reported honestly as false.
+    pub repaired: bool,
+    /// Fresh probe run identity of the required storage check.
+    pub run_id: Uuid,
+    /// Non-secret capability report artifact identity.
+    pub report_path: Option<String>,
+    /// Current status of the repaired connection.
+    pub status: ConnectionStatus,
+}
+
 /// `preview_connect` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -1275,6 +1312,34 @@ pub struct SettingsEntry {
     pub key: String,
     /// JSON-encoded value.
     pub value_json: String,
+}
+
+/// `list_activity` request.
+///
+/// Read-only listing of the connection's real current synchronization work
+/// (durable outbox/local actions/transfers and live in-flight hydration),
+/// one bounded page at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ListActivityRequest {
+    /// Connection whose activity is listed.
+    pub connection_id: Uuid,
+    /// Optional continuation cursor from a previous page. The cursor is bound
+    /// to the connection that produced it.
+    pub cursor: Option<String>,
+    /// Maximum records to return (<= 200).
+    pub limit: u32,
+}
+request_method!(ListActivityRequest, "list_activity");
+
+/// `list_activity` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ListActivityResult {
+    /// One page of activity records.
+    pub items: Vec<ActivityRecord>,
+    /// Continuation cursor, `None` on the last page.
+    pub next_cursor: Option<String>,
 }
 
 /// `list_history` request.

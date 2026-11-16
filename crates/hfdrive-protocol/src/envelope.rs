@@ -64,6 +64,7 @@ pub const ALL_METHODS: &[&str] = &[
     "begin_setup",
     "set_publication_credentials",
     "probe_storage",
+    "repair_storage",
     "preview_connect",
     "connect",
     "pause",
@@ -72,6 +73,7 @@ pub const ALL_METHODS: &[&str] = &[
     "free_space",
     "set_selective_sync",
     "update_settings",
+    "list_activity",
     "list_history",
     "restore",
     "list_conflicts",
@@ -133,6 +135,7 @@ pub enum Request {
     BeginSetup(BeginSetupRequest),
     SetPublicationCredentials(SetPublicationCredentialsRequest),
     ProbeStorage(ProbeStorageRequest),
+    RepairStorage(RepairStorageRequest),
     PreviewConnect(PreviewConnectRequest),
     Connect(ConnectRequest),
     Pause(PauseRequest),
@@ -141,6 +144,7 @@ pub enum Request {
     FreeSpace(FreeSpaceRequest),
     SetSelectiveSync(SetSelectiveSyncRequest),
     UpdateSettings(UpdateSettingsRequest),
+    ListActivity(ListActivityRequest),
     ListHistory(ListHistoryRequest),
     Restore(RestoreRequest),
     ListConflicts(ListConflictsRequest),
@@ -171,6 +175,7 @@ pub enum ResponseResult {
     BeginSetup(BeginSetupResult),
     SetPublicationCredentials(SetPublicationCredentialsResult),
     ProbeStorage(ProbeStorageResult),
+    RepairStorage(RepairStorageResult),
     PreviewConnect(PreviewConnectResult),
     Connect(ConnectResult),
     Pause(PauseResult),
@@ -179,6 +184,7 @@ pub enum ResponseResult {
     FreeSpace(FreeSpaceResult),
     SetSelectiveSync(SetSelectiveSyncResult),
     UpdateSettings(UpdateSettingsResult),
+    ListActivity(ListActivityResult),
     ListHistory(ListHistoryResult),
     Restore(RestoreResult),
     ListConflicts(ListConflictsResult),
@@ -252,6 +258,7 @@ impl Request {
             Request::BeginSetup(_) => BeginSetupRequest::METHOD,
             Request::SetPublicationCredentials(_) => SetPublicationCredentialsRequest::METHOD,
             Request::ProbeStorage(_) => ProbeStorageRequest::METHOD,
+            Request::RepairStorage(_) => RepairStorageRequest::METHOD,
             Request::PreviewConnect(_) => PreviewConnectRequest::METHOD,
             Request::Connect(_) => ConnectRequest::METHOD,
             Request::Pause(_) => PauseRequest::METHOD,
@@ -260,6 +267,7 @@ impl Request {
             Request::FreeSpace(_) => FreeSpaceRequest::METHOD,
             Request::SetSelectiveSync(_) => SetSelectiveSyncRequest::METHOD,
             Request::UpdateSettings(_) => UpdateSettingsRequest::METHOD,
+            Request::ListActivity(_) => ListActivityRequest::METHOD,
             Request::ListHistory(_) => ListHistoryRequest::METHOD,
             Request::Restore(_) => RestoreRequest::METHOD,
             Request::ListConflicts(_) => ListConflictsRequest::METHOD,
@@ -273,6 +281,9 @@ impl Request {
     }
 
     /// Returns the mutation operation id, when this request is a mutation.
+    /// Read-only queries (including `list_activity`) never carry one. The
+    /// match is exhaustive on purpose: a new request variant must be
+    /// classified as read-only or as a mutation when it is added.
     pub fn operation_id(&self) -> Option<Uuid> {
         match self {
             Request::StartLogin(r) => Some(r.operation_id),
@@ -282,6 +293,7 @@ impl Request {
             Request::BeginSetup(r) => Some(r.operation_id),
             Request::SetPublicationCredentials(r) => Some(r.operation_id),
             Request::ProbeStorage(r) => Some(r.operation_id),
+            Request::RepairStorage(r) => Some(r.operation_id),
             Request::PreviewConnect(r) => Some(r.operation_id),
             Request::Connect(r) => Some(r.operation_id),
             Request::Pause(r) => Some(r.operation_id),
@@ -297,7 +309,16 @@ impl Request {
             Request::Unlink(r) => Some(r.operation_id),
             Request::PrepareUpgrade(r) => Some(r.operation_id),
             Request::ExitProvider(r) => Some(r.operation_id),
-            _ => None,
+            Request::Hello(_)
+            | Request::GetStatus(_)
+            | Request::SubscribeStatus(_)
+            | Request::CancelRequest(_)
+            | Request::ListOwners(_)
+            | Request::ListBuckets(_)
+            | Request::InspectDrive(_)
+            | Request::ListActivity(_)
+            | Request::ListHistory(_)
+            | Request::ListConflicts(_) => None,
         }
     }
 }
@@ -564,6 +585,7 @@ fn decode_request(method: &str, value: Value) -> Result<Request, ProtocolCodecEr
         "begin_setup" => (BeginSetup, BeginSetupRequest),
         "set_publication_credentials" => (SetPublicationCredentials, SetPublicationCredentialsRequest),
         "probe_storage" => (ProbeStorage, ProbeStorageRequest),
+        "repair_storage" => (RepairStorage, RepairStorageRequest),
         "preview_connect" => (PreviewConnect, PreviewConnectRequest),
         "connect" => (Connect, ConnectRequest),
         "pause" => (Pause, PauseRequest),
@@ -572,6 +594,7 @@ fn decode_request(method: &str, value: Value) -> Result<Request, ProtocolCodecEr
         "free_space" => (FreeSpace, FreeSpaceRequest),
         "set_selective_sync" => (SetSelectiveSync, SetSelectiveSyncRequest),
         "update_settings" => (UpdateSettings, UpdateSettingsRequest),
+        "list_activity" => (ListActivity, ListActivityRequest),
         "list_history" => (ListHistory, ListHistoryRequest),
         "restore" => (Restore, RestoreRequest),
         "list_conflicts" => (ListConflicts, ListConflictsRequest),
@@ -604,6 +627,7 @@ pub(crate) fn decode_result(method: &str, value: Value) -> Result<ResponseResult
         "begin_setup" => (BeginSetup, BeginSetupResult),
         "set_publication_credentials" => (SetPublicationCredentials, SetPublicationCredentialsResult),
         "probe_storage" => (ProbeStorage, ProbeStorageResult),
+        "repair_storage" => (RepairStorage, RepairStorageResult),
         "preview_connect" => (PreviewConnect, PreviewConnectResult),
         "connect" => (Connect, ConnectResult),
         "pause" => (Pause, PauseResult),
@@ -612,6 +636,7 @@ pub(crate) fn decode_result(method: &str, value: Value) -> Result<ResponseResult
         "free_space" => (FreeSpace, FreeSpaceResult),
         "set_selective_sync" => (SetSelectiveSync, SetSelectiveSyncResult),
         "update_settings" => (UpdateSettings, UpdateSettingsResult),
+        "list_activity" => (ListActivity, ListActivityResult),
         "list_history" => (ListHistory, ListHistoryResult),
         "restore" => (Restore, RestoreResult),
         "list_conflicts" => (ListConflicts, ListConflictsResult),
@@ -1152,5 +1177,30 @@ mod tests {
         assert!(Envelope::parse(bytes).is_err());
         let bytes = br#"{"protocol_major":1,"protocol_minor":0,"request_id":"00000000-0000-4000-8000-000000000000","kind":"event","method":"get_status","body":{}}"#;
         assert!(Envelope::parse(bytes).is_err());
+    }
+
+    #[test]
+    fn operation_id_classifies_mutations_and_read_only_queries() {
+        // A mutation carries a unique operation id; the provider uses
+        // `operation_id()` for durable-operation reservation. This catches a
+        // request variant silently losing its id classification.
+        let mutation = Request::Restore(RestoreRequest {
+            operation_id: Uuid::from_bytes([0x22; 16]),
+            connection_id: Uuid::from_bytes([0x77; 16]),
+            item_id: Uuid::from_bytes([0x33; 16]),
+            version_id: Uuid::from_bytes([0x44; 16]),
+        });
+        assert_eq!(mutation.operation_id(), Some(Uuid::from_bytes([0x22; 16])));
+
+        // `list_activity` is the additive optional read-only query: its request
+        // has no operation id, and its name is a registered wire method.
+        let read_only = Request::ListActivity(ListActivityRequest {
+            connection_id: Uuid::from_bytes([0x77; 16]),
+            cursor: Some("activity:1".to_string()),
+            limit: 50,
+        });
+        assert_eq!(read_only.method(), "list_activity");
+        assert_eq!(read_only.operation_id(), None);
+        assert!(ALL_METHODS.contains(&read_only.method()));
     }
 }

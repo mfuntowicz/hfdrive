@@ -65,8 +65,10 @@ pub enum CaptureFailure {
     Missing,
     #[error("capture was cancelled")]
     Cancelled,
-    #[error("staging admission failed: {0}")]
-    Admission(String),
+    /// Staging admission refused the capture. `code` is the classified
+    /// scheduler class (`work_errors::codes`), `detail` a safe description.
+    #[error("staging admission failed: {detail}")]
+    Admission { code: &'static str, detail: String },
 }
 
 impl CaptureFailure {
@@ -76,8 +78,21 @@ impl CaptureFailure {
             CaptureFailure::Blocked(_) => RetryClass::NeedsUser,
             CaptureFailure::Missing => RetryClass::None,
             CaptureFailure::Cancelled => RetryClass::None,
-            CaptureFailure::Admission(_) => RetryClass::Backoff,
+            CaptureFailure::Admission { .. } => RetryClass::Backoff,
         }
+    }
+
+    /// The classified stable error code of this failure, for the durable
+    /// work-error record. Cancellation is reported as such and is never
+    /// recorded as a permanent failure by callers.
+    pub fn error_code(&self) -> &'static str {
+        crate::sync::work_errors::capture_code(self)
+    }
+
+    /// The safe detail text of this failure (static descriptions and
+    /// structured error codes only — never tokens, URLs or payload bytes).
+    pub fn detail(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -102,7 +117,8 @@ pub fn materialize_first(path: &Path, state: &FileState) -> Result<(), CaptureFa
 }
 
 /// Runs one coherent capture and journals its evidence. Durable ordering:
-/// `begin_snapshot` (Capturing) -> flushed staged file -> `complete_snapshot`
+/// `begin_snapshot` (Capturing) -> `bind_snapshot_operation` (capture bound
+/// to its operation) -> flushed staged file -> `complete_snapshot`
 /// (Ready) -> transfer journal with capture evidence. Nothing external is
 /// referenced before the staged file is flushed.
 pub async fn capture_local_change(
@@ -148,14 +164,27 @@ pub async fn capture_local_change(
             cancel,
         )
         .await
-        .map_err(|error| CaptureFailure::Admission(error.to_string()))?;
+        .map_err(|error| CaptureFailure::Admission {
+            code: crate::sync::work_errors::schedule_code(&error),
+            detail: error.to_string(),
+        })?;
 
-    // 3. Durable capture intent, then the coherent read.
+    // 3. Durable capture intent, then the coherent read. The snapshot row is
+    //    bound to its operation immediately after creation so the activity
+    //    projection can prove this capture is really in flight for this work.
     state
         .begin_snapshot(
             request.connection_id,
             request.snapshot_id,
             request.staging_dir.join(format!("{}.snap", request.snapshot_id)),
+        )
+        .await
+        .map_err(|error| CaptureFailure::Blocked(leak_state_error(&error)))?;
+    state
+        .bind_snapshot_operation(
+            request.connection_id,
+            request.snapshot_id,
+            request.operation_id,
         )
         .await
         .map_err(|error| CaptureFailure::Blocked(leak_state_error(&error)))?;
