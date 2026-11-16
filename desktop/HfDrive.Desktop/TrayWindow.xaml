@@ -15,8 +15,8 @@
       is genuinely up to date (TrayViewModel.IsAllSynced).
     -->
     <!-- The popup fills its native client area. PlacePanel clamps the preferred
-         400x620-DIP viewport to the monitor work area; the body scrolls without
-         clipping the header or footer. -->
+         400x620-DIP viewport to the monitor work area; full-height tab cards and
+         Issues scroll independently without clipping the header or footer. -->
     <Grid x:Name="RootPanel"
           AutomationProperties.AutomationId="HfDriveTrayPanel"
           AutomationProperties.Name="HF Drive tray panel"
@@ -109,11 +109,8 @@
             </StackPanel>
         </Grid>
 
-        <!-- ── Body: explicit state surfaces + live lists ─────────────────── -->
-        <ScrollViewer Grid.Row="1"
-                      VerticalScrollBarVisibility="Auto"
-                      HorizontalScrollMode="Disabled">
-            <StackPanel Padding="16,12" Spacing="0">
+        <!-- ── Body: explicit state surfaces + bounded, full-height live lists ── -->
+        <Grid Grid.Row="1" Padding="16,12">
 
                 <!-- Loading: no accepted status of the live session yet. -->
                 <StackPanel Spacing="8"
@@ -170,53 +167,24 @@
                 </StackPanel>
 
                 <!-- Configured account surface. Optional controls own their margins. -->
-                <StackPanel Spacing="0"
-                            Visibility="{Binding IsReadyView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                <Grid Visibility="{Binding IsReadyView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
 
-                    <!--
-                      Celebration occupies the old body account line. Only the
-                      truthful all-synced state, driven by
-                      TrayViewModel.IsAllSynced (known matching baseline commits,
-                      no pending/dirty/conflict counts and no unfinished activity).
-                    -->
-                    <Border AutomationProperties.AutomationId="AllSyncedAnimation"
-                            AutomationProperties.Name="Everything is up to date"
-                            Height="64"
-                            Style="{StaticResource TrayCardBorderStyle}"
-                            Background="{ThemeResource HfStorageAccentFillBrush}"
-                            Visibility="{Binding IsAllSynced, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                        <StackPanel Orientation="Horizontal" Spacing="12">
-                            <Image x:Name="AllSyncedImage"
-                                   Width="48" Height="48"
-                                   Stretch="Uniform"
-                                   ImageOpened="OnAllSyncedImageOpened">
-                                <Image.Source>
-                                    <BitmapImage x:Name="AllSyncedAnimationSource"
-                                                 UriSource="ms-appx:///Assets/VibingHuggy.gif"
-                                                 DecodePixelWidth="96"
-                                                 AutoPlay="False" />
-                                </Image.Source>
-                            </Image>
-                            <StackPanel VerticalAlignment="Center" Spacing="2" MaxWidth="220">
-                                <TextBlock Text="Everything is up to date"
-                                           Style="{StaticResource SubtitleTextBlockStyle}"
-                                           TextWrapping="Wrap" />
-                                <TextBlock Text="{x:Bind ViewModel.AllSyncedText, Mode=OneWay}"
-                                           Style="{StaticResource CaptionTextBlockStyle}"
-                                           Opacity="0.8"
-                                           TextWrapping="Wrap" />
-                            </StackPanel>
-                        </StackPanel>
-                    </Border>
-
-                    <TextBlock Text="{x:Bind ViewModel.WarningText, Mode=OneWay}"
+                    <TextBlock Grid.Row="0"
+                               Text="{x:Bind ViewModel.WarningText, Mode=OneWay}"
                                TextWrapping="Wrap"
                                Margin="0,16"
                                Foreground="{ThemeResource SystemFillColorCautionBrush}"
                                Visibility="{Binding HasWarningText, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
 
                     <!-- Folder selector when more than one connection exists. -->
-                    <StackPanel Spacing="4"
+                    <StackPanel Grid.Row="1"
+                                Spacing="4"
                                 Margin="0,16"
                                 AutomationProperties.AutomationId="TrayConnections"
                                 AutomationProperties.Name="Synced folders"
@@ -229,10 +197,13 @@
                     </StackPanel>
 
                     <!-- Activity and committed history share an explicit tab grid. -->
-                    <Grid HorizontalAlignment="Stretch" Margin="0">
+                    <Grid Grid.Row="2"
+                          HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch"
+                          Margin="0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
                         </Grid.RowDefinitions>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
@@ -280,22 +251,16 @@
                                      AutomationProperties.Name="Syncing now"
                                      />
                             <Border Grid.Row="1" Grid.ColumnSpan="2"
+                                    VerticalAlignment="Stretch"
                                     Visibility="{Binding IsSyncingTabSelected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
                                     Style="{StaticResource TrayCardBorderStyle}"
                                     AutomationProperties.AutomationId="TrayActivity"
                                     AutomationProperties.Name="Syncing now">
-                                <StackPanel Spacing="8">
-                                    <StackPanel Orientation="Horizontal" Spacing="8"
-                                                Visibility="{Binding IsAllSynced, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                        <FontIcon Glyph="&#xE73E;"
-                                                  FontSize="16"
-                                                  VerticalAlignment="Center"
-                                                  Foreground="{ThemeResource SystemFillColorSuccessBrush}" />
-                                        <TextBlock Text="Everything is up to date"
-                                                   Style="{StaticResource TraySectionHeaderStyle}"
-                                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
-                                                   TextWrapping="Wrap" />
-                                    </StackPanel>
+                                <Grid>
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                  HorizontalScrollMode="Disabled"
+                                                  HorizontalScrollBarVisibility="Disabled">
+                                        <StackPanel Spacing="8">
                                     <TextBlock Text="{x:Bind ViewModel.ActivityStateText, Mode=OneWay}"
                                                Style="{StaticResource CaptionTextBlockStyle}"
                                                Opacity="0.8"
@@ -330,7 +295,35 @@
                                             HorizontalAlignment="Left"
                                             Command="{x:Bind ViewModel.LoadMoreActivityCommand}"
                                             Visibility="{Binding HasMoreActivity, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                </StackPanel>
+                                        </StackPanel>
+                                    </ScrollViewer>
+                                    <Grid AutomationProperties.AutomationId="AllSyncedAnimation"
+                                          AutomationProperties.Name="Everything is up to date"
+                                          Visibility="{Binding IsAllSynced, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                        <StackPanel HorizontalAlignment="Center"
+                                                    VerticalAlignment="Center"
+                                                    Spacing="12"
+                                                    MaxWidth="280">
+                                            <Image x:Name="AllSyncedImage"
+                                                   Width="96" Height="96"
+                                                   Stretch="Uniform"
+                                                   ImageOpened="OnAllSyncedImageOpened">
+                                                <Image.Source>
+                                                    <BitmapImage x:Name="AllSyncedAnimationSource"
+                                                                 UriSource="ms-appx:///Assets/VibingHuggy.gif"
+                                                                 DecodePixelWidth="256"
+                                                                 AutoPlay="False" />
+                                                </Image.Source>
+                                            </Image>
+                                            <TextBlock Text="{x:Bind ViewModel.AllSyncedText, Mode=OneWay}"
+                                                       Style="{StaticResource SubtitleTextBlockStyle}"
+                                                       Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                                       HorizontalAlignment="Center"
+                                                       TextAlignment="Center"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Grid>
+                                </Grid>
                             </Border>
                         <RadioButton Grid.Row="0" Grid.Column="1"
                                      GroupName="ActivityTabs"
@@ -340,11 +333,15 @@
                                      AutomationProperties.Name="Recent activity"
                                      />
                             <Border Grid.Row="1" Grid.ColumnSpan="2"
+                                    VerticalAlignment="Stretch"
                                     Visibility="{Binding IsHistoryTabSelected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
                                     Style="{StaticResource TrayCardBorderStyle}"
                                     AutomationProperties.AutomationId="TrayHistory"
                                     AutomationProperties.Name="Recent activity">
-                                <StackPanel Spacing="8">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollMode="Disabled"
+                                              HorizontalScrollBarVisibility="Disabled">
+                                    <StackPanel Spacing="8">
                                     <TextBlock Text="{x:Bind ViewModel.HistoryStateText, Mode=OneWay}"
                                                Style="{StaticResource CaptionTextBlockStyle}"
                                                Opacity="0.8"
@@ -372,12 +369,14 @@
                                             HorizontalAlignment="Left"
                                             Command="{x:Bind ViewModel.LoadMoreHistoryCommand}"
                                             Visibility="{Binding HasMoreHistory, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                </StackPanel>
+                                    </StackPanel>
+                                </ScrollViewer>
                             </Border>
                     </Grid>
 
                     <!-- Provider capability gap for live activity (old provider). -->
-                    <StackPanel Spacing="8"
+                    <StackPanel Grid.Row="3"
+                                Spacing="8"
                                 Visibility="{Binding IsFeatureUnavailable, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
                         <TextBlock Style="{StaticResource TraySectionHeaderStyle}"
                                    Text="Provider update required"
@@ -386,11 +385,8 @@
                                    TextWrapping="Wrap"
                                    Opacity="0.8" />
                     </StackPanel>
-
-
-                </StackPanel>
-            </StackPanel>
-        </ScrollViewer>
+                </Grid>
+        </Grid>
 
         <!-- ── Sticky issues: always above the footer, never lost in history ── -->
         <Border Grid.Row="2"

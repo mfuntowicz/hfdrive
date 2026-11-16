@@ -638,6 +638,10 @@ public sealed partial class TrayWindow : Window
             UpdateAnimation();
             UpdateTooltip();
         }
+        else if (e.PropertyName == nameof(TrayViewModel.IsSyncingTabSelected))
+        {
+            UpdateAnimation();
+        }
         else if (e.PropertyName == nameof(TrayViewModel.AvatarUri))
         {
             UpdateAvatarImage();
@@ -649,14 +653,15 @@ public sealed partial class TrayWindow : Window
     }
 
     /// <summary>
-    /// Plays VibingHuggy only while the panel is visible, the system allows
-    /// animations and <see cref="TrayViewModel.IsAllSynced"/> proves every
-    /// configured connection is genuinely up to date. Within one continuous
-    /// all-synced state the celebration plays exactly twice — the asset is
-    /// 121 frames × 40 ms = 4.84 s per play, so the total budget is 9.68 s of
-    /// animated playback. Hiding the panel or disabling animations pauses
-    /// playback without discarding elapsed playback; resuming continues the
-    /// same budget and can never exceed it. Ordinary PropertyChanged and
+    /// Plays VibingHuggy only while the panel's Syncing tab is visible, the
+    /// system allows animations and <see cref="TrayViewModel.IsAllSynced"/>
+    /// proves every configured connection is genuinely up to date. Within one
+    /// continuous all-synced state the celebration plays exactly twice — the
+    /// asset is 121 frames × 40 ms = 4.84 s per play, so the total budget is
+    /// 9.68 s of animated playback. Hiding the panel, selecting Recent activity,
+    /// or disabling animations pauses playback without discarding elapsed
+    /// playback; resuming continues the same budget and can never exceed it.
+    /// Ordinary PropertyChanged and
     /// status polls call this repeatedly and never restart playback; only a
     /// genuine non-all-synced → all-synced transition starts a fresh two plays.
     /// </summary>
@@ -681,6 +686,7 @@ public sealed partial class TrayWindow : Window
         }
 
         bool eligible = _isShown
+            && _viewModel.IsSyncingTabSelected
             && _uiSettings.AnimationsEnabled
             && AllSyncedAnimationSource.IsAnimatedBitmap;
         if (!eligible || _celebrationElapsed.Elapsed >= CelebrationBudget)

@@ -668,3 +668,26 @@ Evidence: `artifacts/acceptance/activity-layout-sync.json`,
 `activity-layout-sync.png`, `activity-layout-history.json`,
 `activity-layout-history.png`, and `compact-animation.json`. The temporary
 layout and animation probes were removed after verification.
+
+## Inline idle celebration — 2026-11-16
+
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 175/175.
+  Evidence: `artifacts/tests/tray-inline-celebration-build.log` and
+  `tray-inline-celebration-tests.log`.
+- **passed** — the separate celebration banner is removed. Both tab cards grew
+  from 275px to 357px high (+82px). Syncing now centers a 96×96 Huggy GIF and a
+  single “Everything is up to date” message only in the proven idle state;
+  Recent activity uses the same full-height, independently scrolling card.
+  Issues and all footer actions remain fixed and visible.
+- **passed** — fresh-play frame hashes differed on Syncing. After Recent
+  activity remained selected for eight seconds, returning to Syncing produced
+  new frames rather than an exhausted/restarted animation; late frames were
+  identical after the bounded visible-play budget. This verifies tab-hidden
+  pause/resume and bounded playback on the actual window.
+- No settings, provider sync state, or remote resources were mutated.
+
+Evidence: `artifacts/acceptance/inline-celebration-sync.json`,
+`inline-celebration-sync.png`, `inline-celebration-history-scrolled.json`,
+`inline-celebration-history-scrolled.png`, and `inline-animation.json`. The
+temporary layout and animation probes were removed after verification.
