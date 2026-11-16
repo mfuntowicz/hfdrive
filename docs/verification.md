@@ -754,3 +754,22 @@ after verification.
 Evidence: `artifacts/acceptance/selected-conflict-colors.png` and
 `selected-conflict-colors.png.json`. The temporary visual probe was removed
 after verification.
+
+## Selected conflict typography — 2026-11-16
+
+- **fixed** — the Selected conflict placeholder/detail no longer uses a nested
+  code-style container or `Consolas`. It is ordinary selectable Fluent body
+  text, consistent with the surrounding Operations content.
+- **passed** — final Debug/x64 desktop solution build with locked restore
+  completed with zero errors; managed protocol/tray/settings tests passed
+  178/178. Evidence: `artifacts/tests/selected-conflict-typography-build.log`
+  and `selected-conflict-typography-tests.log`.
+- **passed** — the actual trusted Debug Advanced page rendered the normal-font
+  placeholder directly on the page's neutral card (`#34322E` sample), with no
+  nested detail surface. No conflict was loaded or resolved. A debugger-owned
+  output lock was handled without terminating that session; the final build
+  used the normal trusted output after that process exited.
+
+Evidence: `artifacts/acceptance/selected-conflict-typography.png` and
+`selected-conflict-typography.png.json`. The temporary visual probe and isolated
+build output were removed after verification.

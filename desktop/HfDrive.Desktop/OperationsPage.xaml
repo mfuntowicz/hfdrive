@@ -179,17 +179,10 @@
                     <TextBlock Text="Selected conflict"
                                Style="{StaticResource BodyStrongTextBlockStyle}"
                                TextWrapping="Wrap" />
-                    <Border Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
-                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                            BorderThickness="1"
-                            CornerRadius="6"
-                            Padding="12">
-                        <TextBlock Text="{x:Bind ViewModel.SelectedConflictDetailText, Mode=OneWay}"
-                                   TextWrapping="Wrap"
-                                   FontFamily="Consolas"
-                                   FontSize="12"
-                                   IsTextSelectionEnabled="True" />
-                    </Border>
+                    <TextBlock Text="{x:Bind ViewModel.SelectedConflictDetailText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               FontSize="12"
+                               IsTextSelectionEnabled="True" />
 
                     <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
                                Text="Keep local publishes the local version, keep remote keeps the remote version (unsynchronized local bytes are preserved for recovery first), and keep both retains both under the recorded conflict name." />
