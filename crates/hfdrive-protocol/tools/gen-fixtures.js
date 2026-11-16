@@ -52,6 +52,7 @@ function stringFor(name) {
     case "bucket": case "bucket_name": case "name": return "hfdrive-test-bucket";
     case "bucket_id": return "6581f0d3a1b2c3d4e5f60719";
     case "display_name": return "Acme Labs";
+    case "avatar_url": return "https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg";
     case "account_key": return SAMPLE_ACCOUNT_KEY;
     case "issuer": return "https://huggingface.co";
     case "subject": return "test-person";

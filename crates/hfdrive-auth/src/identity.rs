@@ -52,6 +52,36 @@ pub struct VerifiedOrg {
     pub consented_this_session: bool,
 }
 
+/// Trusted avatar host root: `huggingface.co` or any subdomain (the real
+/// avatar CDN is `cdn-avatars.huggingface.co`).
+const AVATAR_HOST: &str = "huggingface.co";
+
+/// Validate a verified userinfo `picture` claim for display-only use.
+///
+/// Returns the URL string only when it is HTTPS, carries no embedded
+/// username/password, and its host is exactly `huggingface.co` or a subdomain
+/// of it. Anything else (including an external host) returns `None` — this is
+/// never an identity or login failure. The URL is display-only and is never
+/// fetched here or combined with any bearer credential.
+pub(crate) fn validate_avatar_url(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(raw).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    if url.username() != "" || url.password().is_some() {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host != AVATAR_HOST && !host.ends_with(&format!(".{AVATAR_HOST}")) {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
 /// Immutable verified identity of one signed-in account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountProfile {
@@ -65,6 +95,12 @@ pub struct AccountProfile {
     /// [`Namespace`]: an absent or invalid `preferred_username` rejects the
     /// identity before publication or persistence.
     pub namespace: Namespace,
+    /// Verified public avatar URL for display only (validated HTTPS
+    /// `huggingface.co`/subdomain, no embedded credentials). `None` when the
+    /// verified userinfo `picture` claim is absent or rejected — never a
+    /// credential and never required for identity or login.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
     /// Verified organization connections.
     pub orgs: Vec<VerifiedOrg>,
     /// Granted scopes, as returned by the token endpoint, or `None` when the
@@ -90,6 +126,26 @@ impl AccountProfile {
         self.orgs.iter().any(|o| o.subject == org_sub)
     }
 
+    /// Authorization-relevant equality: every field **except** the
+    /// display-only `avatar_url`.
+    ///
+    /// Credential refresh compares this, never derived equality, so a
+    /// display-only avatar difference (an omitted `picture` claim on one
+    /// userinfo response, or a restored-record backfill) can never count as an
+    /// authorization change, advance the authorization epoch, or revoke
+    /// leases.
+    pub(crate) fn same_authorization(&self, other: &Self) -> bool {
+        self.account_key == other.account_key
+            && self.issuer == other.issuer
+            && self.subject == other.subject
+            && self.namespace == other.namespace
+            && self.orgs == other.orgs
+            && self.granted_scopes == other.granted_scopes
+            && self.purpose_covered == other.purpose_covered
+            && self.org_consent_requested == other.org_consent_requested
+            && self.reconsent_required_for_storage == other.reconsent_required_for_storage
+    }
+
     /// Sanitized projection suitable for protocol/status surfaces: contains
     /// no tokens, codes or verifiers by construction.
     pub fn summary(&self) -> AccountProfileSummary {
@@ -98,6 +154,7 @@ impl AccountProfile {
             issuer: self.issuer.clone(),
             subject: self.subject.clone(),
             namespace: self.namespace.as_str().to_owned(),
+            avatar_url: validate_avatar_url(self.avatar_url.as_deref()),
             orgs: self
                 .orgs
                 .iter()
@@ -124,6 +181,9 @@ pub struct AccountProfileSummary {
     pub subject: String,
     /// Verified canonical personal namespace (validated).
     pub namespace: String,
+    /// Validated display-only avatar URL (`https` `huggingface.co`/subdomain).
+    /// Absent when unknown or rejected; never a credential.
+    pub avatar_url: Option<String>,
     /// Verified organizations (display hints).
     pub orgs: Vec<OrgCandidate>,
     /// Granted scopes or `None` when unknown.
@@ -174,5 +234,58 @@ impl ExtraClaims {
             });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_avatar_url;
+
+    #[test]
+    fn accepts_https_huggingface_root_and_avatar_cdn() {
+        assert_eq!(
+            validate_avatar_url(Some("https://huggingface.co/avatar.png")).as_deref(),
+            Some("https://huggingface.co/avatar.png")
+        );
+        // The real avatar host observed in production.
+        assert_eq!(
+            validate_avatar_url(Some(
+                "https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg"
+            ))
+            .as_deref(),
+            Some("https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg")
+        );
+    }
+
+    #[test]
+    fn rejects_http_external_and_embedded_credentials() {
+        // Plain HTTP is never accepted.
+        assert_eq!(validate_avatar_url(Some("http://huggingface.co/avatar.png")), None);
+        // External hosts are dropped, never fetched or authorized.
+        assert_eq!(
+            validate_avatar_url(Some("https://evil.example.com/avatar.png")),
+            None
+        );
+        assert_eq!(
+            validate_avatar_url(Some("https://huggingface.co.evil.example.com/a.png")),
+            None
+        );
+        // Embedded username/password is rejected.
+        assert_eq!(
+            validate_avatar_url(Some("https://user:pass@huggingface.co/avatar.png")),
+            None
+        );
+        assert_eq!(
+            validate_avatar_url(Some("https://user@huggingface.co/avatar.png")),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_claim_is_none_not_an_error() {
+        assert_eq!(validate_avatar_url(None), None);
+        assert_eq!(validate_avatar_url(Some("")), None);
+        assert_eq!(validate_avatar_url(Some("   ")), None);
+        assert_eq!(validate_avatar_url(Some("not a url")), None);
     }
 }

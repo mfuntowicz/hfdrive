@@ -589,6 +589,7 @@ mod tests {
             issuer: ISSUER.to_owned(),
             subject: SUBJECT.to_owned(),
             namespace: Namespace::new("repair-person".to_owned()).unwrap(),
+            avatar_url: None,
             orgs: Vec::new(),
             granted_scopes: Some(Vec::new()),
             purpose_covered: true,

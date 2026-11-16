@@ -78,6 +78,17 @@
         "display_name": {
           "type": "string"
         },
+        "avatar_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
         "granted_scopes": {
           "anyOf": [
             {

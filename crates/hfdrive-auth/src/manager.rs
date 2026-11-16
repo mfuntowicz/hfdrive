@@ -36,7 +36,7 @@ use crate::config::{self, AuthConfig, OidcSettings};
 use crate::discovery::{self, Provider};
 use crate::error::{self, AuthError};
 use crate::flows::{self, CodeClient, HfTokenResponse};
-use crate::identity::{AccountProfile, OrgCandidate, VerifiedOrg};
+use crate::identity::{validate_avatar_url, AccountProfile, OrgCandidate, VerifiedOrg};
 use crate::login::{LoginFlow, LoginPurpose, LoginRequest, LoginSession, LoginState};
 use crate::store::{account_credentials_dir, AccountCredentialStore, CredentialEnvelope, ENVELOPE_SCHEMA};
 use crate::{AuthorizationAuthority, AuthorizationLease, SecretAccessToken, TokenSource};
@@ -276,6 +276,104 @@ impl AuthManager {
         self.set_last_error(needs_sign_in.then_some(AuthError::NeedsSignIn));
         self.publish();
         Ok(profile)
+    }
+
+    /// Run-local display backfill for one restored session.
+    ///
+    /// A credential envelope written before `avatar_url` existed restores with
+    /// the avatar absent, so the account status would show the fallback avatar
+    /// until a future login/refresh. This performs **one** bounded lookup
+    /// against the already discovered/validated userinfo endpoint — the same
+    /// verified route and subject agreement as login/refresh, through the same
+    /// bounded HTTP path, but bearer-only so it works with no OAuth client id
+    /// configured — and fills only the in-memory profile's `avatar_url`.
+    ///
+    /// It never rotates or rewrites tokens/envelopes and never touches the
+    /// authorization epoch: it borrows the session's current access token
+    /// directly (only while unexpired) for that one userinfo call — the
+    /// `Self::access_token` boundary is never invoked, so the refresh path
+    /// (token rotation, envelope rewrite, `invalid_grant` sign-in marking) is
+    /// unreachable by construction. Any failure — including an unusable
+    /// session — resolves to "no avatar", never to sign-out or a capability
+    /// change. The fetched bearer is sent only to the trusted HF userinfo
+    /// endpoint, never to the avatar URL.
+    ///
+    /// Idempotent: returns immediately when the profile already has a
+    /// validated avatar. Callers bound the attempt per provider run.
+    pub async fn backfill_avatar(&self, account: AccountKey) {
+        if self.0.signing_out.load(Ordering::SeqCst)
+            || *lock(&self.0.active) != Some(account)
+        {
+            return;
+        }
+        let Some(entry) = self.entry_opt(account) else { return };
+        let (subject, bearer) = {
+            let shared = lock(&entry.shared);
+            if shared.needs_sign_in || shared.profile.avatar_url.is_some() {
+                return;
+            }
+            // Display-only: borrow the session token as-is whenever it is
+            // merely unexpired — the proactive refresh deadline is irrelevant
+            // here. The token is used directly for the one userinfo call and
+            // `Self::access_token` is never invoked, so no refresh (token
+            // rotation, envelope rewrite, `NeedsSignIn` marking) is reachable.
+            let now = unix_now();
+            let Some(bearer) = shared.token.clone() else { return };
+            if now >= bearer.expires_at() {
+                return;
+            }
+            (shared.profile.subject.clone(), bearer)
+        };
+        let fetched = async {
+            let provider = self.provider().await?;
+            // The metadata endpoint is already discovered and strictly
+            // validated (trusted host, HTTPS, no redirects) at discovery time.
+            let userinfo_endpoint = provider
+                .metadata
+                .userinfo_endpoint()
+                .ok_or(AuthError::ProviderMetadata)?;
+            let http = self.http_client()?;
+            // Bearer-only fetch: no CodeClient and no client id — a restored
+            // session must backfill even when `HFDRIVE_OAUTH_CLIENT_ID` is
+            // absent. Subject agreement is enforced by the same parser.
+            let userinfo = flows::fetch_userinfo_bearer(
+                userinfo_endpoint.as_str(),
+                &http,
+                bearer.as_str(),
+                &subject,
+            )
+            .await?;
+            Ok::<_, AuthError>(flows::avatar_from_userinfo(&userinfo))
+        }
+        .await;
+        // Failure is avatar absence: never a sign-in or capability failure.
+        // Only the sanitized error variant is logged (AuthError carries no
+        // token, URL, or HTTP body).
+        let avatar_url = match fetched {
+            Ok(Some(avatar_url)) => Some(avatar_url),
+            Ok(None) => {
+                tracing::debug!("avatar backfill: no valid avatar claim; keeping fallback");
+                None
+            }
+            Err(error) => {
+                tracing::debug!(error = ?error, "avatar backfill failed; keeping fallback");
+                None
+            }
+        };
+        let Some(avatar_url) = avatar_url else { return };
+        {
+            // Only the restored session this fetch started from is updated; a
+            // concurrent login/replacement entry keeps its own verified value.
+            let Some(current) = self.entry_opt(account) else { return };
+            if !Arc::ptr_eq(&current, &entry) { return; }
+            let mut shared = lock(&current.shared);
+            // Never clobber a value that login/refresh produced meanwhile.
+            if shared.needs_sign_in || shared.profile.avatar_url.is_some() {
+                return;
+            }
+            shared.profile.avatar_url = Some(avatar_url);
+        }
+        self.publish();
     }
 
     /// Start one login session. Only one may be outstanding at a time; the
@@ -689,6 +787,7 @@ impl AuthManager {
             issuer: identity.issuer.clone(),
             subject: identity.subject.clone(),
             namespace: profile.namespace.as_str().to_owned(),
+            avatar_url: validate_avatar_url(profile.avatar_url.as_deref()),
             orgs: profile
                 .orgs
                 .iter()
@@ -958,11 +1057,17 @@ impl AuthManager {
         {
             let shared = lock(&entry.shared);
             profile.org_consent_requested = shared.profile.org_consent_requested;
+            // Display-only: an omitted `picture` claim on this userinfo
+            // response must not drop the already-verified avatar (it is not
+            // authorization state, so it never advances the epoch below).
+            if profile.avatar_url.is_none() {
+                profile.avatar_url = shared.profile.avatar_url.clone();
+            }
             for org in &mut profile.orgs {
                 org.consented_this_session = shared.profile.orgs.iter()
                     .any(|old| old.subject == org.subject && old.consented_this_session);
             }
-            authorization_changed = profile != shared.profile;
+            authorization_changed = !profile.same_authorization(&shared.profile);
             let epoch = entry.authority.current_epoch().map_err(|_| AuthError::Internal)?;
             authorization_epoch = epoch.checked_add(u64::from(authorization_changed)).ok_or(AuthError::Internal)?;
         }
@@ -975,6 +1080,7 @@ impl AuthManager {
                 issuer: entry.issuer.clone(),
                 subject: entry.subject.clone(),
                 namespace: profile.namespace.as_str().to_owned(),
+                avatar_url: validate_avatar_url(profile.avatar_url.as_deref()),
                 orgs: profile.orgs
                     .iter()
                     .map(|org| OrgCandidate {
@@ -1106,6 +1212,7 @@ fn profile_from_envelope(envelope: &CredentialEnvelope) -> Result<AccountProfile
             })
             .collect(),
         granted_scopes: envelope.granted_scopes.clone(),
+        avatar_url: validate_avatar_url(envelope.avatar_url.as_deref()),
         purpose_covered: config::purpose_covered(
             envelope.covered_purpose,
             envelope.granted_scopes.as_deref(),

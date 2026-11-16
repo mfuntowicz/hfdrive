@@ -45,6 +45,12 @@ pub struct CredentialEnvelope {
     pub subject: String,
     /// Verified canonical personal namespace (validated at build/restore).
     pub namespace: String,
+    /// Validated display-only avatar URL (HTTPS `huggingface.co`/subdomain,
+    /// no embedded credentials). `None` when unknown/rejected. `default` keeps
+    /// records written before this field readable — absence restores as
+    /// `None` and never fails the account. Never a credential; never logged.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
     /// Verified organization display identity.
     pub orgs: Vec<OrgCandidate>,
     /// Granted scopes; `None` means unknown, never "proven empty".
@@ -76,6 +82,7 @@ impl std::fmt::Debug for CredentialEnvelope {
             .field("issuer", &self.issuer)
             .field("subject", &self.subject)
             .field("namespace", &self.namespace)
+            .field("avatar_url", &self.avatar_url)
             .field("orgs", &self.orgs)
             .field("granted_scopes", &self.granted_scopes)
             .field("covered_purpose", &self.covered_purpose)
@@ -202,4 +209,44 @@ pub fn account_credentials_dir(state_base: &std::path::Path, account: AccountKey
     hfdrive_state::StatePaths::new(state_base.to_owned())
         .account(account)
         .credentials()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record written before `avatar_url` existed must still restore, with
+    /// the avatar absent rather than the account failing to load.
+    #[test]
+    fn envelopes_without_avatar_url_still_deserialize_as_none() {
+        let old = br#"{
+            "schema": 1,
+            "issuer": "https://huggingface.co",
+            "subject": "fixture-subject",
+            "namespace": "fixture-person",
+            "orgs": [],
+            "granted_scopes": ["openid", "profile"],
+            "covered_purpose": "write_storage",
+            "login_flow": "pkce",
+            "generation": 3,
+            "authorization_epoch": 1,
+            "lifetime_secs": 3600,
+            "expires_at": 4000000000,
+            "access_token": "fixture-access-token",
+            "refresh_token": null
+        }"#;
+        let envelope: CredentialEnvelope =
+            serde_json::from_slice(old).expect("pre-avatar envelope stays readable");
+        assert_eq!(envelope.avatar_url, None);
+        assert_eq!(envelope.subject, "fixture-subject");
+
+        // A new record round-trips its validated avatar unchanged.
+        let mut new = envelope;
+        new.avatar_url =
+            Some("https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg".to_owned());
+        let bytes = serde_json::to_vec(&new).expect("envelope serializes");
+        let restored: CredentialEnvelope =
+            serde_json::from_slice(&bytes).expect("envelope round-trips");
+        assert_eq!(restored.avatar_url, new.avatar_url);
+    }
 }

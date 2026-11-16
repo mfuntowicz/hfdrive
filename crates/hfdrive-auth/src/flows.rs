@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::error::AuthError;
 use crate::http;
-use crate::identity::{AccountProfile, ExtraClaims, VerifiedOrg};
+use crate::identity::{validate_avatar_url, AccountProfile, ExtraClaims, VerifiedOrg};
 use crate::login::{LoginFlow, LoginPurpose, LoginRequest};
 use crate::protocol::{self, CallbackCheck, MAX_CALLBACK_REQUEST_BYTES};
 
@@ -439,10 +439,76 @@ pub(crate) async fn fetch_userinfo(
         .await
         .map_err(|error| match error {
             openidconnect::UserInfoError::Request(_) => AuthError::TokenEndpoint,
-            openidconnect::UserInfoError::Response(status, _, _)
-                if status.is_server_error() || status.as_u16() == 429 => AuthError::TokenEndpoint,
+            openidconnect::UserInfoError::Response(status, _, _) => userinfo_status_error(status),
             _ => AuthError::IdentityValidation,
         })
+}
+
+/// Fetch userinfo against the **already discovered and validated** metadata
+/// endpoint using only the bearer token — no OAuth client id and no
+/// `CodeClient`. Used by the display-only avatar backfill on restored sessions
+/// that predate client configuration; the same bounded request/response rules
+/// apply (no redirects, bounded body, sanitized errors).
+pub(crate) async fn fetch_userinfo_bearer(
+    userinfo_endpoint: &str,
+    http: &reqwest::Client,
+    access_token: &str,
+    expected_subject: &str,
+) -> Result<HfUserInfoClaims, AuthError> {
+    let request = openidconnect::http::Request::builder()
+        .method(openidconnect::http::Method::GET)
+        .uri(userinfo_endpoint)
+        .header(
+            openidconnect::http::header::AUTHORIZATION,
+            format!("Bearer {access_token}"),
+        )
+        .header(openidconnect::http::header::ACCEPT, "application/json")
+        .body(Vec::new())
+        .map_err(|_| AuthError::ProviderMetadata)?;
+    let response = http::send_bounded(http, request, http::MAX_OIDC_RESPONSE_BYTES)
+        .await
+        .map_err(|_| AuthError::TokenEndpoint)?;
+    userinfo_from_response(response.status(), response.body(), expected_subject)
+}
+
+/// Parse one bounded userinfo response with strict subject agreement, mapping
+/// failures to the same sanitized errors as the `CodeClient` path — never a
+/// body, URL or token.
+fn userinfo_from_response(
+    status: openidconnect::http::StatusCode,
+    body: &[u8],
+    expected_subject: &str,
+) -> Result<HfUserInfoClaims, AuthError> {
+    if !status.is_success() {
+        return Err(userinfo_status_error(status));
+    }
+    HfUserInfoClaims::from_json::<serde_json::Error>(
+        body,
+        Some(&SubjectIdentifier::new(expected_subject.to_owned())),
+    )
+    .map_err(|_| AuthError::IdentityValidation)
+}
+
+/// Userinfo status mapping shared by both fetch paths: server errors and 429
+/// are transport-side, every other failure is an identity rejection.
+fn userinfo_status_error(status: openidconnect::http::StatusCode) -> AuthError {
+    if status.is_server_error() || status.as_u16() == 429 {
+        AuthError::TokenEndpoint
+    } else {
+        AuthError::IdentityValidation
+    }
+}
+
+/// Extract and validate the display-only avatar from verified userinfo.
+///
+/// This is the single extraction path shared by login, refresh and the
+/// restored-session avatar backfill: the standard OIDC `picture` claim's
+/// unlocalized value, validated to HTTPS `huggingface.co`/subdomain with no
+/// embedded credentials. Absent or rejected claims are `None` — never an
+/// identity or login failure, and never combined with a bearer credential.
+pub(crate) fn avatar_from_userinfo(userinfo: &HfUserInfoClaims) -> Option<String> {
+    let raw_picture = userinfo.standard_claims().picture().and_then(|p| p.get(None));
+    validate_avatar_url(raw_picture.map(|u| u.as_str()))
 }
 
 /// Build the immutable verified profile.
@@ -477,6 +543,11 @@ pub(crate) fn build_profile(
         .ok_or(AuthError::IdentityValidation)
         .and_then(|raw| Namespace::new(raw).map_err(|_| AuthError::IdentityValidation))?;
 
+    // Display-only: the standard OIDC `picture` claim, validated to HTTPS
+    // `huggingface.co`/subdomain without embedded credentials. An absent or
+    // rejected claim is `None`, never an identity/login failure.
+    let avatar_url = avatar_from_userinfo(userinfo);
+
     let mut orgs: Vec<VerifiedOrg> = Vec::new();
     for source in [userinfo.additional_claims(), &identity.extra] {
         for candidate in source.org_candidates() {
@@ -507,6 +578,7 @@ pub(crate) fn build_profile(
         issuer: identity.issuer.clone(),
         subject: identity.subject.clone(),
         namespace,
+        avatar_url,
         orgs,
         granted_scopes,
         purpose_covered,
@@ -560,4 +632,106 @@ pub(crate) fn random_b64(len: usize) -> Result<String, AuthError> {
 pub(crate) fn refresh_due_at(expires_at: u64, lifetime_secs: u64) -> u64 {
     let lead = std::cmp::max(300, lifetime_secs / 10);
     expires_at.saturating_sub(lead)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{avatar_from_userinfo, fetch_userinfo_bearer, HfUserInfoClaims};
+    use crate::error::AuthError;
+
+    fn userinfo(picture: &str) -> HfUserInfoClaims {
+        let json = format!(
+            r#"{{"sub":"fixture-subject","preferred_username":"fixture-person","picture":"{picture}"}}"#
+        );
+        HfUserInfoClaims::from_json::<serde_json::Error>(json.as_bytes(), None)
+            .expect("fixture userinfo parses")
+    }
+
+    /// Minimal deterministic userinfo responder: returns `body` and records
+    /// whether the request carried a bearer Authorization header.
+    async fn userinfo_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/userinfo", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            // Prove the bearer-only shape: Authorization present, no client_id.
+            let request = String::from_utf8_lossy(&buf);
+            assert!(request.starts_with("GET /userinfo"));
+            assert!(request.to_ascii_lowercase().contains("authorization: bearer"));
+            assert!(!request.contains("client_id"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        endpoint
+    }
+
+    #[tokio::test]
+    async fn bearer_only_userinfo_needs_no_oauth_client_id() {
+        // The restored-session backfill path: no CodeClient and no client id
+        // anywhere — just the discovered endpoint and the bearer token.
+        let endpoint = userinfo_server(
+            r#"{"sub":"fixture-subject","preferred_username":"fixture-person",
+                "picture":"https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg"}"#,
+        )
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let claims =
+            fetch_userinfo_bearer(&endpoint, &client, "fixture-bearer", "fixture-subject")
+                .await
+                .expect("bearer-only fetch succeeds");
+        assert_eq!(
+            avatar_from_userinfo(&claims).as_deref(),
+            Some("https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg")
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_only_userinfo_enforces_subject_agreement() {
+        let endpoint = userinfo_server(
+            r#"{"sub":"someone-else","preferred_username":"fixture-person",
+                "picture":"https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg"}"#,
+        )
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let outcome =
+            fetch_userinfo_bearer(&endpoint, &client, "fixture-bearer", "fixture-subject").await;
+        assert_eq!(outcome.unwrap_err(), AuthError::IdentityValidation);
+    }
+
+    #[test]
+    fn userinfo_picture_is_extracted_and_validated() {
+        // The real avatar host observed in production.
+        let claims = userinfo("https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg");
+        assert_eq!(
+            avatar_from_userinfo(&claims).as_deref(),
+            Some("https://cdn-avatars.huggingface.co/v1/production/uploads/a.jpeg")
+        );
+        // External and HTTP claims validate away to absence, not an error.
+        assert_eq!(avatar_from_userinfo(&userinfo("https://evil.example.com/a.png")), None);
+        assert_eq!(avatar_from_userinfo(&userinfo("http://huggingface.co/a.png")), None);
+    }
+
+    #[test]
+    fn absent_or_malformed_picture_never_fails_the_identity() {
+        let json = br#"{"sub":"fixture-subject","preferred_username":"fixture-person"}"#;
+        let claims = HfUserInfoClaims::from_json::<serde_json::Error>(json, None)
+            .expect("fixture userinfo parses");
+        assert_eq!(avatar_from_userinfo(&claims), None);
+
+        assert_eq!(avatar_from_userinfo(&userinfo("not a url")), None);
+    }
 }

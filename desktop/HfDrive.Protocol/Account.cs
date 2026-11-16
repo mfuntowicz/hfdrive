@@ -16,6 +16,11 @@ public sealed record AccountProfile
     public required string Subject { get; init; }
     public required string Namespace { get; init; }
     public required string DisplayName { get; init; }
+    /// <summary>
+    /// Verified public avatar URL for display only (HTTPS huggingface.co or a subdomain,
+    /// no embedded credentials). Null when unknown or rejected; never a credential.
+    /// </summary>
+    public string? AvatarUrl { get; init; }
     /// <summary>Actual returned grants; null means unknown, not known empty.</summary>
     public IReadOnlyList<string>? GrantedScopes { get; init; }
 }

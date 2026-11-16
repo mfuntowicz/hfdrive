@@ -74,7 +74,17 @@ impl Provider {
 
     pub async fn observe_accounts(self: Arc<Self>) {
         let mut receiver = self.auth.watch();
+        // At most one display-avatar backfill per provider run, for a session
+        // restored without one. Failures stay a fallback avatar: no retry, no
+        // error propagation.
+        let mut avatar_backfill_attempted = false;
         loop {
+            if !avatar_backfill_attempted {
+                if let Some(profile) = self.auth.active_profile() {
+                    avatar_backfill_attempted = true;
+                    self.auth.backfill_avatar(profile.account_key).await;
+                }
+            }
             if let Err(error) = self.synchronize_account().await {
                 // Synchronizing the account failed and its token epoch was
                 // cleared: the session needs a new interactive grant.

@@ -50,6 +50,10 @@ pub struct AccountProfile {
     pub namespace: String,
     /// Display-only user name.
     pub display_name: String,
+    /// Verified public avatar URL for display only (HTTPS `huggingface.co` or a
+    /// subdomain, no embedded credentials). Absent when unknown or rejected;
+    /// never a credential and never required for identity or login.
+    pub avatar_url: Option<String>,
     /// Actual returned grants; absent means unknown, not a known empty grant set.
     pub granted_scopes: Option<Vec<String>>,
 }

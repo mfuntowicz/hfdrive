@@ -3,6 +3,7 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Foundation;
 using Windows.Graphics;
 using Windows.UI.ViewManagement;
@@ -31,11 +32,12 @@ public sealed class BoolToVisibilityConverter : Microsoft.UI.Xaml.Data.IValueCon
 /// <c>Interop.WindowChrome.ApplyFluentFrame</c>, anchored to the notification
 /// icon's monitor work area. Every displayed value comes from
 /// the shared provider session through <see cref="TrayViewModel"/>; there is no
-/// synthetic sync state here. The panel polls only while visible, stops the
-/// VibingHuggy celebration whenever it is hidden or the system disables
-/// animations, and shows explicit loading/disconnected/setup/unavailable/empty
-/// and failed states. Escape or deactivation hides it; the window never takes a
-/// taskbar/Alt-Tab entry (WS_EX_TOOLWINDOW).
+/// synthetic sync state here. The panel polls only while visible, pauses the
+/// VibingHuggy celebration (within its fixed two-play budget) whenever it is
+/// hidden or the system disables animations, and shows explicit
+/// loading/disconnected/setup/unavailable/empty and failed states. Escape or
+/// deactivation hides it; the window never takes a taskbar/Alt-Tab entry
+/// (WS_EX_TOOLWINDOW).
 /// </summary>
 public sealed partial class TrayWindow : Window
 {
@@ -84,6 +86,47 @@ public sealed partial class TrayWindow : Window
     /// and Tick only), so lifecycle control is Stop on hide plus
     /// Stop/detach/drop at disposal.</summary>
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _dismissTimer;
+    /// <summary>
+    /// Celebration playback budget for one continuous all-synced state: the
+    /// VibingHuggy asset is 121 frames × 40 ms = 4.84 s per play, so exactly
+    /// two plays are 9.68 s of animated playback. The budget is measured by
+    /// <see cref="_celebrationElapsed"/> (a Stopwatch that runs only while the
+    /// GIF is actually playing), never by wall clock or restart counts.
+    /// </summary>
+    private static readonly TimeSpan CelebrationBudget = TimeSpan.FromMilliseconds(9_680);
+
+    /// <summary>Watchdog cadence that stops playback exactly at the budget
+    /// boundary even when no other UI event fires.</summary>
+    private static readonly TimeSpan CelebrationTick = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Elapsed animated playback of the current celebration cycle. Runs only
+    /// while the GIF plays: hiding the panel or disabling animations stops it
+    /// (pause), and resuming continues the same budget — never a restart.
+    /// </summary>
+    private readonly Stopwatch _celebrationElapsed = new();
+
+    /// <summary>True from a genuine non-all-synced → all-synced transition
+    /// until <see cref="TrayViewModel.IsAllSynced"/> turns false again; only
+    /// such a transition starts a fresh two-play budget.</summary>
+    private bool _celebrationCycleActive;
+
+    /// <summary>True while the GIF is playing within the current budget.</summary>
+    private bool _celebrationPlaying;
+
+    /// <summary>Repeating watchdog for the celebration budget. The projected
+    /// <c>DispatcherQueueTimer</c> has no Dispose: lifecycle is Stop on pause
+    /// plus Stop/detach/drop at disposal.</summary>
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _celebrationTimer;
+
+    /// <summary>
+    /// Avatar bitmap currently assigned as the account image source. Late
+    /// decode events for an older source are ignored, so a previous account's
+    /// picture can never appear for the current account. The image request is
+    /// anonymous (no credential is attached to it).
+    /// </summary>
+    private BitmapImage? _avatarImageSource;
+
     /// <summary>Cached one-shot placement after Show has settled the live DPI/layout.</summary>
     private readonly Microsoft.UI.Dispatching.DispatcherQueueHandler _finalShowPlacementHandler;
     private bool _finalShowPlacementQueued;
@@ -153,6 +196,10 @@ public sealed partial class TrayWindow : Window
             _subscribedXamlRoot = xamlRoot;
             xamlRoot.Changed += _xamlRootChangedHandler;
         }
+
+        // Reflect any avatar URI already observed before this window existed;
+        // later changes arrive through PropertyChanged.
+        UpdateAvatarImage();
     }
 
     /// <summary>The panel's view model (session-backed, provider-observed data).</summary>
@@ -267,7 +314,26 @@ public sealed partial class TrayWindow : Window
         }
         _uiSettings.AnimationsEnabledChanged -= _animationsEnabledChangedHandler;
 
+        // Celebration lifecycle teardown: stop playback, freeze the budget
+        // Stopwatch and stop/detach/drop the watchdog timer (the projected
+        // type has no Dispose) so no later callback fires into the panel.
         AllSyncedAnimationSource.Stop();
+        _celebrationPlaying = false;
+        _celebrationElapsed.Reset();
+        if (_celebrationTimer is { } celebrationTimer)
+        {
+            celebrationTimer.Stop();
+            celebrationTimer.Tick -= OnCelebrationTick;
+            _celebrationTimer = null;
+        }
+
+        // Drop the avatar source so a late decode event cannot re-show it.
+        if (_avatarImageSource is { } avatarSource)
+        {
+            DetachAvatarSource(avatarSource);
+            TrayAvatarBrush.ImageSource = null;
+            _avatarImageSource = null;
+        }
     }
 
     /// <summary>
@@ -572,6 +638,10 @@ public sealed partial class TrayWindow : Window
             UpdateAnimation();
             UpdateTooltip();
         }
+        else if (e.PropertyName == nameof(TrayViewModel.AvatarUri))
+        {
+            UpdateAvatarImage();
+        }
         else if (e.PropertyName == nameof(TrayViewModel.PanelState))
         {
             if (_viewModel.PanelState == TrayPanelState.Loading) _loadingSinceUtc = DateTime.UtcNow;
@@ -581,18 +651,90 @@ public sealed partial class TrayWindow : Window
     /// <summary>
     /// Plays VibingHuggy only while the panel is visible, the system allows
     /// animations and <see cref="TrayViewModel.IsAllSynced"/> proves every
-    /// configured connection is genuinely up to date. Hiding the panel or any
-    /// unknown/paused/error state stops the animation and its decoding.
+    /// configured connection is genuinely up to date. Within one continuous
+    /// all-synced state the celebration plays exactly twice — the asset is
+    /// 121 frames × 40 ms = 4.84 s per play, so the total budget is 9.68 s of
+    /// animated playback. Hiding the panel or disabling animations pauses
+    /// playback without discarding elapsed playback; resuming continues the
+    /// same budget and can never exceed it. Ordinary PropertyChanged and
+    /// status polls call this repeatedly and never restart playback; only a
+    /// genuine non-all-synced → all-synced transition starts a fresh two plays.
     /// </summary>
     private void UpdateAnimation()
     {
-        bool play = _isShown
-            && !_disposed
-            && _viewModel.IsAllSynced
+        if (_disposed || !_viewModel.IsAllSynced)
+        {
+            // Leaving the all-synced truth ends the cycle; the next genuine
+            // non-all-synced → all-synced transition earns a fresh two plays.
+            _celebrationCycleActive = false;
+            _celebrationElapsed.Reset();
+            SetCelebrationPlaying(false);
+            return;
+        }
+
+        if (!_celebrationCycleActive)
+        {
+            // First eligibility of a fresh cycle: reset the budget now. While
+            // the state stays all-synced, repeated calls keep this budget.
+            _celebrationCycleActive = true;
+            _celebrationElapsed.Reset();
+        }
+
+        bool eligible = _isShown
             && _uiSettings.AnimationsEnabled
             && AllSyncedAnimationSource.IsAnimatedBitmap;
-        if (play) AllSyncedAnimationSource.Play();
-        else AllSyncedAnimationSource.Stop();
+        if (!eligible || _celebrationElapsed.Elapsed >= CelebrationBudget)
+        {
+            // Pause (or finished): the elapsed playback is retained so a later
+            // resume continues the same budget instead of restarting it.
+            SetCelebrationPlaying(false);
+            return;
+        }
+        SetCelebrationPlaying(true);
+    }
+
+    /// <summary>
+    /// Starts/stops the GIF playback, the elapsed-playback Stopwatch and the
+    /// budget watchdog together. Idempotent: repeated state refreshes with an
+    /// unchanged decision are no-ops and never restart playback.
+    /// </summary>
+    private void SetCelebrationPlaying(bool play)
+    {
+        if (play == _celebrationPlaying) return;
+        _celebrationPlaying = play;
+        if (play)
+        {
+            AllSyncedAnimationSource.Play();
+            _celebrationElapsed.Start();
+            var timer = _celebrationTimer ??= CreateCelebrationTimer();
+            timer.Start();
+        }
+        else
+        {
+            AllSyncedAnimationSource.Stop();
+            _celebrationElapsed.Stop();
+            _celebrationTimer?.Stop();
+        }
+    }
+
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer CreateCelebrationTimer()
+    {
+        var timer = DispatcherQueue.CreateTimer();
+        timer.Interval = CelebrationTick;
+        timer.Tick += OnCelebrationTick;
+        return timer;
+    }
+
+    /// <summary>
+    /// Watchdog for the two-play budget: stops playback exactly when the
+    /// accumulated animated playback reaches 9.68 s, even when no other UI
+    /// event fires at that moment.
+    /// </summary>
+    private void OnCelebrationTick(Microsoft.UI.Dispatching.DispatcherQueueTimer sender, object args)
+    {
+        if (_disposed || !_celebrationPlaying) return;
+        if (_celebrationElapsed.Elapsed < CelebrationBudget) return;
+        SetCelebrationPlaying(false);
     }
 
     private void OnAllSyncedImageOpened(object sender, RoutedEventArgs e)
@@ -600,6 +742,77 @@ public sealed partial class TrayWindow : Window
         // The animated bitmap is fully decoded now; start playback only if the
         // truthful all-synced state (and animation preference) still allows it.
         UpdateAnimation();
+    }
+
+    // ── Account avatar (CatchingHuggy fallback; anonymous requests) ─────
+
+    /// <summary>
+    /// Swaps the header avatar to the view model's validated account URI.
+    /// CatchingHuggy stays visible whenever there is no URI (loading, signed
+    /// out, missing/invalid URI) or until the remote image actually opens; a
+    /// decode failure or a source for a previous account falls back to
+    /// CatchingHuggy instead of showing a stale picture. The bitmap request is
+    /// anonymous: no credential is ever attached to it.
+    /// </summary>
+    private void UpdateAvatarImage()
+    {
+        if (_disposed) return;
+        Uri? uri = _viewModel.AvatarUri;
+        if (uri is null)
+        {
+            TrayAvatarBrush.ImageSource = null;
+            _avatarImageSource = null;
+            TrayAvatarShape.Visibility = Visibility.Collapsed;
+            TrayAvatarFallbackShape.Visibility = Visibility.Visible;
+            return;
+        }
+
+        // A fresh BitmapImage per account URI. BitmapImage carries
+        // ImageOpened/ImageFailed itself, so late events from an older
+        // account's image are recognized and ignored.
+        var image = new BitmapImage(uri);
+        image.ImageOpened += OnAvatarImageOpened;
+        image.ImageFailed += OnAvatarImageFailed;
+        _avatarImageSource = image;
+        TrayAvatarBrush.ImageSource = image;
+        // Fallback stays visible until this exact source opens successfully.
+        TrayAvatarShape.Visibility = Visibility.Visible;
+        TrayAvatarFallbackShape.Visibility = Visibility.Visible;
+    }
+
+    private void OnAvatarImageOpened(object sender, RoutedEventArgs e)
+    {
+        // Only the current source may replace the fallback; a late open from a
+        // previous account's image must never show that account's picture.
+        if (_disposed || sender is not BitmapImage source
+            || !ReferenceEquals(source, _avatarImageSource))
+        {
+            return;
+        }
+        TrayAvatarFallbackShape.Visibility = Visibility.Collapsed;
+    }
+
+    private void OnAvatarImageFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        // Missing/unreachable/invalid image data: keep CatchingHuggy. The
+        // account identity itself is unaffected — an avatar failure is never
+        // an identity or login failure.
+        if (_disposed || sender is not BitmapImage source) return;
+        DetachAvatarSource(source);
+        if (ReferenceEquals(source, _avatarImageSource))
+        {
+            TrayAvatarBrush.ImageSource = null;
+            _avatarImageSource = null;
+            TrayAvatarShape.Visibility = Visibility.Collapsed;
+            TrayAvatarFallbackShape.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// <summary>Detaches the avatar bitmap's event handlers idempotently.</summary>
+    private void DetachAvatarSource(BitmapImage source)
+    {
+        source.ImageOpened -= OnAvatarImageOpened;
+        source.ImageFailed -= OnAvatarImageFailed;
     }
 
     private void UpdateTooltip() =>
@@ -703,6 +916,12 @@ public sealed partial class TrayWindow : Window
     private void OnCloseClick(object sender, RoutedEventArgs e) => HidePanel();
 
     private void OnSetupClick(object sender, RoutedEventArgs e) => OpenSection("setup");
+
+    /// <summary>
+    /// Footer "+": opens the existing bucket setup section only. It never
+    /// creates a bucket, never starts consent and never mutates provider state.
+    /// </summary>
+    private void OnAddBucketClick(object sender, RoutedEventArgs e) => OpenSection("setup");
 
     private void OnOpenHFDriveClick(object sender, RoutedEventArgs e) => OpenMainWindow();
 

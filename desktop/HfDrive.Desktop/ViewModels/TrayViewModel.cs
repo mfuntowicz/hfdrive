@@ -208,13 +208,31 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     public bool IsUnavailableView => PanelState == TrayPanelState.Unavailable;
 
     [ObservableProperty]
-    public partial string AccountText { get; set; } = "Loading account status…";
-
-    [ObservableProperty]
-    public partial string SummaryText { get; set; } = string.Empty;
-
-    [ObservableProperty]
     public partial string? WarningText { get; set; }
+
+    // ── Account avatar (display identity only; never a credential) ──────
+
+    /// <summary>
+    /// Validated avatar URI of the current signed-in account, or null while
+    /// loading, signed out, or when the profile carries no usable URI. The
+    /// panel renders CatchingHuggy as the fallback for every null. The URI
+    /// comes from the provider's verified userinfo avatar and is fetched
+    /// anonymously by the image loader: no bearer credential is ever attached
+    /// to it.
+    /// </summary>
+    [ObservableProperty]
+    public partial Uri? AvatarUri { get; set; }
+
+    /// <summary>Account key the current <see cref="AvatarUri"/> belongs to.</summary>
+    private string? _avatarAccountKey;
+
+    /// <summary>
+    /// Accessible name of the account avatar; follows account changes so a
+    /// screen reader never attributes the picture to the wrong person.
+    /// </summary>
+    public string AvatarAutomationName => _account is { State: AuthenticationState.SignedIn, Profile: { } profile }
+        ? $"Signed-in account picture for {profile.Namespace}"
+        : "Signed-in account picture";
 
     [ObservableProperty]
     public partial string DisconnectedText { get; set; } = "The tray panel is not connected to the HF Drive provider.";
@@ -444,16 +462,7 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
         else
             OnPropertyChanged(nameof(HasConnectionSelector));
 
-        AccountText = status.Account.State switch
-        {
-            AuthenticationState.SignedOut => "Not signed in.",
-            AuthenticationState.SigningIn => "Waiting for authorization in your browser…",
-            AuthenticationState.SignedIn => $"Signed in as {status.Account.Profile?.DisplayName} ({status.Account.Profile?.Namespace}).",
-            AuthenticationState.NeedsSignIn => $"Sign-in required for {status.Account.Profile?.Namespace ?? "the selected account"}. Local work is retained.",
-            _ => "Account status unavailable.",
-        };
-
-        UpdateSummary();
+        UpdateAvatar(status.Account);
         UpdateAllSynced();
         UpdatePauseResume();
         ApplySessionState();
@@ -465,19 +474,41 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
         // routine status delta must not restart paged history.
     }
 
-    private void UpdateSummary()
+    /// <summary>
+    /// Publishes the current account's validated avatar URI. A missing/invalid
+    /// URI is published as null (the panel falls back to CatchingHuggy). An
+    /// account change clears the previous URI first, so the previous user's
+    /// picture is never shown for a new account.
+    /// </summary>
+    private void UpdateAvatar(AccountStatus account)
     {
-        if (Connections.Count == 0)
+        string? accountKey = account.Profile?.AccountKey;
+        if (!string.Equals(accountKey, _avatarAccountKey, StringComparison.Ordinal))
         {
-            SummaryText = "No folders are connected yet.";
+            _avatarAccountKey = accountKey;
+            AvatarUri = null;
+            OnPropertyChanged(nameof(AvatarAutomationName));
+        }
+        if (account.State != AuthenticationState.SignedIn)
+        {
+            if (AvatarUri is not null) AvatarUri = null;
             return;
         }
 
-        string account = _account?.State == AuthenticationState.SignedIn
-            ? $"Signed in as {_account?.Profile?.DisplayName}"
-            : "Not signed in";
-        string drives = Connections.Count == 1 ? "1 folder connected" : $"{Connections.Count} folders connected";
-        SummaryText = $"{account} · {drives}";
+        // Defensive validation at the display boundary: the provider already
+        // rejects anything that is not an HTTPS huggingface.co (subdomain) URL
+        // without embedded credentials. Never build a request from anything
+        // else; the image loader performs an anonymous GET only.
+        Uri? next = null;
+        if (Uri.TryCreate(account.Profile?.AvatarUrl, UriKind.Absolute, out Uri? candidate)
+            && candidate.Scheme == Uri.UriSchemeHttps
+            && string.IsNullOrEmpty(candidate.UserInfo)
+            && (candidate.Host.Equals("huggingface.co", StringComparison.OrdinalIgnoreCase)
+                || candidate.Host.EndsWith(".huggingface.co", StringComparison.OrdinalIgnoreCase)))
+        {
+            next = candidate;
+        }
+        if (AvatarUri != next) AvatarUri = next;
     }
 
     // ── Data loading (bounded, cancellable, stale-guarded) ───────────────

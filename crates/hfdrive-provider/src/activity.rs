@@ -1270,6 +1270,7 @@ mod tests {
                 issuer: "https://huggingface.co".to_owned(),
                 subject: "activity-fixture-subject".to_owned(),
                 namespace: "fixture-person".to_owned(),
+                avatar_url: None,
                 orgs: Vec::new(),
                 granted_scopes: Some(vec!["openid".to_owned(), "profile".to_owned()]),
                 covered_purpose: hfdrive_auth::LoginPurpose::WriteStorage,

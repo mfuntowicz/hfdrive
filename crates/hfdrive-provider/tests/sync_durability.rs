@@ -319,6 +319,7 @@ fn deletions_require_a_completed_non_invalidated_scan() {
             connection_id: connection(),
             cursor: None,
             pending_head_refresh: false,
+            head_refresh_generation: 0,
             volume_id: "vol".into(),
             journal_id: "j".into(),
             usn_cursor: Some(7),

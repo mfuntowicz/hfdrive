@@ -482,6 +482,7 @@ mod tests {
                 subject: "fixture-subject".to_owned(),
                 namespace: "fixture-person".to_owned(),
                 display_name: "fixture-person".to_owned(),
+                avatar_url: Some("https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg".to_owned()),
                 granted_scopes: Some(vec!["openid".to_owned()]),
             }),
             login: None,

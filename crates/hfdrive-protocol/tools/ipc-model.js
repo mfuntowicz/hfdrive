@@ -49,7 +49,7 @@ const wireEnum = (enumName, variant) =>
 
 const OBJECTS = {
   error_object: ["code:enum:protocol_error_code", "message:string", "retry_after_ms:opt:dec64"],
-  account_profile: ["account_key:string", "issuer:string", "subject:string", "namespace:string", "display_name:string", "granted_scopes:opt:arr:string"],
+  account_profile: ["account_key:string", "issuer:string", "subject:string", "namespace:string", "display_name:string", "avatar_url:opt:string", "granted_scopes:opt:arr:string"],
   login_progress: ["session_id:uuid", "flow:enum:login_flow", "purpose:enum:login_purpose", "phase:enum:login_phase", "expires_at:string"],
   account_status: ["state:enum:authentication_state", "profile:opt:obj:account_profile", "login:opt:obj:login_progress", "last_error:opt:obj:error_object"],
   publication_protection_context: ["connection_id:uuid", "account_key:string", "issuer:string", "subject:string", "owner_id:string", "owner_kind:enum:owner_kind", "bucket_id:string", "workspace_id:uuid", "prefix:string"],

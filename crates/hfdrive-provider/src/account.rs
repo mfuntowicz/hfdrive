@@ -103,6 +103,7 @@ pub(crate) fn status(snapshot: &AuthSnapshot) -> Result<wire::AccountStatus, wir
             subject: profile.subject.clone(),
             namespace: profile.namespace.as_str().to_owned(),
             display_name: profile.namespace.as_str().to_owned(),
+            avatar_url: profile.avatar_url.clone(),
             granted_scopes: profile.granted_scopes.clone(),
         }
     });
@@ -178,6 +179,7 @@ mod tests {
             issuer: "https://huggingface.co".into(),
             subject: subject.into(),
             namespace: Namespace::new("fixture-person".into()).unwrap(),
+            avatar_url: Some("https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg".into()),
             orgs: vec![hfdrive_auth::VerifiedOrg {
                 subject: "fixture-org".into(), name: None, role: Some("admin".into()),
                 restrictions: vec!["resource-group-limited".into()], consented_this_session: false,
@@ -217,6 +219,10 @@ mod tests {
         };
         let account = status(&snapshot).unwrap();
         assert_eq!(account.state, wire::AuthenticationState::NeedsSignIn);
-        assert_eq!(account.profile.unwrap().granted_scopes, None);
+        let profile = account.profile.unwrap();
+        assert_eq!(profile.granted_scopes, None);
+        assert_eq!(profile.avatar_url.as_deref(),
+            Some("https://cdn-avatars.huggingface.co/v1/production/uploads/test-avatar.jpeg"),
+            "the provider projects the validated auth value without inventing one");
     }
 }

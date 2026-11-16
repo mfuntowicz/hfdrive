@@ -44,7 +44,7 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- ── Header: CatchingHuggy identity, live summary, refresh/close ── -->
+        <!-- ── Header: left account avatar, centered title, refresh/close ── -->
         <Grid Grid.Row="0"
               Padding="16,12"
               Background="{ThemeResource HfHeaderBackgroundBrush}"
@@ -56,28 +56,39 @@
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <Image Grid.Column="0"
-                   Width="36" Height="34"
-                   Stretch="Uniform"
-                   AutomationProperties.Name="HF Drive">
-                <Image.Source>
-                    <BitmapImage UriSource="ms-appx:///Assets/CatchingHuggy.png" DecodePixelWidth="72" />
-                </Image.Source>
-            </Image>
+            <!-- The logged user's picture occupies the left identity slot.
+                 CatchingHuggy remains the loading/missing/failed-image fallback. -->
+            <Grid Grid.Column="0"
+                  Width="32" Height="32"
+                  VerticalAlignment="Center"
+                  AutomationProperties.Name="{x:Bind ViewModel.AvatarAutomationName, Mode=OneWay}">
+                <Ellipse x:Name="TrayAvatarFallbackShape"
+                         Width="32" Height="32">
+                    <Ellipse.Fill>
+                        <ImageBrush Stretch="UniformToFill">
+                            <ImageBrush.ImageSource>
+                                <BitmapImage UriSource="ms-appx:///Assets/CatchingHuggy.png" DecodePixelWidth="64" />
+                            </ImageBrush.ImageSource>
+                        </ImageBrush>
+                    </Ellipse.Fill>
+                </Ellipse>
+                <Ellipse x:Name="TrayAvatarShape"
+                         Width="32" Height="32"
+                         Visibility="Collapsed">
+                    <Ellipse.Fill>
+                        <ImageBrush x:Name="TrayAvatarBrush" Stretch="UniformToFill" />
+                    </Ellipse.Fill>
+                </Ellipse>
+            </Grid>
 
-            <StackPanel Grid.Column="1"
-                        Margin="12,0,8,0"
-                        VerticalAlignment="Center"
-                        Spacing="2">
-                <TextBlock Text="HF Drive"
-                           Style="{StaticResource SubtitleTextBlockStyle}"
-                           Foreground="{ThemeResource HfHeaderForegroundBrush}" />
-                <TextBlock Text="{x:Bind ViewModel.SummaryText, Mode=OneWay}"
-                           Style="{StaticResource CaptionTextBlockStyle}"
-                           Opacity="0.8"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource HfHeaderForegroundBrush}" />
-            </StackPanel>
+            <!-- Center across the full header; the side slots do not offset it. -->
+            <TextBlock Grid.Column="0" Grid.ColumnSpan="3"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       Text="HF Drive"
+                       FontFamily="Inter, Segoe UI"
+                       Style="{StaticResource SubtitleTextBlockStyle}"
+                       Foreground="{ThemeResource HfHeaderForegroundBrush}" />
 
             <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4">
                 <Button x:Name="TrayRefreshButton"
@@ -108,7 +119,7 @@
                             HorizontalAlignment="Center"
                             Visibility="{Binding IsLoadingView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
                     <ProgressRing IsActive="True" Width="32" Height="32" />
-                    <TextBlock Text="{x:Bind ViewModel.AccountText, Mode=OneWay}"
+                    <TextBlock Text="Loading account status…"
                                TextWrapping="Wrap"
                                Opacity="0.8" />
                 </StackPanel>
@@ -161,27 +172,9 @@
                 <StackPanel Spacing="16"
                             Visibility="{Binding IsReadyView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
 
-                    <TextBlock Text="{x:Bind ViewModel.AccountText, Mode=OneWay}"
-                               TextWrapping="Wrap"
-                               Opacity="0.8" />
-                    <TextBlock Text="{x:Bind ViewModel.WarningText, Mode=OneWay}"
-                               TextWrapping="Wrap"
-                               Foreground="{ThemeResource SystemFillColorCautionBrush}" />
-
-                    <!-- Folder selector when more than one connection exists. -->
-                    <StackPanel Spacing="4"
-                                AutomationProperties.AutomationId="TrayConnections"
-                                AutomationProperties.Name="Synced folders"
-                                Visibility="{Binding HasConnectionSelector, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                        <TextBlock Text="Folder" Opacity="0.8" />
-                        <ComboBox ItemsSource="{x:Bind ViewModel.Connections, Mode=OneWay}"
-                                  SelectedItem="{x:Bind ViewModel.SelectedConnection, Mode=TwoWay}"
-                                  DisplayMemberPath="TitleDisplay"
-                                  HorizontalAlignment="Stretch" />
-                    </StackPanel>
-
                     <!--
-                      Celebration: only the truthful all-synced state, driven by
+                      Celebration occupies the old body account line. Only the
+                      truthful all-synced state, driven by
                       TrayViewModel.IsAllSynced (known matching baseline commits,
                       no pending/dirty/conflict counts and no unfinished activity).
                     -->
@@ -213,6 +206,22 @@
                             </StackPanel>
                         </StackPanel>
                     </Border>
+
+                    <TextBlock Text="{x:Bind ViewModel.WarningText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+
+                    <!-- Folder selector when more than one connection exists. -->
+                    <StackPanel Spacing="4"
+                                AutomationProperties.AutomationId="TrayConnections"
+                                AutomationProperties.Name="Synced folders"
+                                Visibility="{Binding HasConnectionSelector, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Text="Folder" Opacity="0.8" />
+                        <ComboBox ItemsSource="{x:Bind ViewModel.Connections, Mode=OneWay}"
+                                  SelectedItem="{x:Bind ViewModel.SelectedConnection, Mode=TwoWay}"
+                                  DisplayMemberPath="TitleDisplay"
+                                  HorizontalAlignment="Stretch" />
+                    </StackPanel>
 
                     <!-- Files and folders currently syncing (real list_activity). -->
                     <StackPanel Spacing="8"
@@ -337,33 +346,66 @@
             </StackPanel>
         </ScrollViewer>
 
-        <!-- ── Footer: real pause/resume mutation + open the main window ──── -->
+        <!-- ── Footer: equal three-column actions + spanning status row ─── -->
         <Grid Grid.Row="2"
               Padding="16,12"
               BorderBrush="{ThemeResource HfCardBorderBrush}"
               BorderThickness="0,1,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Spacing="2">
-                <Button x:Name="TrayPauseResumeButton"
-                        AutomationProperties.Name="{x:Bind ViewModel.PauseResumeText, Mode=OneWay}"
-                        HorizontalAlignment="Left"
-                        Content="{x:Bind ViewModel.PauseResumeText, Mode=OneWay}"
-                        Command="{x:Bind ViewModel.TogglePauseResumeCommand}"
-                        Visibility="{Binding IsReadyView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                <TextBlock Text="{x:Bind ViewModel.LastActionText, Mode=OneWay}"
-                           Style="{StaticResource CaptionTextBlockStyle}"
-                           Opacity="0.8"
-                           TextWrapping="Wrap" />
-            </StackPanel>
-            <Button Grid.Column="1"
+
+            <!-- Three equal-width, equal-height action buttons at the
+                 400-DIP panel width. The status line spans the row below so
+                 its text can never misalign the buttons. -->
+            <Button Grid.Row="0" Grid.Column="0"
+                    x:Name="TrayPauseResumeButton"
+                    Margin="0,0,4,0"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Center"
+                    AutomationProperties.Name="{x:Bind ViewModel.PauseResumeText, Mode=OneWay}"
+                    Content="{x:Bind ViewModel.PauseResumeText, Mode=OneWay}"
+                    Command="{x:Bind ViewModel.TogglePauseResumeCommand}"
+                    Visibility="{Binding IsReadyView, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+            <Button Grid.Row="0" Grid.Column="1"
+                    x:Name="TrayAddBucketButton"
+                    Margin="2,0"
+                    Padding="0"
+                    MinWidth="0"
+                    MinHeight="32"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Center"
+                    AutomationProperties.Name="Add bucket"
+                    Background="{ThemeResource HfAddBucketBackgroundBrush}"
+                    ToolTipService.ToolTip="Add bucket"
+                    Click="OnAddBucketClick">
+                <FontIcon Glyph="&#xE710;"
+                          FontSize="14"
+                          Foreground="{ThemeResource HfAddBucketForegroundBrush}" />
+            </Button>
+            <Button Grid.Row="0" Grid.Column="2"
                     x:Name="TrayOpenButton"
+                    Margin="4,0,0,0"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Center"
                     AutomationProperties.Name="Open HF Drive"
                     Content="Open HF Drive"
                     Style="{StaticResource AccentButtonStyle}"
                     Click="OnOpenHFDriveClick" />
+
+            <!-- Real pause/resume/last action status, own spanning row. -->
+            <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3"
+                       Margin="0,6,0,0"
+                       Text="{x:Bind ViewModel.LastActionText, Mode=OneWay}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Opacity="0.8"
+                       TextWrapping="Wrap" />
         </Grid>
     </Grid>
 </Window>
