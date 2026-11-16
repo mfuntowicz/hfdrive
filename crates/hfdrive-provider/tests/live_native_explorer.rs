@@ -4,9 +4,9 @@
 //!
 //! # Gates
 //!
-//! Ignored by default. Requires `HFDRIVE_LIVE_ACCEPTANCE=1`, the registered
-//! public OAuth client id in `HFDRIVE_OAUTH_CLIENT_ID`, and a completed setup
-//! wizard sign-in + supplemental S3 record for `mfuntowicz/drive-dev`. Real
+//! Ignored by default. Requires `HFDRIVE_LIVE_ACCEPTANCE=1`, the fixed
+//! production public client, and a completed setup wizard sign-in +
+//! supplemental S3 record for `mfuntowicz/drive-dev`. Real
 //! network operations run only against that development fixture; the CFAPI
 //! root is the explicitly authorized disposable directory
 //! `F:\Workspace\hfdrive\artifacts\acceptance\live-hf-root`, which must be
@@ -136,17 +136,13 @@ fn ensure(condition: bool, message: &str) -> LiveResult<()> {
 // Entry point: gates first, cleanup always
 // ---------------------------------------------------------------------------
 
-#[ignore = "authorized live HF and CFAPI acceptance only; requires HFDRIVE_LIVE_ACCEPTANCE=1 and HFDRIVE_OAUTH_CLIENT_ID"]
+#[ignore = "authorized live HF and CFAPI acceptance only; requires HFDRIVE_LIVE_ACCEPTANCE=1 and the fixed production client"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_xet_file_hydrates_through_cfapi() {
     if std::env::var_os("HFDRIVE_LIVE_ACCEPTANCE").is_none() {
         eprintln!("skipped: set HFDRIVE_LIVE_ACCEPTANCE=1 to authorize live network and CFAPI effects");
         return;
     }
-    let client_id = std::env::var("HFDRIVE_OAUTH_CLIENT_ID")
-        .expect("HFDRIVE_OAUTH_CLIENT_ID must hold the registered public OAuth client id");
-    assert!(!client_id.trim().is_empty(), "HFDRIVE_OAUTH_CLIENT_ID must not be empty");
-
     let run_id = uuid::Uuid::new_v4();
     let mut cleanup = Cleanup::new(run_id);
     let outcome = live_run(&client_id, run_id, &mut cleanup).await;
@@ -393,7 +389,7 @@ async fn live_run(client_id: &str, run_id: uuid::Uuid, cleanup: &mut Cleanup) ->
                 .to_owned()
         })?;
     let auth = AuthManager::new(
-        AuthConfig::with_client_id(Some(client_id.to_owned())),
+        AuthConfig::production(),
         state_root.clone(),
         Some(account),
     );

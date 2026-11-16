@@ -8,7 +8,7 @@
 /// "re-login required", "retry later" and "permanent configuration problem".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
-    /// Production build without `HFDRIVE_OAUTH_CLIENT_ID`; login is refused
+    /// No client id is configured in the current `AuthConfig`; login is refused
     /// outright (no borrowed or fake client id is ever used).
     #[error("the product OAuth client is not configured")]
     OAuthClientNotConfigured,

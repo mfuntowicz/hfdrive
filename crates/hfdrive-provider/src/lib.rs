@@ -80,7 +80,7 @@ pub struct Provider {
 
 impl Provider {
     /// Open preserved state before accepting IPC. A corrupt or foreign database is never replaced.
-    pub async fn open(paths: StatePaths, client_id: Option<String>, user_sid: String) -> Result<Arc<Self>, hfdrive_state::StateError> {
+    pub async fn open(paths: StatePaths, user_sid: String) -> Result<Arc<Self>, hfdrive_state::StateError> {
         let engine_state_dir = paths.base().to_path_buf();
         let state = Arc::new(StateStore::open(paths.clone()).await?);
         let selected = state.selected_account().await?;
@@ -103,7 +103,7 @@ impl Provider {
                 device_id
             }
         };
-        let auth = AuthManager::new(hfdrive_auth::AuthConfig::with_client_id(client_id), paths.base().to_path_buf(), selected);
+        let auth = AuthManager::new(hfdrive_auth::AuthConfig::production(), paths.base().to_path_buf(), selected);
         let tokens = Arc::new(DurableTokens::new(auth.clone()));
         let (status, _) = watch::channel(StatusSnapshot {
             sequence: 0,

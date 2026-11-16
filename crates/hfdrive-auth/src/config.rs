@@ -2,20 +2,25 @@
 //!
 //! The production build uses the product's **own public client** registered at
 //! <https://huggingface.co/settings/applications/new> without a client secret
-//! and with the exact callback `http://127.0.0.1/oauth/callback` (the runtime
-//! listener binds `127.0.0.1:0`; only the port differs). The client id comes
-//! from `HFDRIVE_OAUTH_CLIENT_ID` at process start. When it is absent, login
-//! fails with [`AuthError::OAuthClientNotConfigured`](crate::AuthError) —
-//! no borrowed, placeholder or fake client id is ever substituted.
+//! and with the exact callback `http://127.0.0.1:53643/oauth/callback`.
+//! Production binds the same fixed loopback port because HF validates the
+//! complete redirect URI, including its port. The registered client id is fixed
+//! in this source file. There is no runtime override: environment variables
+//! cannot redirect users to a different OAuth client or service.
 
 use crate::error::AuthError;
 use crate::login::LoginPurpose;
 
-/// Environment variable holding the product OAuth client id (public client).
-pub const OAUTH_CLIENT_ID_ENV: &str = "HFDRIVE_OAUTH_CLIENT_ID";
+/// The product's registered public OAuth client id. This is public
+/// configuration, not a secret or an access token.
+pub const OAUTH_CLIENT_ID: &str = "fb5faab4-e580-4b13-84d6-1b9217966b8e";
 
 /// Exact loopback callback path registered for the product client.
 pub const CALLBACK_PATH: &str = "/oauth/callback";
+
+/// Fixed loopback callback port registered for the product client. HF compares
+/// the complete URI, so production cannot use an ephemeral listener port.
+pub const CALLBACK_PORT: u16 = 53_643;
 
 /// Default lifetime of a login session (five minutes).
 pub const DEFAULT_LOGIN_LIFETIME_SECS: u64 = 300;
@@ -34,6 +39,8 @@ pub struct OidcSettings {
     pub(crate) require_https: bool,
     pub(crate) required_issuer: Option<String>,
     pub(crate) login_lifetime_secs: u64,
+    /// Fixed for production; zero selects an ephemeral port for local fixtures.
+    pub(crate) callback_port: u16,
 }
 
 impl OidcSettings {
@@ -53,6 +60,7 @@ impl OidcSettings {
             require_https: true,
             required_issuer: Some(Self::HUGGINGFACE_ISSUER.to_owned()),
             login_lifetime_secs: DEFAULT_LOGIN_LIFETIME_SECS,
+            callback_port: CALLBACK_PORT,
         }
     }
 
@@ -72,6 +80,7 @@ impl OidcSettings {
             require_https: false,
             required_issuer: Some(issuer.to_owned()),
             login_lifetime_secs: login_lifetime_secs.max(1),
+            callback_port: 0,
         }
     }
 
@@ -115,11 +124,10 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Production configuration: read `HFDRIVE_OAUTH_CLIENT_ID` once at
-    /// startup. Absent or blank means "not configured"; login then fails with
-    /// [`AuthError::OAuthClientNotConfigured`] and nothing is sent anywhere.
-    pub fn from_env() -> Self {
-        Self::with_client_id(std::env::var(OAUTH_CLIENT_ID_ENV).ok())
+    /// The only production OAuth configuration. No environment variable,
+    /// command-line argument, IPC field, or user setting can replace it.
+    pub fn production() -> Self {
+        Self::with_client_id(Some(OAUTH_CLIENT_ID.to_owned()))
     }
 
     /// Explicit client id (None/blank = not configured).
@@ -179,4 +187,21 @@ pub fn purpose_covered(purpose: LoginPurpose, granted: Option<&[String]>) -> boo
     scopes_for(purpose)
         .iter()
         .all(|need| granted.iter().any(|g| g == need))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_uses_only_the_registered_public_client() {
+        let production = AuthConfig::production();
+        assert!(production.is_configured());
+        assert_eq!(production.require_client_id().unwrap(), OAUTH_CLIENT_ID);
+        assert_eq!(OAUTH_CLIENT_ID, "fb5faab4-e580-4b13-84d6-1b9217966b8e");
+        assert_eq!(CALLBACK_PORT, 53_643);
+        assert_eq!(OidcSettings::huggingface().callback_port, CALLBACK_PORT);
+        assert_eq!(OidcSettings::fixture("http://fixture", "http://fixture/discovery", "127.0.0.1", 300).callback_port, 0);
+        assert!(AuthConfig::default().require_client_id().is_err());
+    }
 }

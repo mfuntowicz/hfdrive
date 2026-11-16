@@ -1,30 +1,26 @@
 # HF Drive OAuth setup
 
 HF Drive signs in with its **own public OAuth client**. There is no shared,
-borrowed or bundled client id and no client secret anywhere in the product.
+borrowed or bundled client secret and no client secret anywhere in the product.
+The public client identifier is fixed in `crates/hfdrive-auth/src/config.rs` as
+`fb5faab4-e580-4b13-84d6-1b9217966b8e`.
 
-## Registering the product client
+## Registered product client
 
-1. Sign in at <https://huggingface.co> and open
-   <https://huggingface.co/settings/applications/new>.
-2. Register a **public** client (no client secret) with the exact callback
-   URL `http://127.0.0.1/oauth/callback`.
-3. Set the issued client id in the provider's environment:
+The product registration uses the exact callback URL
+`http://127.0.0.1:53643/oauth/callback`. The provider binds its callback listener
+to that same loopback address and port before launching the system browser.
+HF validates the complete redirect URI, including the port, so production never
+uses an ephemeral callback port. There is no wildcard binding, no `localhost`
+DNS name, no embedded WebView and no alternate callback path.
 
-   ```powershell
-   $env:HFDRIVE_OAUTH_CLIENT_ID = "<the client id you registered>"
-   ```
-
-The provider binds its callback listener to `127.0.0.1:0` at login time and
-launches the system browser; only the port differs from the registered URL.
-There is no wildcard binding, no `localhost` DNS name, no embedded WebView
-and no alternate callback path.
-
-### Missing configuration is a hard gate
-
-If `HFDRIVE_OAUTH_CLIENT_ID` is absent or blank at startup, every login fails
-with `OAuthClientNotConfigured` and nothing is sent to any server. No
-placeholder or sample client id is ever substituted, in any build.
+Production does **not** read `HFDRIVE_OAUTH_CLIENT_ID` or any other OAuth client
+override. Environment variables, command-line arguments, IPC fields and user
+settings cannot redirect sign-in to another client or service. The issuer and
+all endpoint trust decisions remain pinned to `https://huggingface.co`.
+`OAuthClientNotConfigured` remains available only for custom `AuthConfig`
+instances and deterministic tests that deliberately omit a client ID; normal
+production startup always uses the registered client above.
 
 ## Desktop onboarding
 

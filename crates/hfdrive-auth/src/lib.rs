@@ -34,7 +34,7 @@ pub mod manager;
 pub mod protocol;
 pub mod store;
 
-pub use config::{AuthConfig, OidcSettings, OAUTH_CLIENT_ID_ENV};
+pub use config::{AuthConfig, OidcSettings, OAUTH_CLIENT_ID};
 pub use error::AuthError;
 pub use identity::{AccountProfile, AccountProfileSummary, OrgCandidate, VerifiedOrg};
 pub use login::{LoginFlow, LoginPurpose, LoginRequest, LoginSession, LoginState};

@@ -22,10 +22,11 @@ const MAX_URL_BYTES: usize = 8 * 1024;
 
 /// Validate a `https` URL for shell launch.
 ///
-/// Rejects anything that is not exactly `https://` followed by a host, any
-/// character that is not allowed in an URL (controls, spaces, quotes, shell
-/// metacharacters), embedded NUL, and over-long input. The caller parses the
-/// URL separately; this is the belt-and-braces launch-boundary check.
+/// Rejects anything that is not exactly `https://` followed by a host,
+/// controls, spaces, quotes or backslashes, embedded NUL, and over-long input.
+/// `&` is explicitly allowed: it separates query parameters and has no shell
+/// meaning here because `ShellExecuteW` receives the URL directly, never a
+/// command line. The caller parses the URL separately as well.
 pub(crate) fn validate_launch_url(url: &str) -> Result<(), LaunchError> {
     if url.is_empty() || url.len() > MAX_URL_BYTES {
         return Err(LaunchError { code: 87 }); // ERROR_INVALID_PARAMETER
@@ -37,9 +38,9 @@ pub(crate) fn validate_launch_url(url: &str) -> Result<(), LaunchError> {
         return Err(LaunchError { code: 87 });
     }
     for c in url.chars() {
-        // Control characters, spaces, quotes and shell metacharacters are
-        // never valid in the URLs we issue and must not reach a shell edge.
-        if c <= ' ' || c == '\u{7f}' || matches!(c, '"' | '\'' | '`' | '$' | '&' | '|' | ';' | '<' | '>' | '\\') {
+        // Controls, spaces, quotes and path/shell syntax that could confuse
+        // the launch boundary are refused. Query separators are not commands.
+        if c <= ' ' || c == '\u{7f}' || matches!(c, '"' | '\'' | '`' | '$' | '|' | ';' | '<' | '>' | '\\') {
             return Err(LaunchError { code: 87 });
         }
     }
@@ -87,5 +88,8 @@ mod tests {
         assert!(validate_launch_url("").is_err());
         assert!(validate_launch_url(&("https://x".to_owned() + &"a".repeat(MAX_URL_BYTES))).is_err());
         assert!(validate_launch_url("https://huggingface.co/oauth/authorize?x=1#f").is_ok());
+        assert!(validate_launch_url(
+            "https://huggingface.co/oauth/authorize?client_id=fb5faab4-e580-4b13-84d6-1b9217966b8e&redirect_uri=http%3A%2F%2F127.0.0.1%2Foauth%2Fcallback&response_type=code&scope=openid+profile"
+        ).is_ok());
     }
 }

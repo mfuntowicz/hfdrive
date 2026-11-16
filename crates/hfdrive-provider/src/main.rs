@@ -91,7 +91,7 @@ async fn run() -> Result<(), HostError> {
         }
         Err(error) => return Err(error.into()),
     };
-    let provider = Provider::open(StatePaths::new(state_root), std::env::var(hfdrive_auth::OAUTH_CLIENT_ID_ENV).ok(), _lease.user_sid().to_owned()).await?;
+    let provider = Provider::open(StatePaths::new(state_root), _lease.user_sid().to_owned()).await?;
     let server = IpcServer::bind(policy)?;
     tokio::spawn(provider.clone().observe_accounts());
     tokio::spawn(provider.clone().import_menu_loop());

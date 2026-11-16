@@ -872,3 +872,32 @@ verification.
   `artifacts/acceptance/oauth-error-code-fixed.png` and
   `artifacts/acceptance/oauth-error-code-fixed.json`. The temporary UI harness
   was removed after verification.
+
+## Fixed OAuth client and loopback callback — 2026-11-16
+
+- **implemented** — production now embeds the registered public client ID
+  `fb5faab4-e580-4b13-84d6-1b9217966b8e` in
+  `crates/hfdrive-auth/src/config.rs`. `Provider::open` no longer accepts a
+  client override, `HFDRIVE_OAUTH_CLIENT_ID` and `AuthConfig::from_env` were
+  removed, and production startup uses only `AuthConfig::production()`.
+- **fixed** — browser validation rejected `&`, making every OAuth query string
+  fail before `ShellExecuteW`. Query separators are now accepted while controls,
+  spaces, quotes and backslashes remain rejected. The URL still passes directly
+  to `ShellExecuteW`, never through a command shell.
+- **fixed** — HF rejected the random callback port as an unregistered
+  `redirect_uri`. Production now binds and sends exactly
+  `http://127.0.0.1:53643/oauth/callback`; only deterministic fixtures retain
+  ephemeral ports.
+- **passed** — all 49 authentication tests and the OAuth-shaped browser-launch
+  regression passed. The provider built and restarted with no OAuth environment
+  variable and answers status normally. The actual desktop reached
+  `Complete sign-in in your system browser` and `Waiting for authorization`,
+  proving that the fixed client reaches authorization creation and the browser
+  launches. Evidence: `artifacts/tests/oauth-fixed-callback-auth-tests.log`,
+  `oauth-fixed-callback-browser-tests.log`, and
+  `oauth-fixed-callback-build.log`.
+- **not_run** — successful HF authorization after registering the exact callback
+  is not claimed. HF rejected the old random-port URI; the user has not
+  confirmed adding `http://127.0.0.1:53643/oauth/callback` to the client
+  registration. The rejected attempt was cancelled by provider restart and the
+  fixed-callback provider is running. No consent or token exchange was completed.

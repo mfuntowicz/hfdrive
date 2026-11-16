@@ -334,8 +334,8 @@ impl AuthManager {
                 .ok_or(AuthError::ProviderMetadata)?;
             let http = self.http_client()?;
             // Bearer-only fetch: no CodeClient and no client id — a restored
-            // session must backfill even when `HFDRIVE_OAUTH_CLIENT_ID` is
-            // absent. Subject agreement is enforced by the same parser.
+            // session must backfill even for a custom configuration without a
+            // client id. Subject agreement is enforced by the same parser.
             let userinfo = flows::fetch_userinfo_bearer(
                 userinfo_endpoint.as_str(),
                 &http,
@@ -643,7 +643,7 @@ impl AuthManager {
         epoch: u64,
     ) -> Result<AccountProfile, AuthError> {
         // The listener binds before the browser launches.
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+        let listener = TcpListener::bind(("127.0.0.1", self.0.settings.callback_port))
             .await
             .map_err(|_| AuthError::Internal)?;
         let port = listener.local_addr().map_err(|_| AuthError::Internal)?.port();
