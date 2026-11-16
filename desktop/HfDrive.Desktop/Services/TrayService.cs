@@ -268,7 +268,10 @@ internal sealed class TrayService : IDisposable
                     // OneDrive-style panel.
                     return new LRESULT(0);
                 case WmContextMenu:                 // v4 right-click / keyboard menu
-                    RequestMenu();
+                    ulong packedPoint = wParam.Value.ToUInt64();
+                    RequestMenu(
+                        unchecked((short)(packedPoint & 0xffff)),
+                        unchecked((short)((packedPoint >> 16) & 0xffff)));
                     return new LRESULT(0);
                 case WmRButtonUp:                   // legacy right-click
                     RequestLegacyMenu();
@@ -344,7 +347,7 @@ internal sealed class TrayService : IDisposable
     /// subclass, so re-entry is ignored outright — a handle must never be
     /// tracked twice.
     /// </summary>
-    private void RequestMenu()
+    private void RequestMenu(int callbackX, int callbackY)
     {
         if (_menuShowing) return;
         _sawVersion4ContextMenu = true;
@@ -353,7 +356,7 @@ internal sealed class TrayService : IDisposable
             _suppressNextContextMenu = false;
             return;
         }
-        ShowMenu();
+        ShowMenu(TrayMenuPlacement.AbovePoint(callbackX, callbackY));
     }
 
     /// <summary>
@@ -381,14 +384,16 @@ internal sealed class TrayService : IDisposable
         }
     }
 
-    private unsafe void ShowMenu()
+    private unsafe void ShowMenu(TrayMenuPlacement? fallbackAnchor = null)
     {
         if (_menu.IsNull || _menuShowing) return;
         // Required so the popup dismisses on outside clicks.
         PInvoke.SetForegroundWindow(_hwnd);
-        var position = PInvoke.GetMessagePos();
-        int x = (short)(position & 0xffff);
-        int y = (short)((position >> 16) & 0xffff);
+        TrayMenuPlacement placement = GetMenuPlacement(_hwnd, fallbackAnchor);
+        TRACK_POPUP_MENU_FLAGS flags = TRACK_POPUP_MENU_FLAGS.TPM_RETURNCMD
+            | TRACK_POPUP_MENU_FLAGS.TPM_RIGHTBUTTON;
+        if (placement.CenterHorizontal) flags |= TRACK_POPUP_MENU_FLAGS.TPM_CENTERALIGN;
+        if (placement.AlignBottom) flags |= TRACK_POPUP_MENU_FLAGS.TPM_BOTTOMALIGN;
         // TPM_RETURNCMD: the BOOL return carries the chosen command id (0 when
         // the menu is cancelled). Convert the real return once to the menu-id
         // type of the case constants; cancel matches no case below.
@@ -396,8 +401,8 @@ internal sealed class TrayService : IDisposable
         _menuShowing = true;
         try
         {
-            command = (uint)(int)PInvoke.TrackPopupMenu(_menu, TRACK_POPUP_MENU_FLAGS.TPM_RETURNCMD | TRACK_POPUP_MENU_FLAGS.TPM_RIGHTBUTTON,
-                x, y, 0, _hwnd, null);
+            command = (uint)(int)PInvoke.TrackPopupMenu(_menu, flags,
+                placement.X, placement.Y, 0, _hwnd, null);
         }
         finally
         {
@@ -429,17 +434,48 @@ internal sealed class TrayService : IDisposable
                 ExitUiRequested?.Invoke();
                 break;
             case ExitProviderCommand:
-                if (ConfirmExitProvider(_hwnd, x, y))
+                if (ConfirmExitProvider(_hwnd, placement, flags))
                     ExitProviderRequested?.Invoke();
                 break;
         }
+    }
+
+    /// <summary>Uses the shell's icon rectangle first, then the version-4
+    /// callback point, and finally the legacy message point. The menu is always
+    /// centered horizontally with its bottom at the anchor's top.</summary>
+    private static unsafe TrayMenuPlacement GetMenuPlacement(HWND hwnd, TrayMenuPlacement? fallbackAnchor)
+    {
+        var identifier = new NOTIFYICONIDENTIFIER
+        {
+            cbSize = (uint)Marshal.SizeOf<NOTIFYICONIDENTIFIER>(),
+            hWnd = hwnd,
+            uID = 1,
+            guidItem = TrayGuid,
+        };
+        RECT icon = default;
+        try
+        {
+            PInvoke.Shell_NotifyIconGetRect(&identifier, &icon).ThrowOnFailure();
+            if (icon.right > icon.left && icon.bottom > icon.top)
+                return TrayMenuPlacement.AboveIcon(icon.left, icon.top, icon.right, icon.bottom);
+        }
+        catch (Exception)
+        {
+            // The shell did not supply an icon rectangle; use the real click.
+        }
+
+        if (fallbackAnchor is { } callbackAnchor) return callbackAnchor;
+        var position = PInvoke.GetMessagePos();
+        return TrayMenuPlacement.AbovePoint(
+            (short)(position & 0xffff),
+            (short)((position >> 16) & 0xffff));
     }
 
     /// <summary>
     /// A distinct second native confirmation for the destructive provider exit:
     /// the user must pick an explicit "Stop the provider" item.
     /// </summary>
-    private static unsafe bool ConfirmExitProvider(HWND owner, int x, int y)
+    private static unsafe bool ConfirmExitProvider(HWND owner, TrayMenuPlacement placement, TRACK_POPUP_MENU_FLAGS flags)
     {
         var confirm = PInvoke.CreatePopupMenu();
         if (confirm.IsNull) return false;
@@ -456,8 +492,8 @@ internal sealed class TrayService : IDisposable
             // TPM_RETURNCMD: the BOOL return carries the chosen command id (0
             // when cancelled); converted once to the menu-id type, so only the
             // explicit confirm item succeeds and cancel/failure never does.
-            uint command = (uint)(int)PInvoke.TrackPopupMenu(confirm, TRACK_POPUP_MENU_FLAGS.TPM_RETURNCMD | TRACK_POPUP_MENU_FLAGS.TPM_RIGHTBUTTON,
-                x, y, 0, owner, null);
+            uint command = (uint)(int)PInvoke.TrackPopupMenu(confirm, flags,
+                placement.X, placement.Y, 0, owner, null);
             return command == ConfirmExitProviderCommand;
         }
         finally

@@ -714,3 +714,24 @@ Evidence: `artifacts/acceptance/contextual-issues-sync.json`,
 `contextual-issues-sync.png`, `contextual-issues-history.json`, and
 `contextual-issues-history.png`. The temporary UI probe was removed after
 verification.
+
+## Tray context-menu icon anchor — 2026-11-16
+
+- **fixed** — the native menu no longer relies on `GetMessagePos` with default
+  alignment. `Shell_NotifyIconGetRect` supplies the icon center and top;
+  `TPM_CENTERALIGN | TPM_BOTTOMALIGN` places the menu immediately above it.
+  Version-4 callback coordinates and the legacy message point remain fallbacks,
+  and provider-exit confirmation uses the same placement.
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 178/178,
+  including icon-centered and pointer-fallback placement contracts. Evidence:
+  `artifacts/tests/tray-menu-anchor-build.log` and `tray-menu-anchor-tests.log`.
+- **passed** — the real version-4 `WM_CONTEXTMENU` path produced menu bounds
+  `(2239,1214)-(2462,1392)` for icon bounds `(2334,1392)-(2366,1440)`.
+  `menu.bottom = icon.top` exactly and the icon center is inside the menu
+  horizontally. The menu was dismissed with Escape; no command or provider
+  mutation was invoked.
+
+Evidence: `artifacts/acceptance/tray-menu-anchor.png` and
+`tray-menu-anchor.png.json`. The temporary native callback probe was removed
+after verification.
