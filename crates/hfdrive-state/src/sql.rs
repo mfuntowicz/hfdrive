@@ -257,6 +257,7 @@ pub(crate) fn read_scan(row: &Row<'_>) -> SResult<ScanState> {
         scan_epoch: c::unsigned(row.get_ref(6)?, "scan_epoch")?,
         scan_complete: c::boolean(row.get_ref(7)?, "scan_complete")?,
         scan_invalidated: c::boolean(row.get_ref(8)?, "scan_invalidated")?,
+        head_refresh_generation: c::unsigned(row.get_ref(9)?, "head_refresh_generation")?,
     })
 }
 

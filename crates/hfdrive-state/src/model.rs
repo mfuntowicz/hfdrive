@@ -425,6 +425,7 @@ pub struct ScanState {
     pub connection_id: ConnectionId,
     pub cursor: Option<String>,
     pub pending_head_refresh: bool,
+    pub head_refresh_generation: u64,
     pub volume_id: String,
     pub journal_id: String,
     pub usn_cursor: Option<u64>,
@@ -449,6 +450,13 @@ pub struct ConnectionWorkCounts {
     pub pending_files: u32,
     pub dirty_files: u32,
     pub conflict_files: u32,
+}
+
+/// Durable dispatch evidence, including metadata-only work and pending apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationWork {
+    pub head_refresh_generation: u64,
+    pub ready: bool,
 }
 
 /// Upload-byte and pin evidence for connection status projection.

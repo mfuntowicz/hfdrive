@@ -307,14 +307,19 @@ async fn run_round_inner<R: RemoteOps>(
 
     // 2. Remote head. Read-only connections never initialize; a writable
     //    connection without a head needs an explicit initialization intent.
+    let baseline = ctx.state.baseline(ctx.connection).await?;
     let head = match ctx.remote.read_head(ctx.cancel).await? {
         Some(head) => head,
+        None if baseline.applied_commit.is_some()
+            || baseline.observed_commit.is_some()
+            || baseline.published_commit.is_some() => {
+            return Err(RemoteError::RemoteContentUnavailable.into());
+        }
         None => {
             outcome.needs_initialize = writable;
             return Ok(outcome);
         }
     };
-    let baseline = ctx.state.baseline(ctx.connection).await?;
     let remote_moved = baseline.applied_commit != Some(head.head.commit_id);
     if planning.is_empty() && !remote_moved {
         // A successful quiet poll still proves which commit is observable.
@@ -327,6 +332,7 @@ async fn run_round_inner<R: RemoteOps>(
         return Ok(outcome);
     }
 
+    ctx.state.set_baseline(ctx.connection, BaselineKind::Observed, Some(head.head.commit_id)).await?;
     // 3. Complete views and the pure merge. Read-only rounds reconcile in
     //    read-only mode: zero remote ops, local intents deferred, remote
     //    changes materialized through guarded local actions.
@@ -356,12 +362,7 @@ async fn run_round_inner<R: RemoteOps>(
     //    apply the journaled local actions, close bookkeeping and absorb the
     //    observed head into the base.
     if !writable || planned.plan.remote_ops.is_empty() {
-        outcome.applied_local_actions = execute_pending_actions(ctx).await?;
-        close_bookkeeping(ctx, &planning, &planned, &head, &mut outcome).await?;
-        advance_base(ctx, head.head.commit_id, &planned, &sources).await?;
-        ctx.state
-            .set_baseline(ctx.connection, BaselineKind::Applied, Some(head.head.commit_id))
-            .await?;
+        finish_remote_application(ctx, &planning, &planned, &sources, &head, &mut outcome).await?;
         return Ok(outcome);
     }
 
@@ -745,6 +746,35 @@ fn version_record(
 // Bookkeeping closure (converged/superseded intents)
 // ---------------------------------------------------------------------------
 
+async fn finish_remote_application<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+    entries: &[OutboxEntry],
+    planned: &PlannedRound,
+    sources: &PlanSources,
+    head: &RemoteHead,
+    outcome: &mut RoundOutcome,
+) -> Result<(), PublishError> {
+    outcome.applied_local_actions = execute_pending_actions(ctx).await?;
+    require_namespace_application(ctx).await?;
+    close_bookkeeping(ctx, entries, planned, head, outcome).await?;
+    advance_base(ctx, head.head.commit_id, planned, sources).await?;
+    ctx.state.set_baseline(ctx.connection, BaselineKind::Applied, Some(head.head.commit_id)).await?;
+    Ok(())
+}
+
+async fn require_namespace_application<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+) -> Result<(), PublishError> {
+    if ctx.state.pending_local_actions(ctx.connection).await?.iter().any(|action| matches!(
+        action.kind,
+        StateActionKind::Other | StateActionKind::CreatePlaceholder | StateActionKind::Rename
+            | StateActionKind::UpdatePlaceholder | StateActionKind::DeletePlaceholder
+    )) {
+        return Err(PublishError::LocalApply("the committed namespace still has guarded local changes pending"));
+    }
+    Ok(())
+}
+
 async fn close_bookkeeping<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     entries: &[OutboxEntry],
@@ -860,6 +890,7 @@ async fn finish_commit<R: RemoteOps>(
 
     // Guarded local application of the journaled plan actions.
     outcome.applied_local_actions = execute_pending_actions(ctx).await?;
+    require_namespace_application(ctx).await?;
 
     // Mark locally published content in-sync (guarded), then close entries.
     for entry in round_entries {
@@ -1725,6 +1756,7 @@ mod tests {
                 },
                 etag: None,
             }),
+            ..Default::default()
         };
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();
@@ -1750,6 +1782,129 @@ mod tests {
             assert_eq!(baseline.applied_commit, Some(applied));
             assert_eq!(baseline.published_commit, Some(prior_publication));
         }
+        fixture.state.close().await.unwrap();
+    }
+
+    fn read_only_context<'a>(
+        fixture: &'a crate::sync::test_support::TestConnection,
+        remote: &'a HeadOnlyRemote,
+        scheduler: &'a crate::scheduler::Scheduler,
+        cancel: &'a CancellationToken,
+    ) -> RoundContext<'a, HeadOnlyRemote> {
+        RoundContext {
+            state: &fixture.account, remote, connection: fixture.connection,
+            workspace: fixture.workspace, root_item_id: fixture.root_item,
+            device_id: DeviceId::new(), mode: ReconcileMode::ReadOnly,
+            root: &fixture.root, staging_dir: fixture.directory.path(),
+            recovery_dir: fixture.directory.path(), scheduler, cancel,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_established_missing_head_preserves_baselines_and_local_bytes() {
+        let fixture = connection_fixture().await;
+        let path = fixture.root.join("keep.bin");
+        std::fs::write(&path, b"unsynchronized local bytes").unwrap();
+        let committed = CommitId::new();
+        for kind in [BaselineKind::Applied, BaselineKind::Observed, BaselineKind::Published] {
+            fixture.account.set_baseline(fixture.connection, kind, Some(committed)).await.unwrap();
+        }
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let mut context = read_only_context(&fixture, &remote, &scheduler, &cancel);
+        for (mode, writable) in [(ReconcileMode::ReadOnly, false), (ReconcileMode::Writable, true)] {
+            context.mode = mode;
+            assert!(matches!(run_round(&context, writable).await,
+                Err(PublishError::Remote(RemoteError::RemoteContentUnavailable))));
+            let baseline = fixture.account.baseline(fixture.connection).await.unwrap();
+            assert_eq!(baseline.observed_commit, Some(committed));
+            assert_eq!(baseline.applied_commit, Some(committed));
+            assert_eq!(baseline.published_commit, Some(committed));
+            assert_eq!(std::fs::read(&path).unwrap(), b"unsynchronized local bytes");
+        }
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_namespace_application_keeps_the_old_baseline_and_original_guard() {
+        use hfdrive_core::reconcile::{CatalogView, ItemState};
+        use hfdrive_core::storage::Sha256Digest;
+        let fixture = connection_fixture().await;
+        let path = std::path::PathBuf::from("guarded.bin");
+        std::fs::write(fixture.root.join(&path), b"local bytes must survive").unwrap();
+        let operation = OperationId::new();
+        let root = ItemRecord {
+            item_id: fixture.root_item, parent_id: None, name: String::new(),
+            kind: ItemKind::Directory, item_revision: operation, content_version_id: None,
+            deleted: false, content_operation: operation, location_operation: operation,
+            deletion_operation: None,
+        };
+        let file = ItemRecord {
+            item_id: ItemId::new(), parent_id: Some(fixture.root_item), name: "guarded.bin".to_owned(),
+            kind: ItemKind::File, content_version_id: Some(VersionId::new()), ..root.clone()
+        };
+        let next_operation = OperationId::new();
+        let changed = ItemRecord {
+            content_version_id: Some(VersionId::new()), item_revision: next_operation,
+            content_operation: next_operation, ..file.clone()
+        };
+        let root_state = ItemState::from_record(&root, None, None).unwrap();
+        let base = CatalogView::new(vec![root_state.clone(), ItemState::from_record(
+            &file, Some(Sha256Digest::of(b"base")), Some(4),
+        ).unwrap()]).unwrap();
+        let remote_view = CatalogView::new(vec![root_state, ItemState::from_record(
+            &changed, Some(Sha256Digest::of(b"remote")), Some(6),
+        ).unwrap()]).unwrap();
+        let names = collect_names(&base, &remote_view);
+        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let previous = CommitId::new();
+        let target = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, previous, &[root, file.clone()]).await.unwrap();
+        fixture.account.upsert_item(registry_item(fixture.connection, &file, Some(Sha256Digest::of(b"base")), Some(4), None)).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, BaselineKind::Applied, Some(previous)).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, BaselineKind::Observed, Some(target)).await.unwrap();
+
+        let planned = plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::ReadOnly, &sources).await.unwrap();
+        let facts = planned.plan.local_actions.iter().map(|action| (action.action_id, ActionFacts {
+            source_path: Some(path.clone()), target_path: Some(path.clone()),
+            expected_file_id: None, expected_generation: None, expected_usn: None,
+        })).collect();
+        plan::persist_plan_records(&fixture.account, fixture.connection, &planned.plan, &facts).await.unwrap();
+        let original = fixture.account.pending_local_actions(fixture.connection).await.unwrap();
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].kind, StateActionKind::UpdatePlaceholder);
+
+        let retry = plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::ReadOnly, &sources).await.unwrap();
+        let changed_facts = retry.plan.local_actions.iter().map(|action| (action.action_id, ActionFacts {
+            source_path: Some(path.clone()), target_path: Some(path.clone()),
+            expected_file_id: Some("00000000000000000000000000000001".to_owned()),
+            expected_generation: Some(7), expected_usn: Some(9),
+        })).collect();
+        plan::persist_plan_records(&fixture.account, fixture.connection, &retry.plan, &changed_facts).await.unwrap();
+        let pending = fixture.account.pending_local_actions(fixture.connection).await.unwrap();
+        assert_eq!(pending.len(), 1, "retry must not accumulate a second namespace action");
+        assert_eq!(pending[0].action_id, original[0].action_id);
+        assert_eq!(pending[0].expected_file_id, None);
+        assert_eq!(pending[0].expected_usn, None);
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let context = read_only_context(&fixture, &remote, &scheduler, &cancel);
+        let head = RemoteHead { head: HeadV1 {
+            format: format::FORMAT_NAME.to_owned(), schema_version: format::SCHEMA_VERSION,
+            workspace_id: fixture.workspace, root_item_id: fixture.root_item, commit_id: target,
+            generation: GenerationId::new(), required_features: Vec::new(),
+        }, etag: None };
+        let mut outcome = RoundOutcome::default();
+        assert!(matches!(finish_remote_application(&context, &[], &retry, &sources, &head, &mut outcome).await,
+            Err(PublishError::LocalApply(_))));
+        let baseline = fixture.account.baseline(fixture.connection).await.unwrap();
+        assert_eq!(baseline.applied_commit, Some(previous));
+        assert_eq!(baseline.observed_commit, Some(target));
+        assert_eq!(fixture.account.pending_local_actions(fixture.connection).await.unwrap()[0].state, LocalActionState::Pending);
+        assert_eq!(std::fs::read(fixture.root.join(path)).unwrap(), b"local bytes must survive");
         fixture.state.close().await.unwrap();
     }
 }

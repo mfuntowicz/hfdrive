@@ -621,9 +621,23 @@ impl AccountStore {
             .await
     }
 
-    pub async fn ack_head_refresh(&self, connection_id: ConnectionId) -> Result<ScanState, StateError> {
+    /// Clears only the invalidation generation covered by the completed read.
+    pub async fn ack_head_refresh(
+        &self,
+        connection_id: ConnectionId,
+        generation: u64,
+    ) -> Result<ScanState, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
-        queue.call(move |db| db.ack_head_refresh(account, connection_id)).await
+        queue.call(move |db| db.ack_head_refresh(account, connection_id, generation)).await
+    }
+
+    pub async fn reconciliation_work(
+        &self,
+        connection_id: ConnectionId,
+        now_ms: u64,
+    ) -> Result<ReconciliationWork, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.reconciliation_work(account, connection_id, now_ms)).await
     }
 
     pub async fn begin_scan(

@@ -1295,11 +1295,11 @@ mod tests {
             registered_connection(&state, account.account_key(), &root).await;
         // Seed the durable resume position and clear its pending flag so the
         // reset's effect is observable on its own.
-        account
+        let seeded = account
             .record_head_invalidation(connection, Some("c0".to_owned()))
             .await
             .expect("seed cursor");
-        account.ack_head_refresh(connection).await.expect("clear pending flag");
+        account.ack_head_refresh(connection, seeded.head_refresh_generation).await.expect("clear pending flag");
 
         let shared = Arc::new(FakeFeedState::default());
         // One empty feed (immediate EOF) then dead opens: only the independent

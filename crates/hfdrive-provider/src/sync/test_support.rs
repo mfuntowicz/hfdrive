@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use bytes::Bytes;
 use hfdrive_core::ids::{CommitId, OperationId};
@@ -17,8 +18,10 @@ use crate::remote_watch::{EventFeed, RemoteEvents};
 use super::remote::{RangeSource, RemoteError, RemoteHead, RemoteOps};
 
 /// A HEAD-only boundary: unexpected effects fail the test, never pretend success.
+#[derive(Default)]
 pub(crate) struct HeadOnlyRemote {
     pub head: Option<RemoteHead>,
+    pub head_reads: Arc<AtomicUsize>,
 }
 
 pub(crate) struct UnusedReader;
@@ -54,6 +57,7 @@ impl RemoteOps for HeadOnlyRemote {
     }
 
     async fn read_head(&self, _: &CancellationToken) -> Result<Option<RemoteHead>, RemoteError> {
+        self.head_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.head.clone())
     }
 

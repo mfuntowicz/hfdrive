@@ -201,6 +201,7 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     local_ready: AtomicBool,
     scan_requested: AtomicBool,
     persistence_failed: AtomicBool,
+    reconcile_requested: AtomicBool,
 }
 
 /// The live CFAPI pump of one connected root. Stopping it cancels its work
@@ -548,6 +549,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             local_ready: AtomicBool::new(false),
             scan_requested: AtomicBool::new(true),
             persistence_failed: AtomicBool::new(false),
+            reconcile_requested: AtomicBool::new(true),
         });
 
 
@@ -980,6 +982,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
 
     /// Resumes remote scheduling; the next drive revalidates capabilities.
     pub fn resume(&self) {
+        self.reconcile_requested.store(true, Ordering::Release);
         self.paused.send_replace(false);
     }
 
@@ -1350,6 +1353,18 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         if *self.paused.borrow() {
             return;
         }
+        let work = match self.state.reconciliation_work(self.config.connection_id, now_ms()).await {
+            Ok(work) => work,
+            Err(error) => {
+                let mut health = self.health.borrow().clone();
+                health.last_error = Some(error.to_string());
+                self.health.send_replace(health);
+                return;
+            }
+        };
+        if !self.reconcile_requested.swap(false, Ordering::AcqRel) && !work.ready {
+            return;
+        }
         self.refresh_health().await;
         let cancel = self.cancel.child_token();
         let ctx = self.round_context(&cancel);
@@ -1357,7 +1372,16 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             self.upload_pass(&ctx).await;
         }
         match run_round(&ctx, self.writable()).await {
-            Ok(outcome) => self.publish_health(&outcome),
+            Ok(outcome) => match self.state.ack_head_refresh(
+                self.config.connection_id, work.head_refresh_generation,
+            ).await {
+                Ok(_) => self.publish_health(&outcome),
+                Err(error) => {
+                    let mut health = self.health.borrow().clone();
+                    health.last_error = Some(error.to_string());
+                    self.health.send_replace(health);
+                }
+            },
             Err(error) => {
                 let mut health = self.health.borrow().clone();
                 health.last_error = Some(error.to_string());
@@ -1365,6 +1389,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             }
         }
         self.apply_pass(&ctx).await;
+        self.refresh_health().await;
     }
 
     async fn refresh_health(&self) {
@@ -1768,7 +1793,7 @@ mod tests {
                 recovery_dir: fixture.directory.path().join("recovery"),
                 mode: hfdrive_state::ConnectionMode::Writable, start_paused: true,
             },
-            fixture.account.clone(), HeadOnlyRemote { head: None },
+            fixture.account.clone(), HeadOnlyRemote { head: None, ..Default::default() },
             Arc::new(Scheduler::new(Default::default())),
             Arc::new(crate::sync::activity::ActivityRegistry::new()),
             cancel.clone(), receiver,
@@ -1795,6 +1820,71 @@ mod tests {
         assert_eq!(fixture.account.item(fixture.connection, item_id).await.unwrap(), Some(item));
         assert_eq!(fixture.account.observation(fixture.connection, item_id).await.unwrap(), Some(observation));
         assert_eq!(std::fs::read(fixture.root.join("already-here.txt")).unwrap(), b"recover these local bytes");
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reconciliation_waits_for_invalidations_and_preserves_directory_work() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        let fixture = connection_fixture().await;
+        let remote = HeadOnlyRemote::default();
+        let reads = remote.head_reads.clone();
+        let cancel = CancellationToken::new();
+        let (_notifications, receiver) = mpsc::channel(1);
+        let runtime = ConnectionRuntime::start(
+            ConnectionConfig {
+                connection_id: fixture.connection, workspace: fixture.workspace,
+                root_item_id: fixture.root_item, device_id: DeviceId::new(),
+                root: fixture.root.clone(), staging_dir: fixture.directory.path().join("snapshots"),
+                recovery_dir: fixture.directory.path().join("recovery"),
+                mode: hfdrive_state::ConnectionMode::Writable, start_paused: true,
+            },
+            fixture.account.clone(), remote,
+            Arc::new(Scheduler::new(Default::default())),
+            Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            cancel.clone(), receiver,
+        );
+        runtime.resume();
+        runtime.drive().await;
+        runtime.drive().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 1, "an idle tick must not reread remote HEAD");
+
+        fixture.account.record_head_invalidation(fixture.connection, Some("change".to_owned())).await.unwrap();
+        runtime.drive().await;
+        runtime.drive().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 2, "a persisted invalidation must wake an idle connection once");
+
+        runtime.pause();
+        fixture.account.record_head_invalidation(fixture.connection, Some("while-paused".to_owned())).await.unwrap();
+        runtime.drive().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert!(fixture.account.scan_state(fixture.connection).await.unwrap().unwrap().pending_head_refresh);
+        runtime.resume();
+        runtime.drive().await;
+        runtime.drive().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+
+        let item_id = ItemId::new();
+        let intent = SyncIntent::Create {
+            item_id: *item_id.as_uuid(), parent_id: *fixture.root_item.as_uuid(),
+            name: "folder".to_owned(), kind: IntentKind::Directory, content: None,
+        };
+        let entry = intent_entry(
+            fixture.connection, OperationId::new(), Some(item_id), None, None, 0, &intent,
+        ).unwrap();
+        let operation = entry.operation_id;
+        fixture.account.record_observed_work(Some(hfdrive_state::ItemRecord {
+            connection_id: fixture.connection, item_id, parent_id: Some(fixture.root_item),
+            name: "folder".to_owned(), name_key: "folder".to_owned(),
+            kind: hfdrive_state::ItemKind::Directory, revision: operation,
+            content_version_id: None, deleted: false, metadata_json: serde_json::json!({}),
+        }), entry, None).await.unwrap();
+        assert_eq!(fixture.account.work_counts(fixture.connection).await.unwrap().pending_files, 0);
+        runtime.drive().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 4, "directory-only work cannot depend on pending file counts");
+        assert_ne!(fixture.account.outbox_entry(fixture.connection, operation).await.unwrap().unwrap().state, OutboxState::Complete);
         cancel.cancel();
         runtime.disconnect().await.unwrap();
         fixture.state.close().await.unwrap();

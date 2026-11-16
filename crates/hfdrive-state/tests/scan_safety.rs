@@ -276,7 +276,7 @@ async fn head_invalidation_is_persisted_before_the_cursor_advances() {
     assert_eq!(state.cursor.as_deref(), Some("cursor-1"));
 
     // The applied head refresh clears the flag only after processing.
-    let state = account.ack_head_refresh(connection_id).await.unwrap();
+    let state = account.ack_head_refresh(connection_id, state.head_refresh_generation).await.unwrap();
     assert!(!state.pending_head_refresh);
     assert_eq!(state.cursor.as_deref(), Some("cursor-1"), "the cursor is retained for reconnect");
 
@@ -312,4 +312,92 @@ async fn scan_state_survives_restart() {
     assert!(state.pending_head_refresh, "an unacknowledged HEAD refresh survives restart");
     assert_eq!(state.usn_cursor, Some(77));
     store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn acknowledging_a_read_preserves_a_newer_invalidation_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(tmp.path().to_path_buf());
+    let store = StateStore::open(paths.clone()).await.unwrap();
+    let connection = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+    assert!(!account.reconciliation_work(connection, 0).await.unwrap().ready);
+    let first = account.record_head_invalidation(connection, Some("opaque-cursor".to_owned())).await.unwrap();
+    // Independent polling can invalidate HEAD without changing the SSE cursor.
+    let later = account.record_head_invalidation(connection, Some("opaque-cursor".to_owned())).await.unwrap();
+    let acknowledged = account.ack_head_refresh(connection, first.head_refresh_generation).await.unwrap();
+    assert!(acknowledged.pending_head_refresh);
+    assert_eq!(acknowledged.cursor.as_deref(), Some("opaque-cursor"));
+    store.close().await.unwrap();
+
+    let reopened = StateStore::open(paths).await.unwrap();
+    let account = reopened.open_account(account_key()).await.unwrap();
+    let pending = account.reconciliation_work(connection, 0).await.unwrap();
+    assert!(pending.ready, "the newer event must still schedule reconciliation after restart");
+    assert_eq!(pending.head_refresh_generation, later.head_refresh_generation);
+    account.ack_head_refresh(connection, later.head_refresh_generation).await.unwrap();
+    assert!(!account.reconciliation_work(connection, 0).await.unwrap().ready);
+    assert_eq!(account.scan_state(connection).await.unwrap().unwrap().cursor.as_deref(), Some("opaque-cursor"));
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn directory_publication_resolution_waits_for_its_durable_retry_deadline() {
+    use hfdrive_core::ids::{CommitId, GenerationId, ItemId};
+    use hfdrive_state::{ItemKind, ItemRecord, OutboxEntry, OutboxState, OutboxTransition, RetryClass};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(tmp.path().to_path_buf());
+    let store = StateStore::open(paths.clone()).await.unwrap();
+    let connection = connect(&store).await;
+    let account = store.open_account(account_key()).await.unwrap();
+    let root_id = ItemId::new();
+    let root = ItemRecord {
+        connection_id: connection, item_id: root_id, parent_id: None,
+        name: String::new(), name_key: String::new(), kind: ItemKind::Directory,
+        revision: OperationId::new(), content_version_id: None, deleted: false,
+        metadata_json: serde_json::json!({}),
+    };
+    account.upsert_item(root.clone()).await.unwrap();
+    let item_id = ItemId::new();
+    let operation = OperationId::new();
+    let directory = ItemRecord {
+        item_id, parent_id: Some(root_id), name: "folder".to_owned(),
+        name_key: "folder".to_owned(), revision: operation, ..root
+    };
+    let entry = OutboxEntry {
+        connection_id: connection, operation_id: operation, item_id: Some(item_id),
+        base_commit: None, base_json: None, observed_generation: 0,
+        intent_json: serde_json::json!({
+            "intent": "create", "item_id": item_id, "parent_id": root_id,
+            "name": "folder", "kind": "directory", "content": null
+        }),
+        state: OutboxState::Observed, snapshot_id: None, object_ref: None,
+        candidate_commit: None, candidate_head_json: None, expected_etag: None,
+        retry_class: RetryClass::None, next_attempt_at_ms: None,
+    };
+    account.record_observed_work(Some(directory), entry, None).await.unwrap();
+    let candidate = CommitId::new();
+    let workspace = account.get_connection(connection).await.unwrap().unwrap().binding.workspace_id;
+    account.transition_outbox(connection, operation, OutboxTransition::MetadataReady {
+        candidate_commit: candidate,
+        candidate_head_json: serde_json::json!({
+            "format": "hfdrive", "schema_version": 1, "workspace_id": workspace,
+            "root_item_id": root_id, "commit_id": candidate,
+            "generation": GenerationId::new(), "required_features": []
+        }),
+        expected_etag: "\"base\"".to_owned(),
+    }).await.unwrap();
+    account.transition_outbox(connection, operation, OutboxTransition::PublishUnknown {
+        retry_class: RetryClass::Backoff, next_attempt_at_ms: Some(5000),
+    }).await.unwrap();
+    assert_eq!(account.work_counts(connection).await.unwrap().pending_files, 0);
+    assert!(!account.reconciliation_work(connection, 4999).await.unwrap().ready);
+    assert!(account.reconciliation_work(connection, 5000).await.unwrap().ready);
+    store.close().await.unwrap();
+    let reopened = StateStore::open(paths).await.unwrap();
+    let account = reopened.open_account(account_key()).await.unwrap();
+    assert!(!account.reconciliation_work(connection, 4999).await.unwrap().ready);
+    assert!(account.reconciliation_work(connection, 5000).await.unwrap().ready);
+    assert_eq!(account.outbox_entry(connection, operation).await.unwrap().unwrap().state, OutboxState::PublishUnknown);
+    reopened.close().await.unwrap();
 }

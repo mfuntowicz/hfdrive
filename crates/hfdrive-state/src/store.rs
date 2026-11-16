@@ -1446,6 +1446,37 @@ impl Db {
         })
     }
 
+    pub(crate) fn reconciliation_work(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        now_ms: u64,
+    ) -> SResult<ReconciliationWork> {
+        let now_ms = schema::checked_i64(now_ms)?;
+        let conn = self.account_conn(account)?;
+        query_optional(
+            conn,
+            "SELECT e.head_refresh_generation,
+                    e.pending_head_refresh = 1
+                    OR c.observed_commit IS NOT c.applied_commit
+                    OR EXISTS (
+                        SELECT 1 FROM outbox o WHERE o.connection_id = e.connection_id
+                        AND o.state <> 'complete'
+                        AND (o.retry_class = 'none' OR o.next_attempt_at_ms IS NULL OR o.next_attempt_at_ms <= ?2)
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM local_actions a WHERE a.connection_id = e.connection_id AND a.state = 'pending'
+                    )
+             FROM event_cursors e JOIN connections c ON c.connection_id = e.connection_id
+             WHERE e.connection_id = ?1",
+            params![connection_id.as_bytes().as_slice(), now_ms],
+            |row| Ok(ReconciliationWork {
+                head_refresh_generation: c::unsigned(row.get_ref(0)?, "head_refresh_generation")?,
+                ready: c::boolean(row.get_ref(1)?, "reconciliation_ready")?,
+            }),
+        )?.ok_or(StateError::UnknownConnection(connection_id))
+    }
+
     pub(crate) fn storage_counts(
         &mut self,
         account: AccountKey,
@@ -1993,7 +2024,8 @@ impl Db {
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
         let changed = conn.execute(
-            "UPDATE event_cursors SET pending_head_refresh = 1, cursor = ?2, updated_at_ms = ?3 WHERE connection_id = ?1",
+            "UPDATE event_cursors SET pending_head_refresh = 1, head_refresh_generation = head_refresh_generation + 1,
+                    cursor = ?2, updated_at_ms = ?3 WHERE connection_id = ?1",
             params![connection_id.as_bytes().as_slice(), cursor, now],
         )?;
         if changed == 0 {
@@ -2006,16 +2038,15 @@ impl Db {
         &mut self,
         account: AccountKey,
         connection_id: ConnectionId,
+        generation: u64,
     ) -> SResult<ScanState> {
         let now = schema::checked_i64(schema::now_ms())?;
         let conn = self.account_conn(account)?;
-        let changed = conn.execute(
-            "UPDATE event_cursors SET pending_head_refresh = 0, updated_at_ms = ?2 WHERE connection_id = ?1",
-            params![connection_id.as_bytes().as_slice(), now],
+        conn.execute(
+            "UPDATE event_cursors SET pending_head_refresh = 0, updated_at_ms = ?2
+             WHERE connection_id = ?1 AND head_refresh_generation = ?3",
+            params![connection_id.as_bytes().as_slice(), now, schema::checked_i64(generation)?],
         )?;
-        if changed == 0 {
-            return Err(StateError::UnknownConnection(connection_id));
-        }
         self.scan_state(account, connection_id)?.ok_or(StateError::UnknownConnection(connection_id))
     }
 
@@ -2087,7 +2118,7 @@ impl Db {
         query_optional(
             conn,
             "SELECT connection_id, cursor, pending_head_refresh, volume_id, journal_id, usn_cursor,
-                    scan_epoch, scan_complete, scan_invalidated
+                    scan_epoch, scan_complete, scan_invalidated, head_refresh_generation
              FROM event_cursors WHERE connection_id = ?1",
             params![connection_id.as_bytes().as_slice()],
             s::read_scan,

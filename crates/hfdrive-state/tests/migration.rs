@@ -41,7 +41,7 @@ async fn fresh_creation_sets_schema_identity() {
     let account_db = paths.account(key).database();
     assert!(account_db.exists());
     assert_eq!(application_id(&account_db), ACCOUNT_APPLICATION_ID);
-    assert_eq!(user_version(&account_db), 3);
+    assert_eq!(user_version(&account_db), 5);
     store.close().await.unwrap();
 }
 
@@ -199,10 +199,10 @@ async fn corrupt_database_is_refused_and_preserved() {
 }
 
 /// A real v2 account database (the schema this build must upgrade) migrates to
-/// version 3 with a pre-migration backup: work evidence, snapshot operation
+/// the current version with a pre-migration backup: work evidence, snapshot operation
 /// bindings and the paging indexes appear, and the v2 rows keep working.
 #[tokio::test]
-async fn v2_account_database_migrates_to_v3_with_backup() {
+async fn v2_account_database_migrates_to_current_with_backup() {
     use hfdrive_core::ids::{ConnectionId, SnapshotId, WorkspaceId};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -254,7 +254,7 @@ async fn v2_account_database_migrates_to_v3_with_backup() {
     let snapshots = account.list_snapshots(connection_id).await.unwrap();
     store.close().await.unwrap();
 
-    assert_eq!(user_version(&account_db), 3, "the account database must land on schema 3");
+    assert_eq!(user_version(&account_db), 5, "the account database must land on the current schema");
     let conn = Connection::open(&account_db).unwrap();
     for table in ["work_errors"] {
         let found: i64 = conn

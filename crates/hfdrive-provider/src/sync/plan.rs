@@ -343,21 +343,30 @@ pub async fn persist_plan_records(
     plan: &ReconcilePlan,
     facts: &HashMap<ActionId, ActionFacts>,
 ) -> Result<(), PlanError> {
+    let pending = state.pending_local_actions(connection).await?;
     for action in &plan.local_actions {
         let bound = facts.get(&action.action_id);
+        let kind = map_action_kind(action.action);
+        let old_version = action.expected.as_ref().and_then(|item| item.content_version_id);
+        let new_version = action.target.as_ref().and_then(|item| item.content_version_id);
+        // A retry must retain the original guard, not bless newly observed drift.
+        if pending.iter().any(|row| row.item_id == Some(action.item_id)
+            && row.kind == kind && row.old_version == old_version && row.new_version == new_version
+            && row.source_path.as_ref() == bound.and_then(|facts| facts.source_path.as_ref())
+            && row.target_path.as_ref() == bound.and_then(|facts| facts.target_path.as_ref()))
+        {
+            continue;
+        }
         let row = LocalAction {
             connection_id: connection,
             action_id: action.action_id,
             item_id: Some(action.item_id),
-            kind: map_action_kind(action.action),
+            kind,
             expected_file_id: bound.and_then(|f| f.expected_file_id.clone()),
             expected_generation: bound.and_then(|f| f.expected_generation),
             expected_usn: bound.and_then(|f| f.expected_usn),
-            old_version: action
-                .expected
-                .as_ref()
-                .and_then(|state| state.content_version_id),
-            new_version: action.target.as_ref().and_then(|state| state.content_version_id),
+            old_version,
+            new_version,
             source_path: bound.and_then(|f| f.source_path.clone()),
             target_path: bound.and_then(|f| f.target_path.clone()),
             recovery_path: None,
@@ -590,7 +599,7 @@ mod tests {
         record_common_bases(&fixture.account, fixture.connection, observed, &[root.clone(), future_child]).await.unwrap();
         fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(applied)).await.unwrap();
         fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Observed, Some(observed)).await.unwrap();
-        let remote = crate::sync::test_support::HeadOnlyRemote { head: None };
+        let remote = crate::sync::test_support::HeadOnlyRemote::default();
         let source = RemoteDigests(&remote);
         let cancel = CancellationToken::new();
         let mut digests = DigestResolver::new(&source, &cancel);

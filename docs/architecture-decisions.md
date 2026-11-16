@@ -14,6 +14,20 @@ Owner namespaces for storage operations are resolved from the authenticated `who
 
 Explorer presents the HF Drive catalog namespace, not the bucket object listing. Managed immutable payloads, versions, catalog pages and commits live under an explicitly selected prefix. Only conditional replacement of HEAD publishes a change. An ordinary bucket is not silently converted or imported.
 
+Bucket website/CLI edits are not currently imported: SSE paths are reduced to
+managed-HEAD invalidations. A human-readable tree would be an additional
+projection, not a replacement for this authority. Moving the existing managed
+prefix is a separate migration, and dot-prefixed folders are not access control.
+
+Lossless reconciliation of arbitrary website writes is not established by the
+documented service contract. Native Xet add/copy/delete exposes no documented
+destination precondition; supported S3 copy-source conditions do not guard a
+newer destination. Pre/post-read checks and event replay cannot close that race
+or recover every overwritten non-versioned revision. Do not silently enable a
+mutable projection or claim safe bidirectional website editing on that basis.
+Sources: [native batch/events contract](https://huggingface.co/.well-known/openapi.json),
+[S3 API differences](https://huggingface.co/docs/hub/storage-buckets-s3#other-api-differences).
+
 Payload transport is native HF/Xet. S3 is the conditional publication channel, not a replacement payload backend. An Xet identifier, application SHA-256 and S3 ETag are distinct types. Retained committed history is not automatically garbage-collected and may incur storage costs.
 
 ## ADR 003 — Separate credential authorities

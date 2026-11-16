@@ -48,6 +48,9 @@ Every external effect is preceded by a durable record on the account database
    CFAPI operations with journaled expectations (file id, generation, USN).
    Unknown or drifted expectations never count as a match; a guard refusal
    keeps the old content and the durable pending action.
+   Refused namespace actions block Applied advancement. Replanning an equivalent
+   pending action reuses its original journal identity and file/generation/USN
+   expectations; a retry never grants itself permission by replacing that guard.
 7. **Completion** — `complete_outbox` closes the entry only from
    `LocalApplyPending` and clears `dirty` only when the persisted generation
    still matches. A newer generation stays dirty and gets its own follow-up
@@ -71,6 +74,28 @@ bounded record reads and range streams without any S3 credential. Local edits
 stay durable and recoverable, are reported as pending, and never dispatch.
 A native-only `HEAD` read carries no ETag and therefore can never authorize a
 conditional write.
+
+## Remote refresh scheduling
+
+Bucket SSE notifications and the independent jittered 60–90-second fallback
+request managed-HEAD reconciliation. The two-second runtime tick checks durable
+dispatch readiness; an idle tick does not perform another network HEAD read.
+Startup/resume forces a refresh, and pending directory-only outbox work and
+local-apply journals remain eligible even when the pending-file count is zero.
+
+Each persisted invalidation increments `head_refresh_generation`. A successful
+HEAD read acknowledges only the generation captured before that round;
+invalidations arriving during the read remain pending, even when their opaque
+SSE cursor is unchanged. A paused connection retains these invalidations.
+Account schema 5 stores this generation through a forward migration with an
+online pre-migration backup; older binaries must not open the newer schema.
+
+This is managed-catalog reconciliation, not import of arbitrary website edits.
+The external-edit/destination-write limitations are recorded in ADR 002.
+
+An established connection with a remembered Observed, Published, or Applied
+baseline cannot treat a missing remote HEAD as a fresh workspace. It reports
+`RemoteContentUnavailable` and retains local bytes and all known baselines.
 
 ## Mode and lifecycle distinctions
 

@@ -462,3 +462,30 @@ Evidence: `artifacts/acceptance/file-copy-roundtrip.json`,
 `fresh-published-file-native-verified.json`, `fresh-file-item-history.log`, and
 `final-file-sync-root-verified.json`. The three temporary native QA scripts
 were removed after verification.
+
+### Reconciliation refresh generations
+
+Passed: seven migration and eight scan-safety tests. Account schema 5 retains
+the committed migration sequence, creates a WAL-consistent pre-migration
+backup, and adds a monotonic HEAD-refresh generation. A completed read cannot
+acknowledge a newer invalidation, even when polling retained the same opaque
+SSE cursor; the pending dispatch survives an actual database close/reopen.
+Evidence: `artifacts/tests/reconciliation-state.log`.
+
+This gate used isolated temporary databases, not the registered user drive.
+
+A further focused regression passed for directory-only metadata publication:
+with zero pending files, ambiguous publication remains parked before its
+durable retry deadline and becomes eligible at that deadline after reopen.
+Evidence: `artifacts/tests/reconciliation-directory-deadline.log`.
+
+Passed: 40 provider `sync::` tests, including no idle HEAD reread, durable
+invalidation wake-up, pause/resume retention, directory-only dispatch, missing
+established HEAD preservation, and refused namespace application. The guarded
+application case retains actual local bytes and the old Applied baseline;
+replanning keeps one original journal entry instead of replacing its guard.
+Evidence: `artifacts/tests/reconciliation-provider.log`.
+
+These are deterministic local-state/temporary-filesystem gates. No readable
+bucket projection, arbitrary website-edit import, live migration, or new
+two-device acceptance is claimed by this change.

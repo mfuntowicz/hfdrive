@@ -16,7 +16,7 @@ use std::{
 };
 
 pub const CONTROL_SCHEMA_VERSION: u32 = 2;
-pub const ACCOUNT_SCHEMA_VERSION: u32 = 3;
+pub const ACCOUNT_SCHEMA_VERSION: u32 = 5;
 
 const CONTROL_APPLICATION_ID: i64 = 0x4846_4443; // "HFDC"
 const ACCOUNT_APPLICATION_ID: i64 = 0x4846_4441; // "HFDA"
@@ -29,6 +29,8 @@ const ACCOUNT_MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001.sql")),
     (2, include_str!("../migrations/0002.sql")),
     (3, include_str!("../migrations/0003.sql")),
+    (4, include_str!("../migrations/0004.sql")),
+    (5, include_str!("../migrations/0005.sql")),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
