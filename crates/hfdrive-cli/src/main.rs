@@ -1,6 +1,7 @@
 mod account;
 mod args;
 mod client;
+mod import;
 
 use args::{Cli, Command, ProviderCommand};
 use clap::Parser;
@@ -34,6 +35,8 @@ enum CliError {
     LoginEnded(hfdrive_protocol::LoginPhase),
     #[error("storage credentials were verified and saved, but the provider has not reconnected the drive")]
     RepairIncomplete,
+    #[error(transparent)]
+    Import(#[from] import::ImportRequestError),
 }
 
 fn policy() -> Result<IpcPolicy, CliError> {
@@ -63,6 +66,10 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
     if matches!(&arguments.command, Command::Provider { command: ProviderCommand::Exit { confirm: false } }) {
         return Err(CliError::ExitConfirmation);
     }
+    let import_request = match &arguments.command {
+        Command::Import { request } => Some(import::load_request(*request)?),
+        _ => None,
+    };
     let cancellation = CancellationToken::new();
     let stop = cancellation.clone();
     tokio::spawn(async move { if tokio::signal::ctrl_c().await.is_ok() { stop.cancel(); } });
@@ -77,6 +84,7 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
     if hello.protocol_major != 1 || hello.protocol_minor != 0 { return Err(CliError::Response); }
     let request = match &arguments.command {
         Command::Status { .. } => Request::GetStatus(GetStatusRequest {}),
+        Command::Import { .. } => Request::Import(import_request.clone().ok_or(CliError::Response)?),
         Command::Pause(connection) => Request::Pause(PauseRequest {
             operation_id: Uuid::new_v4(), connection_id: Some(connection.connection),
         }),
@@ -150,6 +158,7 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
         _ => return Err(CliError::Unavailable),
     };
     let request_timeout = match &arguments.command {
+        Command::Import { .. } => Duration::from_secs(600),
         Command::Probe { .. } | Command::RepairStorage { .. } => Duration::from_secs(180),
         _ => Duration::from_secs(30),
     };
@@ -179,6 +188,33 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
                         state_text(connection.state), connection.owner.namespace.as_deref().unwrap_or("namespace not reported"), connection.bucket.name, connection.root_path)?;
                 }
             }
+        }
+        (Command::Import { request }, ResponseResult::Import(result)) => {
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "Imported {} file(s), {} bytes, into {}.", result.file_count, result.total_bytes, result.prefix)?;
+            if result.empty_directory_count > 0 {
+                writeln!(output, "{} empty director{} not imported: native buckets contain files, not standalone directory objects.",
+                    result.empty_directory_count, if result.empty_directory_count == 1 { "y was" } else { "ies were" })?;
+            }
+            let mut page = result;
+            let mut previous_cursor = None;
+            loop {
+                for file in page.files {
+                    writeln!(output, "{}\t{}\t{}\t{}", file.key, file.size, file.sha256, file.xet_file_id)?;
+                }
+                let Some(cursor) = page.next_cursor else { break; };
+                if previous_cursor.as_ref() == Some(&cursor) { return Err(CliError::Response); }
+                previous_cursor = Some(cursor.clone());
+                let continuation = import_request.clone().ok_or(CliError::Response)?;
+                let next = tokio::time::timeout(request_timeout, client::call(&mut stream,
+                    Request::Import(hfdrive_protocol::ImportRequest {
+                        files_cursor: Some(cursor),
+                        ..continuation
+                    }), &cancellation)).await.map_err(|_| CliError::Timeout)??;
+                let ResponseResult::Import(next) = next else { return Err(CliError::Response); };
+                page = next;
+            }
+            import::remove_completed_request(*request)?;
         }
         (Command::Pause(_), ResponseResult::Pause(result)) => {
             writeln!(std::io::stdout().lock(), "Paused connections: {:?}", result.paused_connection_ids)?;

@@ -1611,7 +1611,9 @@ dependencies = [
  "clap",
  "hfdrive-protocol",
  "hfdrive-windows",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -1717,6 +1719,19 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "hfdrive-shell"
+version = "0.1.0"
+dependencies = [
+ "hfdrive-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

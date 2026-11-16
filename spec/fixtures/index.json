@@ -243,6 +243,38 @@
       "expectation": {
         "parse": "accept"
       }
+    },
+    {
+      "name": "import_request",
+      "file": "golden/import_request.json",
+      "description": "import request with the exact target object and raw bucket source paths (mutation operation id)",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "import_response_result",
+      "file": "golden/import_response_result.json",
+      "description": "import result with the exact hfdrive-imports/<import_id> prefix (no trailing slash), per-file result records and full-width decimal u64 sizes/counts",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "import_response_result_paged",
+      "file": "golden/import_response_result_paged.json",
+      "description": "import result page carrying next_cursor: one page of per-file records with complete import_id/prefix/file_count/total_bytes repeated on every page",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "import_request_files_cursor",
+      "file": "golden/import_request_files_cursor.json",
+      "description": "import request page continuation carrying files_cursor for the same operation (read replay, never a second mutation)",
+      "expectation": {
+        "parse": "accept"
+      }
     }
   ],
   "invalid": [
@@ -420,6 +452,125 @@
       "stage": "envelope",
       "error_code": "malformed_frame",
       "description": "payload bytes are not valid UTF-8"
+    },
+    {
+      "name": "reject_import_target_unknown_member",
+      "file": "invalid/reject_import_target_unknown_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request whose target object carries an unknown member is rejected"
+    },
+    {
+      "name": "reject_import_target_missing_field",
+      "file": "invalid/reject_import_target_missing_field.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request whose target object omits a required field is rejected"
+    },
+    {
+      "name": "reject_import_target_enum",
+      "file": "invalid/reject_import_target_enum.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request whose target visibility is an unknown enum variant is rejected"
+    },
+    {
+      "name": "reject_import_sources_not_string",
+      "file": "invalid/reject_import_sources_not_string.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request whose sources array contains a non-string entry is rejected"
+    },
+    {
+      "name": "reject_import_sources_missing",
+      "file": "invalid/reject_import_sources_missing.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request without the required sources array is rejected"
+    },
+    {
+      "name": "reject_import_unknown_body_member",
+      "file": "invalid/reject_import_unknown_body_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request body with an unknown member is rejected"
+    },
+    {
+      "name": "reject_import_result_prefix_wrong_type",
+      "file": "invalid/reject_import_result_prefix_wrong_type.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result whose prefix is not a string is rejected"
+    },
+    {
+      "name": "reject_import_result_prefix_mismatch",
+      "file": "invalid/reject_import_result_prefix_mismatch.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result whose prefix is not exactly hfdrive-imports/<import_id> (no trailing slash) is rejected"
+    },
+    {
+      "name": "reject_import_result_file_unknown_member",
+      "file": "invalid/reject_import_result_file_unknown_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result whose per-file record carries an unknown member is rejected"
+    },
+    {
+      "name": "reject_import_result_file_missing_field",
+      "file": "invalid/reject_import_result_file_missing_field.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result whose per-file record omits xet_file_id is rejected"
+    },
+    {
+      "name": "reject_import_size_number",
+      "file": "invalid/reject_import_size_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result per-file size sent as a JSON number instead of a decimal string is rejected"
+    },
+    {
+      "name": "reject_import_size_leading_zero",
+      "file": "invalid/reject_import_size_leading_zero.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result total_bytes with a leading zero is rejected"
+    },
+    {
+      "name": "reject_import_size_overflow",
+      "file": "invalid/reject_import_size_overflow.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result total_bytes beyond u64 range is rejected"
+    },
+    {
+      "name": "reject_import_files_cursor_number",
+      "file": "invalid/reject_import_files_cursor_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import request files_cursor sent as a JSON number instead of a string is rejected"
+    },
+    {
+      "name": "reject_import_next_cursor_number",
+      "file": "invalid/reject_import_next_cursor_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result next_cursor sent as a JSON number instead of a string is rejected"
+    },
+    {
+      "name": "reject_import_file_count_string",
+      "file": "invalid/reject_import_file_count_string.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result file_count sent as a decimal string instead of a u32 JSON number is rejected"
+    },
+    {
+      "name": "reject_import_empty_directory_count_string",
+      "file": "invalid/reject_import_empty_directory_count_string.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "import result empty_directory_count sent as a decimal string instead of a u32 JSON number is rejected"
     }
   ]
 }

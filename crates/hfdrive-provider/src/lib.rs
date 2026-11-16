@@ -19,6 +19,8 @@ mod connect;
 mod controls;
 mod diagnostics;
 mod history;
+mod import;
+mod import_menu;
 mod inspect;
 mod operations;
 mod probe;
@@ -207,7 +209,7 @@ impl Provider {
             protocol_major: 1,
             protocol_minor: 0,
             provider_version: env!("CARGO_PKG_VERSION").to_owned(),
-            supported_features: ["get_status", "subscribe_status", "cancel_request", "start_login", "cancel_login", "sign_out", "list_owners", "list_buckets", "create_bucket", "inspect_drive", "list_conflicts", "resolve_conflict", "list_history", "restore", "begin_setup", "set_publication_credentials", "preview_connect", "connect", "probe_storage", "repair_storage", "pause", "resume", "set_pin", "free_space", "set_selective_sync", "export_diagnostics", "prepare_unlink", "unlink", "update_settings", "list_activity", "prepare_upgrade", "exit_provider"]
+            supported_features: ["get_status", "subscribe_status", "cancel_request", "start_login", "cancel_login", "sign_out", "list_owners", "list_buckets", "create_bucket", "inspect_drive", "list_conflicts", "resolve_conflict", "list_history", "restore", "begin_setup", "set_publication_credentials", "preview_connect", "connect", "probe_storage", "repair_storage", "pause", "resume", "set_pin", "free_space", "set_selective_sync", "export_diagnostics", "prepare_unlink", "unlink", "update_settings", "list_activity", "prepare_upgrade", "exit_provider", "import"]
                 .into_iter().map(str::to_owned).collect(),
             supported_min_protocol_minor: 0,
         })
@@ -270,6 +272,15 @@ impl Provider {
 
     async fn execute_mutation_action(self: &Arc<Self>, request: Request) -> operations::MutationOutcome {
         match request {
+            Request::Import(request) => {
+                let outcome = self.import(request).await;
+                let uncertain = self.operations.cancellation.is_cancelled()
+                    || outcome.as_ref().is_err_and(|error| matches!(error.code,
+                        ProtocolErrorCode::Cancelled | ProtocolErrorCode::Timeout | ProtocolErrorCode::Internal));
+                operations::MutationOutcome {
+                    reply: outcome.map(ResponseResult::Import).into(), uncertain,
+                }
+            }
             Request::StartLogin(request) => self.start_login(request).await.map(ResponseResult::StartLogin).into(),
             Request::CancelLogin(request) => self.cancel_login(request.session_id).await.map(ResponseResult::CancelLogin).into(),
             Request::SignOut(_) => self.sign_out().await.map(ResponseResult::SignOut).into(),
@@ -378,6 +389,7 @@ impl Provider {
             _ => {
                 let account = self.auth.active_profile().ok_or_else(|| error(ProtocolErrorCode::NeedsSignIn, "An authenticated account is required"))?.account_key;
                 let id = match request {
+                    Request::Import(_) => None,
                     Request::SetPublicationCredentials(r) => Some(connection(r.connection_id)?),
                     Request::ProbeStorage(r) => Some(connection(r.connection_id)?),
                     Request::RepairStorage(r) => Some(connection(r.connection_id)?),

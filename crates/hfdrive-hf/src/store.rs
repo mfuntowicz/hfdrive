@@ -4,8 +4,9 @@
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use hfdrive_core::ids::AccountKey;
 use hfdrive_core::storage::{
-    ByteRange, DriveBinding, ImmutableKey, ObjectRef, PayloadKey, RelativeKey, RemotePrefix, Sha256Digest,
+    BucketBinding, ByteRange, DriveBinding, ImmutableKey, ObjectRef, PayloadKey, RelativeKey, RemotePrefix, Sha256Digest,
     StableSnapshot, XetFileId,
 };
 use serde::{Deserialize, Serialize};
@@ -579,9 +580,31 @@ impl Drop for RangeReader {
     }
 }
 
+#[derive(Clone, Debug)]
+enum StoreBinding {
+    Managed(DriveBinding),
+    Raw(BucketBinding),
+}
+
+impl StoreBinding {
+    fn bucket(&self) -> &BucketBinding {
+        match self {
+            Self::Managed(binding) => &binding.bucket,
+            Self::Raw(binding) => binding,
+        }
+    }
+
+    fn managed(&self) -> Option<&DriveBinding> {
+        match self {
+            Self::Managed(binding) => Some(binding),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
 struct StoreInner<T: TokenSource> {
     api: NativeApi<T>,
-    binding: DriveBinding,
+    binding: StoreBinding,
     config: NativeConfig,
     xet: std::sync::Mutex<Option<XetStore>>,
 }
@@ -606,12 +629,22 @@ impl<T: TokenSource> NativeBucketStore<T> {
             return Err(NativeError::IdentityMismatch);
         }
         Ok(Self {
-            inner: Arc::new(StoreInner { api, binding, config, xet: std::sync::Mutex::new(None) }),
+            inner: Arc::new(StoreInner { api, binding: StoreBinding::Managed(binding), config, xet: std::sync::Mutex::new(None) }),
         })
     }
 
+    /// Managed drive binding. Raw import stores deliberately have no workspace;
+    /// callers through [`NativeRawStore`] never receive this accessor.
     pub fn binding(&self) -> &DriveBinding {
-        &self.inner.binding
+        self.inner.binding.managed().expect("managed drive binding required")
+    }
+
+    fn bucket(&self) -> &BucketBinding {
+        self.inner.binding.bucket()
+    }
+
+    fn managed_prefix(&self) -> Result<&RemotePrefix, NativeError> {
+        self.inner.binding.managed().map(|binding| &binding.prefix).ok_or(NativeError::IdentityMismatch)
     }
 
     /// Capture the operation lease; thread it through every dispatch of one
@@ -632,7 +665,7 @@ impl<T: TokenSource> NativeBucketStore<T> {
     }
 
     fn bucket_ns_name(&self) -> (&str, &str) {
-        let bucket = &self.inner.binding.bucket;
+        let bucket = self.bucket();
         (bucket.owner_namespace.as_str(), bucket.bucket_name.as_str())
     }
 
@@ -652,7 +685,7 @@ impl<T: TokenSource> NativeBucketStore<T> {
         tree_page(
             &self.inner.api,
             lease,
-            &self.inner.binding.bucket,
+            self.bucket(),
             prefix,
             recursive,
             limit,
@@ -894,7 +927,7 @@ impl<T: TokenSource> NativeBucketStore<T> {
         checkpoint: &CasCommitCheckpoint,
     ) -> Result<StagedCommitted<T>, NativeError> {
         self.inner.api.check_lease(lease)?;
-        let target_key = self.inner.binding.prefix.immutable_key(ImmutableKey::Payload(snapshot.upload_id));
+        let target_key = self.managed_prefix()?.immutable_key(ImmutableKey::Payload(snapshot.upload_id));
         if checkpoint.target_key != target_key.as_str()
             || checkpoint.size != snapshot.size
             || checkpoint.sha256 != snapshot.sha256
@@ -918,8 +951,17 @@ impl<T: TokenSource> NativeBucketStore<T> {
         target: ImmutableKey,
         source: UploadSource,
     ) -> Result<StagedUpload<T>, NativeError> {
+        let target_key = self.managed_prefix()?.immutable_key(target);
+        self.begin_exact_upload(lease, target_key, source)
+    }
+
+    fn begin_exact_upload(
+        &self,
+        lease: &NativeLease,
+        target_key: RelativeKey,
+        source: UploadSource,
+    ) -> Result<StagedUpload<T>, NativeError> {
         self.inner.api.check_lease(lease)?;
-        let target_key = self.inner.binding.prefix.immutable_key(target);
         let (expected_size, expected_sha256) = match &source {
             UploadSource::Snapshot(snapshot) => {
                 let size = std::fs::metadata(&snapshot.path).map_err(|_| NativeError::SourceChanged)?.len();
@@ -1031,10 +1073,10 @@ impl<T: TokenSource> NativeBucketStore<T> {
             return Ok(RangeReader::cached(pieces, range.len(), self.inner.api.budget().clone(), self.inner.config.range_chunk_bytes));
         }
         let state = self.inner.api.client_state().await?;
-        let refresh_url = XetStore::read_token_url(self.inner.api.endpoint(), &self.inner.binding.bucket)?;
+        let refresh_url = XetStore::read_token_url(self.inner.api.endpoint(), self.bucket())?;
         let group = self
             .xet()?
-            .read_group(&self.inner.binding.bucket, &refresh_url, state.bearer.clone(), state.generation)
+            .read_group(self.bucket(), &refresh_url, state.bearer.clone(), state.generation)
             .await?;
         let info = crate::xet::file_info(object.xet_file_id.as_str(), object.size);
         let stream = tokio::select! {
@@ -1095,6 +1137,147 @@ impl<T: TokenSource> NativeBucketStore<T> {
             activity: source.activity,
             cursor: None,
             ended: false,
+        })
+    }
+}
+
+/// Account+bucket raw storage plane for one-shot imports. Unlike the managed
+/// store this has no workspace, managed prefix, HEAD, catalog or connection:
+/// every payload key is supplied exactly by the caller (preflighted through
+/// [`hfdrive_core::storage::RelativeKey`]) and no managed key is ever derived.
+/// The same staged Xet ingestion/CAS/binding checkpoints are reused verbatim,
+/// so an interrupted import can resume from durable evidence.
+pub struct NativeRawStore<T: TokenSource> {
+    store: NativeBucketStore<T>,
+}
+
+impl<T: TokenSource> Clone for NativeRawStore<T> {
+    fn clone(&self) -> Self {
+        Self { store: self.store.clone() }
+    }
+}
+
+impl<T: TokenSource> NativeRawStore<T> {
+    /// Build a raw store for exactly one account+bucket pair. The account must
+    /// equal the [`NativeApi`] account; a mismatch is
+    /// [`NativeError::IdentityMismatch`] at construction, so a cross-account
+    /// lease can never reach a dispatch from this store. No workspace,
+    /// managed prefix, or connection identity exists here.
+    pub fn new(
+        api: NativeApi<T>,
+        account: AccountKey,
+        bucket: BucketBinding,
+        config: NativeConfig,
+    ) -> Result<Self, NativeError> {
+        if account != api.account() {
+            return Err(NativeError::IdentityMismatch);
+        }
+        Ok(Self {
+            store: NativeBucketStore {
+                inner: Arc::new(StoreInner {
+                    api,
+                    binding: StoreBinding::Raw(bucket),
+                    config,
+                    xet: std::sync::Mutex::new(None),
+                }),
+            },
+        })
+    }
+
+    /// The exact bucket binding; there is deliberately no workspace accessor.
+    pub fn bucket(&self) -> &BucketBinding {
+        self.store.bucket()
+    }
+
+    /// Capture the operation lease; thread it through every dispatch of one
+    /// durable operation.
+    pub fn capture_lease(&self) -> Result<NativeLease, NativeError> {
+        self.store.capture_lease()
+    }
+
+    /// Real native read-authorization check against the selected bucket.
+    pub async fn check_native_read(&self, lease: &NativeLease, cancel: &CancellationToken) -> Result<(), NativeError> {
+        self.store.check_native_read(lease, cancel).await
+    }
+
+    /// Real native write-authorization check against the selected bucket.
+    /// Callers run this at invocation and again before resumed uploads: a
+    /// target listing or cached selection is never authorization.
+    pub async fn check_native_write(&self, lease: &NativeLease, cancel: &CancellationToken) -> Result<(), NativeError> {
+        self.store.check_native_write(lease, cancel).await
+    }
+
+    /// Native HEAD metadata for one exact raw key (`Ok(None)` when absent).
+    /// Occupant reconciliation uses this before binding: `addFile` is
+    /// unconditional, so an existing key may only be resumed when durable
+    /// same-import evidence agrees with the live size and Xet identity; any
+    /// other occupant must park or fail, never be rebound.
+    pub async fn file_metadata(
+        &self,
+        lease: &NativeLease,
+        key: &RelativeKey,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ObjectMetadata>, NativeError> {
+        self.store.file_metadata(lease, key, cancel).await
+    }
+
+    /// Targeted metadata lookup for exact raw keys with full per-key
+    /// reconciliation (see [`NativeBucketStore::paths_info`]).
+    pub async fn paths_info(
+        &self,
+        lease: &NativeLease,
+        keys: &[RelativeKey],
+        cancel: &CancellationToken,
+    ) -> Result<PathsInfoReport, NativeError> {
+        self.store.paths_info(lease, keys, cancel).await
+    }
+
+    /// Apply add/delete operations for exact raw keys (see
+    /// [`NativeBucketStore::apply_batch`]); every result must be reconciled
+    /// before advancing an import journal.
+    pub async fn apply_batch(
+        &self,
+        lease: &NativeLease,
+        ops: Vec<BatchOp>,
+        cancel: &CancellationToken,
+    ) -> Result<BatchReport, NativeError> {
+        self.store.apply_batch(lease, ops, cancel).await
+    }
+
+    /// Begin one staged upload to an exact raw key. No workspace or managed
+    /// key is derived; the caller supplies the preflighted [`RelativeKey`].
+    pub fn begin_raw_upload(
+        &self,
+        lease: &NativeLease,
+        target_key: RelativeKey,
+        source: UploadSource,
+    ) -> Result<StagedUpload<T>, NativeError> {
+        self.store.begin_exact_upload(lease, target_key, source)
+    }
+
+    /// Resume exact raw-key binding from durable CAS evidence without
+    /// re-ingestion or another upload. `checkpoint.target_key` must equal
+    /// `key` exactly, and its size/SHA-256 must match the checkpoint's own
+    /// record; anything else is [`NativeError::SourceChanged`] and is never
+    /// bound. Call [`StagedCommitted::bind`] to cross the binding boundary.
+    pub fn resume_raw_committed(
+        &self,
+        lease: &NativeLease,
+        key: &RelativeKey,
+        checkpoint: &CasCommitCheckpoint,
+    ) -> Result<StagedCommitted<T>, NativeError> {
+        self.store.inner.api.check_lease(lease)?;
+        if checkpoint.target_key != key.as_str() {
+            return Err(NativeError::SourceChanged);
+        }
+        let checkpoint_key = RelativeKey::new(checkpoint.target_key.clone()).map_err(|_| NativeError::SourceChanged)?;
+        Ok(StagedCommitted {
+            store: self.store.clone(),
+            lease: lease.clone(),
+            target_key: checkpoint_key,
+            xet_file_id: checkpoint.xet_file_id.clone(),
+            size: checkpoint.size,
+            sha256: checkpoint.sha256,
         })
     }
 }
@@ -1178,7 +1361,7 @@ impl<T: TokenSource> StagedUpload<T> {
         if cancel.is_cancelled() {
             return Err(NativeError::Cancelled);
         }
-        let write_url = XetStore::write_token_url(self.store.inner.api.endpoint(), &self.store.inner.binding.bucket)?;
+        let write_url = XetStore::write_token_url(self.store.inner.api.endpoint(), self.store.bucket())?;
         let state = self.store.inner.api.client_state().await?;
         let commit = self.store.xet()?.write_commit(&write_url, state.bearer.clone()).await?;
 

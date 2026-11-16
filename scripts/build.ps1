@@ -82,6 +82,16 @@ try {
         throw "MSBuild failed with exit code $LASTEXITCODE."
     }
 
+    # ---- Rust Explorer COM contract tests -----------------------------------
+    # The hfdrive-shell cdylib is built by the Cargo workspace above. These tests
+    # exercise the strict shared request/target/path contracts only; they never
+    # register COM, load the DLL into Explorer, or contact Hugging Face.
+    Write-Host 'Running cargo test -p hfdrive-shell --locked --target x86_64-pc-windows-msvc'
+    & cargo test -p hfdrive-shell --locked --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) {
+        throw "Rust shell contract tests failed with exit code $LASTEXITCODE."
+    }
+
     # ---- Build provenance ----
     $provenanceDir = Join-Path $repoRoot 'artifacts\build'
     New-Item -ItemType Directory -Force -Path $provenanceDir | Out-Null

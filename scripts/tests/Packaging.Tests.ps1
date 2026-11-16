@@ -78,8 +78,36 @@ Assert-HfDrive ($capNames -contains 'runFullTrust') 'runFullTrust capability is 
 Assert-HfDrive ($capNames -contains 'unvirtualizedResources') 'unvirtualizedResources capability is required.'
 
 $ignorable = @(($manifest.Package.IgnorableNamespaces -split '\s+') | Where-Object { $_ })
-foreach ($ns in @('uap5', 'uap10', 'rescap', 'virtualization')) {
+foreach ($ns in @('com', 'desktop4', 'desktop5', 'uap5', 'uap10', 'rescap', 'virtualization')) {
     Assert-HfDrive ($ignorable -contains $ns) "IgnorableNamespaces must contain '$ns'."
+}
+
+# ---- Explorer shell command registration ---------------------------------
+$shellClsid = Get-HfDriveShellCommandClsid
+$surrogateClass = @(Get-HfDriveManifestNodes -Manifest $manifest `
+    -XPath "/f:Package/f:Applications/f:Application[@Id='HFDrive']/f:Extensions/com:Extension/com:ComServer/com:SurrogateServer/com:Class")
+Assert-HfDrive (@($surrogateClass).Count -eq 1) 'Exactly one shell COM class must be registered.'
+Assert-HfDrive ($surrogateClass[0].GetAttribute('Id') -eq $shellClsid) "Shell COM class Id must be '$shellClsid'."
+Assert-HfDrive ($surrogateClass[0].GetAttribute('Path') -eq 'shell\HfDrive.Shell\HfDrive.Shell.dll') `
+    'Shell COM class Path must be shell\HfDrive.Shell\HfDrive.Shell.dll.'
+Assert-HfDrive ($surrogateClass[0].GetAttribute('ThreadingModel') -eq 'STA') `
+    'Shell COM class must be registered with the STA threading model for com:SurrogateServer.'
+
+$shellVerbs = @(Get-HfDriveManifestNodes -Manifest $manifest `
+    -XPath "/f:Package/f:Applications/f:Application[@Id='HFDrive']/f:Extensions/desktop4:Extension/desktop4:FileExplorerContextMenus/desktop5:ItemType/desktop5:Verb")
+Assert-HfDrive (@($shellVerbs).Count -eq 2) 'The shell verb must be registered exactly twice (files and folders).'
+foreach ($verb in $shellVerbs) {
+    Assert-HfDrive ($verb.GetAttribute('Clsid') -eq $shellClsid) "Shell verb Clsid must be '$shellClsid'."
+    Assert-HfDrive ($verb.GetAttribute('Id') -eq 'HuggingFaceDrive') 'Shell verb Id must be HuggingFaceDrive.'
+}
+$itemTypes = @(Get-HfDriveManifestNodes -Manifest $manifest `
+    -XPath "/f:Package/f:Applications/f:Application[@Id='HFDrive']/f:Extensions/desktop4:Extension/desktop4:FileExplorerContextMenus/desktop5:ItemType")
+$typeValues = @($itemTypes | ForEach-Object { $_.GetAttribute('Type') })
+Assert-HfDrive (@($typeValues | Sort-Object) -join ',' -eq '*,Directory') `
+    "Context menu ItemTypes must be exactly '*' and 'Directory' (no Directory\Background)."
+foreach ($itemType in $itemTypes) {
+    Assert-HfDrive ($itemType.GetAttribute('Type') -ne 'Directory\Background') `
+        'Directory\Background must not be registered.'
 }
 
 # Tokens are rendered at package time; the checked-in template keeps exactly these two.
@@ -160,6 +188,13 @@ Assert-HfDrive ($packageScript -match 'Unsigned development package: no certific
     'Unsigned mode must state that no certificate/trust/install action occurs.'
 Assert-HfDrive ($packageScript -match 'startIndexAt = ''assets''') `
     'PRI generation must index only application-owned assets and avoid WinUI-internal duplicates.'
+Assert-HfDrive ($packageScript -match 'shell\\HfDrive\.Shell\\HfDrive\.Shell\.dll') `
+    'package.ps1 must stage the shell COM DLL at the manifest path shell\HfDrive.Shell\HfDrive.Shell.dll.'
+Assert-HfDrive ($packageScript -match 'Path="shell\\HfDrive\.Shell\\HfDrive\.Shell\.dll"') `
+    'package.ps1 must verify the rendered manifest registers exactly the staged shell DLL path.'
+$buildScript = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts\build.ps1') -Raw
+Assert-HfDrive ($buildScript -match 'cargo test -p hfdrive-shell --locked --target x86_64-pc-windows-msvc') `
+    'build.ps1 must run the deterministic Rust shell contract tests.'
 $appxManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'packaging\AppxManifest.xml') -Raw
 Assert-HfDrive ($appxManifest -match '<uap5:AppExecutionAlias uap10:Subsystem="console">') `
     'Console subsystem must be declared on uap5:AppExecutionAlias, not uap5:Extension or uap5:ExecutionAlias.'

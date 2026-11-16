@@ -244,6 +244,16 @@ public sealed record Envelope
                 if (hasResult)
                 {
                     DeserializeInto(result, resultType);
+                    if (method == "import")
+                    {
+                        // Contract invariant: the destination prefix is exactly
+                        // hfdrive-imports/<import_id> (no trailing slash).
+                        var import = Deserialize<ImportResult>(result);
+                        if (import.Prefix != $"hfdrive-imports/{import.ImportId}")
+                        {
+                            throw new ProtocolException(ProtocolErrorCode.MalformedFrame, "invalid field prefix");
+                        }
+                    }
                 }
                 else
                 {
@@ -419,6 +429,7 @@ internal static class CommandTypes
         ["unlink"] = (typeof(UnlinkRequest), typeof(UnlinkResult)),
         ["prepare_upgrade"] = (typeof(PrepareUpgradeRequest), typeof(PrepareUpgradeResult)),
         ["exit_provider"] = (typeof(ExitProviderRequest), typeof(ExitProviderResult)),
+        ["import"] = (typeof(ImportRequest), typeof(ImportResult)),
     };
 
     internal static (Type Request, Type Result) Lookup(string method) =>

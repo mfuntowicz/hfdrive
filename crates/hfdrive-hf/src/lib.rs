@@ -44,7 +44,7 @@ pub use control::{
 };
 pub use store::{
     BatchAdd, BatchFailure, BatchOp, BatchReport, BoundObject, CasCommitCheckpoint, ChangeOp, EventCursor, EventResume,
-    IngestionCheckpoint, NativeBucketStore, NativeChange, NativeEvent, NativeEventStream, NativeTreeEntry,
+    IngestionCheckpoint, NativeBucketStore, NativeChange, NativeEvent, NativeEventStream, NativeRawStore, NativeTreeEntry,
     ObjectMetadata, PageCursor, PathInfo, PathKind, PathsInfoReport, RangeCache, RangeReader, StagedCommitted, StagedIngested,
     StagedUpload, TreePage, UploadSource,
 };

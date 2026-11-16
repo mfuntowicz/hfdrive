@@ -128,12 +128,23 @@ impl Provider {
             Ok(id) => id,
             Err(_) => return Err(error(ProtocolErrorCode::InvalidRequest, "A nonzero operation identifier is required")).into(),
         };
-        let request_value = match serde_json::to_value(&request) {
+        let import_cursor = match &request {
+            Request::Import(request) => Some(request.files_cursor.clone()),
+            _ => None,
+        };
+        let mut request_value = match serde_json::to_value(&request) {
             Ok(value) => value,
             Err(_) => return Err(internal()).into(),
         };
+        // Receipt cursors select a page of the same committed operation; they
+        // are not mutation identity and must not change its request digest.
+        if matches!(&import_cursor, Some(Some(_))) {
+            let Some(cursor) = request_value.get_mut("files_cursor") else { return Err(internal()).into(); };
+            *cursor = serde_json::Value::Null;
+        }
         let effect_class = match &request {
             Request::StartLogin(_)
+            | Request::Import(_)
             | Request::CreateBucket(_)
             | Request::ProbeStorage(_)
             | Request::RepairStorage(_)
@@ -160,7 +171,7 @@ impl Provider {
             operation_id, kind: request.method().to_owned(), request: request_value,
             effect_class, account_key, connection_id, bucket_creation_operation_id,
         };
-        let (record, replayed) = match self.state.begin_operation(reservation).await {
+        let (mut record, mut replayed) = match self.state.begin_operation(reservation).await {
             Ok(BeginOutcome::Replayed(record)) => (record, true),
             Ok(BeginOutcome::Fresh(record)) => (record, false),
             Err(StateError::OperationNotReplayable { .. }) => match self.state.get_operation(operation_id).await {
@@ -170,8 +181,38 @@ impl Provider {
             },
             Err(error) => return Err(state_error(error)).into(),
         };
+        if !replayed && matches!(&import_cursor, Some(Some(_))) {
+            if let Err(error) = self.state.fail_operation(operation_id, ProtocolErrorCode::InvalidRequest.wire().to_owned()).await {
+                return Err(state_error(error)).into();
+            }
+            return Err(error(ProtocolErrorCode::InvalidRequest, "An import receipt cursor requires an existing committed operation")).into();
+        }
+        if replayed
+            && matches!(&import_cursor, Some(None))
+            && matches!(record.state, OperationState::Pending | OperationState::ExternalPending)
+        {
+            let Request::Import(import) = &request else { return Err(internal()).into(); };
+            if let Err(error) = crate::import::validate_import_resume(self, import) {
+                return Err(error).into();
+            }
+            if record.state == OperationState::ExternalPending {
+                record = match self.state.reconcile_operation(operation_id, hfdrive_state::OperationResolution::ResumeVerified).await {
+                    Ok(record) => record,
+                    Err(error) => return Err(state_error(error)).into(),
+                };
+            }
+            // mark_dispatched below is the atomic execution claim. A competing
+            // retry either loses that transition or remains a read-only replay.
+            replayed = false;
+        }
         if replayed || record.state != OperationState::Pending {
-            return self.replay_operation(record).await.into();
+            let result = self.replay_operation(record).await;
+            return match (result, import_cursor) {
+                (Ok(ResponseResult::Import(result)), Some(cursor)) => {
+                    crate::import::page_import_result(result, cursor.as_deref()).map(ResponseResult::Import).into()
+                }
+                (result, _) => result.into(),
+            };
         }
         if effect_class == EffectClass::External {
             if let Err(error) = self.state.mark_dispatched(operation_id).await {
@@ -191,6 +232,9 @@ impl Provider {
             Err(_) => Ok(()),
         };
         if let Err(error) = persistence { outcome.reply.result = Err(state_error(error)); }
+        if let (Some(cursor), Ok(ResponseResult::Import(result))) = (import_cursor, &outcome.reply.result) {
+            outcome.reply.result = crate::import::page_import_result_ref(result, cursor.as_deref()).map(ResponseResult::Import);
+        }
         outcome.reply
     }
 
@@ -247,4 +291,160 @@ pub(crate) fn state_error(error_value: StateError) -> ProtocolError {
         _ => Code::Internal,
     };
     error(code, "Durable state could not complete this operation; existing data was preserved")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hfdrive_protocol::{ImportFileResult, ImportResult, ImportTarget, OwnerKind, StatusSnapshot, Visibility};
+    use uuid::Uuid;
+
+    fn import_request(operation_id: Uuid, import_id: Uuid) -> Request {
+        Request::Import(hfdrive_protocol::ImportRequest {
+            operation_id,
+            import_id,
+            target: ImportTarget {
+                owner_kind: OwnerKind::Personal,
+                owner_id: "owner-id".to_owned(),
+                owner_namespace: "alice".to_owned(),
+                bucket_id: "bucket-id".to_owned(),
+                bucket_name: "data".to_owned(),
+                visibility: Visibility::Private,
+            },
+            sources: vec![r"C:\fixture\hello.txt".to_owned()],
+            files_cursor: None,
+        })
+    }
+
+    async fn signed_in_provider() -> (Arc<Provider>, hfdrive_core::ids::AccountKey) {
+        let provider = Arc::new(Provider::new(StatusSnapshot {
+            sequence: 0,
+            account: Default::default(),
+            connections: Vec::new(),
+        }));
+        let account_key = hfdrive_core::ids::AccountKey::from_subject("https://huggingface.co", "import-replay-subject");
+        let store = hfdrive_auth::AccountCredentialStore::open(provider.paths.account(account_key).credentials(), account_key).unwrap();
+        store.save(&hfdrive_auth::CredentialEnvelope {
+            schema: hfdrive_auth::store::ENVELOPE_SCHEMA,
+            issuer: "https://huggingface.co".to_owned(),
+            subject: "import-replay-subject".to_owned(),
+            namespace: "alice".to_owned(),
+            avatar_url: None,
+            orgs: Vec::new(),
+            granted_scopes: Some(vec!["openid".to_owned()]),
+            covered_purpose: hfdrive_auth::LoginPurpose::WriteStorage,
+            login_flow: hfdrive_auth::LoginFlow::Pkce,
+            generation: 1,
+            authorization_epoch: 1,
+            lifetime_secs: 3_600,
+            expires_at: 4_000_000_000,
+            access_token: "fixture-not-a-live-token".to_owned(),
+            refresh_token: None,
+        }).unwrap();
+        provider.auth.restore_account(account_key).unwrap();
+        provider.state.record_account(hfdrive_state::AccountRecord {
+            account_key,
+            issuer: "https://huggingface.co".to_owned(),
+            subject: "import-replay-subject".to_owned(),
+            namespace: "alice".to_owned(),
+            credential_ref: hfdrive_state::CredentialRef("oauth.hfdcred".to_owned()),
+            auth_epoch: 1,
+            status: hfdrive_state::AccountStatus::Active,
+        }).await.unwrap();
+        (provider, account_key)
+    }
+
+    #[tokio::test]
+    async fn import_cursor_replays_the_requested_committed_page() {
+        let (provider, account_key) = signed_in_provider().await;
+        let operation_id = Uuid::new_v4();
+        let import_id = Uuid::new_v4();
+        let request = import_request(operation_id, import_id);
+        let operation = hfdrive_core::ids::OperationId::from_uuid(operation_id).unwrap();
+        provider.state.begin_operation(BeginOperationRequest {
+            operation_id: operation,
+            kind: "import".to_owned(),
+            request: serde_json::to_value(&request).unwrap(),
+            effect_class: EffectClass::External,
+            account_key: Some(account_key),
+            connection_id: None,
+            bucket_creation_operation_id: None,
+        }).await.unwrap();
+        let full = ImportResult {
+            import_id,
+            prefix: format!("hfdrive-imports/{import_id}"),
+            files: (0..205).map(|index| ImportFileResult {
+                key: format!("hfdrive-imports/{import_id}/file-{index}"),
+                size: 1,
+                sha256: "ab".repeat(32),
+                xet_file_id: "cd".repeat(32),
+            }).collect(),
+            next_cursor: None,
+            file_count: 205,
+            total_bytes: 205,
+            empty_directory_count: 0,
+        };
+        provider.state.finish_operation(operation, serde_json::to_value(&full).unwrap()).await.unwrap();
+
+        let first = provider.dispatch_mutation(request.clone(), CancellationToken::new()).await.result.unwrap();
+        let ResponseResult::Import(first) = first else { panic!("wrong response") };
+        assert_eq!(first.files.len(), 200);
+        let cursor = first.next_cursor.unwrap();
+        let Request::Import(continuation) = request else { unreachable!() };
+        let second = provider.dispatch_mutation(Request::Import(hfdrive_protocol::ImportRequest {
+            files_cursor: Some(cursor),
+            ..continuation
+        }), CancellationToken::new()).await.result.unwrap();
+        let ResponseResult::Import(second) = second else { panic!("wrong response") };
+        assert_eq!(second.files.len(), 5);
+        assert_eq!(second.files[0].key, format!("hfdrive-imports/{import_id}/file-200"));
+        assert_eq!(second.file_count, 205);
+        assert_eq!(second.total_bytes, 205);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_pending_import_uses_the_verified_resume_transition() {
+        let (provider, account_key) = signed_in_provider().await;
+        let operation_id = Uuid::new_v4();
+        let import_id = Uuid::new_v4();
+        let Request::Import(mut import) = import_request(operation_id, import_id) else { unreachable!() };
+        // Once resume reaches execute_import, this fails before any native call.
+        import.target.owner_id.clear();
+        let request = Request::Import(import);
+        let operation = hfdrive_core::ids::OperationId::from_uuid(operation_id).unwrap();
+        provider.state.begin_operation(BeginOperationRequest {
+            operation_id: operation,
+            kind: "import".to_owned(),
+            request: serde_json::to_value(&request).unwrap(),
+            effect_class: EffectClass::External,
+            account_key: Some(account_key),
+            connection_id: None,
+            bucket_creation_operation_id: None,
+        }).await.unwrap();
+        provider.state.mark_dispatched(operation).await.unwrap();
+
+        let reply = provider.dispatch_mutation(request, CancellationToken::new()).await;
+        let error = reply.result.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        let record = provider.state.get_operation(operation).await.unwrap().unwrap();
+        assert_eq!(record.state, OperationState::Failed);
+    }
+
+    #[tokio::test]
+    async fn fresh_import_cursor_is_rejected_without_starting_work() {
+        let (provider, _account_key) = signed_in_provider().await;
+        let operation_id = Uuid::new_v4();
+        let import_id = Uuid::new_v4();
+        let Request::Import(request) = import_request(operation_id, import_id) else { unreachable!() };
+        let reply = provider.dispatch_mutation(Request::Import(hfdrive_protocol::ImportRequest {
+            files_cursor: Some(format!("import-files-v1:{import_id}:0")),
+            ..request
+        }), CancellationToken::new()).await;
+        let error = reply.result.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        let record = provider.state.get_operation(hfdrive_core::ids::OperationId::from_uuid(operation_id).unwrap()).await.unwrap().unwrap();
+        assert_eq!(record.state, OperationState::Failed);
+        assert!(record.result_json.is_none());
+    }
 }

@@ -794,3 +794,58 @@ build output were removed after verification.
 Evidence: `artifacts/acceptance/recent-history-fixed.json` and
 `recent-history-fixed.png`. The temporary delayed-state probe was removed after
 verification.
+
+## Raw Explorer imports and Rust COM shell — 2026-11-16
+
+- **implemented** — one-shot native file/folder imports now use exact
+  `hfdrive-imports/<import-id>` keys, deterministic collision suffixes,
+  reparse/EFS/hardlink rejection, bounded cancellable source scans, stable
+  snapshots, and durable ingestion/CAS/binding checkpoints. Same-operation
+  recovery validates the journal's exact source/key/staging map before the
+  atomic `ResumeVerified` transition. Full receipts are persisted before IPC
+  paging; cursor requests replay committed pages without mutation. Every page
+  repeats `empty_directory_count`, while per-directory evidence and local paths
+  remain in the journal.
+- **implemented** — the C++ Explorer projects were removed. The Rust
+  `hfdrive-shell` cdylib exports only `DllGetClassObject` and
+  `DllCanUnloadNow`, reads a bounded target cache, publishes requests with
+  `CREATE_NEW` + flush + atomic rename, and launches the packaged CLI with only
+  the request UUID. Packaging reads the same `CARGO_TARGET_DIR` as the build;
+  relative package output paths are normalized before MSBuild publish.
+- **passed** — 8 provider import tests, 4 CLI import tests, 4 Rust protocol
+  fixture suites, 6 shell tests, 6 state idempotency tests, 12 raw-key tests,
+  and 8 native raw-store tests. Coverage includes replay page two, rejection of
+  fresh cursors, verified resume, journal tampering, cancellation, public
+  labels, COM clone/unload balance, strict paths, checkpoint mismatch, occupant
+  metadata, and no managed-HEAD access. Managed protocol verification passed
+  180/180. Logs: `artifacts/tests/provider-import-tests.log`,
+  `cli-import-tests.log`, `protocol-import-fixtures.log`,
+  `rust-shell-tests.log`, `state-import-idempotency.log`,
+  `core-raw-keys.log`, `hf-raw-import-tests.log`, and
+  `artifacts/tests/protocol/managed-import-protocol.trx`.
+- **passed** — `scripts/build.ps1 -Configuration Debug -Locked` completed the
+  full Cargo workspace and managed solution with 0 errors and ran all 6 shell
+  tests. Existing managed MVVM/WinRT warnings remain. Evidence:
+  `artifacts/tests/full-import-build.log` and
+  `artifacts/build/build-provenance-Debug.json`.
+- **passed** — the actual DLL loaded in a child process without registration,
+  provider IPC, credentials, or network. The empty-cache parent returned
+  `Hugging Face Drive`, `ECS_HIDDEN`, and balanced `DllCanUnloadNow=S_OK`.
+  This is DLL evidence, not Explorer registration acceptance. Evidence:
+  `artifacts/acceptance/shell-com-smoke.json` and
+  `artifacts/tests/rust-shell-exports.log`.
+- **passed** — `scripts/package.ps1 -Configuration Debug -Development -Unsigned
+  -Version 0.1.0.0` produced the real MSIX from the isolated Cargo target with
+  no certificate discovery, signing, trust, install, or registration. Required
+  desktop/provider/CLI/shell/manifest/PRI payloads were read back from the
+  package; the staged shell DLL has exactly two exports. Evidence:
+  `artifacts/package-import-smoke/package-provenance-0.1.0.0.json`,
+  `artifacts/acceptance/package-import-smoke.json`, and
+  `artifacts/tests/package-shell-exports.log`. Packaging static regression
+  passed with 763 manifest tokens.
+- **not_run** — no real Explorer COM registration/invocation and no native
+  bucket upload were performed. When asked, the user explicitly declined
+  per-user registration and creation/cleanup of objects in the development
+  bucket for this run. No such effects or credentials were used. The exact gate
+  is recorded in `artifacts/acceptance/external-gates.json`; deterministic
+  fixtures and the DLL smoke are not live HF/Explorer acceptance.

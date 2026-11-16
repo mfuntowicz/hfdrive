@@ -285,6 +285,17 @@ impl<T: TokenSource> NativeControl<T> {
         NativeBucketStore::new(self.api.clone(), binding, self.config.clone())
     }
 
+    /// Open the raw account+bucket storage plane used by one-shot imports.
+    /// No workspace, managed prefix, or connection exists there; the account
+    /// must match this control plane's account.
+    pub fn open_raw_store(
+        &self,
+        account: hfdrive_core::ids::AccountKey,
+        bucket: BucketBinding,
+    ) -> Result<store::NativeRawStore<T>, NativeError> {
+        store::NativeRawStore::new(self.api.clone(), account, bucket, self.config.clone())
+    }
+
     fn summary_binding(&self, owner: &OwnerRef, summary: &BucketSummaryWire) -> Result<BucketBinding, NativeError> {
         let bucket_name = BucketName::new(summary.name.clone()).map_err(|_| NativeError::InvalidResponse)?;
         Ok(BucketBinding {

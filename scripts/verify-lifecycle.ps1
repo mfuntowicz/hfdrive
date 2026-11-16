@@ -232,6 +232,21 @@ function Invoke-PackageSuite {
     Add-LifecycleResult -Check 'startup_task_disabled_by_default' -Status $(if ($stOk) { 'passed' } else { 'failed' }) `
         -Detail $(if ($st) { "TaskId=$($st.GetAttribute('TaskId')); Enabled=$($st.GetAttribute('Enabled'))" } else { 'startup task missing' })
 
+    $shellClass = Get-HfDriveManifestNodes -Manifest $manifest `
+        -XPath "/f:Package/f:Applications/f:Application[@Id='HFDrive']/f:Extensions/com:Extension/com:ComServer/com:SurrogateServer/com:Class"
+    $sc = @($shellClass)[0]
+    $shellOk = @($shellClass).Count -eq 1 -and $sc -and
+        $sc.GetAttribute('Id') -eq (Get-HfDriveShellCommandClsid) -and
+        $sc.GetAttribute('ThreadingModel') -eq 'STA'
+    Add-LifecycleResult -Check 'shell_com_registration' -Status $(if ($shellOk) { 'passed' } else { 'failed' }) `
+        -Detail $(if ($sc) { "Clsid=$($sc.GetAttribute('Id')); Path=$($sc.GetAttribute('Path')); ThreadingModel=$($sc.GetAttribute('ThreadingModel'))" } else { 'shell COM class missing' })
+    $shellVerbs = Get-HfDriveManifestNodes -Manifest $manifest `
+        -XPath "/f:Package/f:Applications/f:Application[@Id='HFDrive']/f:Extensions/desktop4:Extension/desktop4:FileExplorerContextMenus/desktop5:ItemType"
+    $typeValues = @($shellVerbs | ForEach-Object { $_.GetAttribute('Type') })
+    $verbsOk = (@($typeValues | Sort-Object) -join ',' -eq '*,Directory')
+    Add-LifecycleResult -Check 'shell_context_menu_itemtypes' -Status $(if ($verbsOk) { 'passed' } else { 'failed' }) `
+        -Detail ($typeValues -join ', ')
+
     $caps = Get-HfDriveManifestNodes -Manifest $manifest -XPath '/f:Package/f:Capabilities/rescap:Capability'
     $capNames = @($caps | ForEach-Object { $_.GetAttribute('Name') })
     $capsOk = ($capNames -contains 'runFullTrust') -and ($capNames -contains 'unvirtualizedResources')
@@ -246,7 +261,8 @@ function Invoke-PackageSuite {
 
     # Layout / runtime inventory (real package entries).
     $entries = Get-HfDriveMsixEntries -PackagePath $Msix
-    foreach ($required in @('HfDrive.Desktop.exe', 'provider/hfdrive-provider.exe', 'cli/hfdrive.exe', 'Resources.pri')) {
+    foreach ($required in @('HfDrive.Desktop.exe', 'provider/hfdrive-provider.exe', 'cli/hfdrive.exe',
+            'shell/HfDrive.Shell/HfDrive.Shell.dll', 'Resources.pri')) {
         $found = @($entries | Where-Object { $_ -replace '\\', '/' -eq $required })
         Add-LifecycleResult -Check "layout_$($required -replace '[\\/]', '_')" `
             -Status $(if ($found.Count -ge 1) { 'passed' } else { 'failed' }) -Detail $required
@@ -257,7 +273,7 @@ function Invoke-PackageSuite {
         Add-LifecycleResult -Check "asset_$([System.IO.Path]::GetFileNameWithoutExtension($asset))" `
             -Status $(if ($found.Count -ge 1) { 'passed' } else { 'failed' }) -Detail $asset
     }
-    foreach ($group in @('', 'provider/', 'cli/')) {
+    foreach ($group in @('', 'provider/', 'cli/', 'shell/HfDrive.Shell/')) {
         foreach ($crt in @('vcruntime140.dll', 'msvcp140.dll')) {
             $found = @($entries | Where-Object { ($_.Replace('\', '/')) -ieq "$group$crt" })
             $checkName = 'crt_' + (($group + $crt) -replace '[/\\.]+', '_').TrimEnd('_')

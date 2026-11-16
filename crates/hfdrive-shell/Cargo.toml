@@ -1,0 +1,32 @@
+[package]
+name = "hfdrive-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hfdrive_shell"
+crate-type = ["cdylib"]
+
+[dependencies]
+hfdrive-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+windows-core = "=0.62.2"
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

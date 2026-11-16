@@ -1274,7 +1274,7 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
         else
         {
             summary.Add("The prefix contains ordinary objects and is not a managed drive.");
-            summary.Add("HF Drive manages a prefix whose raw bucket layout differs from your Explorer folders. An ordinary bucket is an import source, not a managed workspace: move or copy its objects out of band if you want them inside a managed drive. HF Drive never imports ordinary objects automatically.");
+            summary.Add("HF Drive manages a prefix whose raw bucket layout differs from your Explorer folders. Ordinary objects are never imported automatically into a managed drive. To upload selected files or folders into a bucket, right-click them in Explorer and choose Hugging Face Drive, then the destination bucket. Raw imports go under hfdrive-imports/<import-id> and do not create a managed workspace.");
         }
         InspectStatusText = string.Join("\n", summary);
         _inspectValid = true;

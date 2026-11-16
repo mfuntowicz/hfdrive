@@ -13,6 +13,7 @@
       - Package identity name: HFDrive
       - Application IDs:       HFDrive, Provider, Cli
       - Development publisher: CN=HFDrive Development
+      - Shell command CLSID:   3071D4E7-5A86-4356-8BCE-CBB4E4C76734
 #>
 Set-StrictMode -Version Latest
 
@@ -23,12 +24,14 @@ $script:HfDriveProviderAppId = 'Provider'
 $script:HfDriveCliAppId = 'Cli'
 $script:HfDriveStartupTaskId = 'HFDrive.Provider'
 $script:HfDriveCliAlias = 'hfdrive.exe'
+$script:HfDriveShellCommandClsid = '3071D4E7-5A86-4356-8BCE-CBB4E4C76734'
 
 function Get-HfDrivePackageName { return $script:HfDrivePackageName }
 function Get-HfDriveDevPublisher { return $script:HfDriveDevPublisher }
 function Get-HfDriveApplicationIds { return $script:HfDriveApplicationIds }
 function Get-HfDriveStartupTaskId { return $script:HfDriveStartupTaskId }
 function Get-HfDriveAppAliasName { return $script:HfDriveCliAlias }
+function Get-HfDriveShellCommandClsid { return $script:HfDriveShellCommandClsid }
 
 function ConvertTo-HfDriveVersion {
     # Strict four-part package version (major.minor.patch.build, each 0..65535).
@@ -203,6 +206,9 @@ function Get-HfDriveManifestNodes {
     )
     $nsm = New-Object System.Xml.XmlNamespaceManager($Manifest.NameTable)
     $nsm.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $nsm.AddNamespace('com', 'http://schemas.microsoft.com/appx/manifest/com/windows10')
+    $nsm.AddNamespace('desktop4', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/4')
+    $nsm.AddNamespace('desktop5', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/5')
     $nsm.AddNamespace('uap', 'http://schemas.microsoft.com/appx/manifest/uap/windows10')
     $nsm.AddNamespace('uap5', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/5')
     $nsm.AddNamespace('uap10', 'http://schemas.microsoft.com/appx/manifest/uap/windows10/10')

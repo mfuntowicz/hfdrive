@@ -9,5 +9,6 @@ pub mod reconcile;
 pub mod format;
 pub mod ids;
 pub mod names;
+pub mod raw_keys;
 pub mod settings;
 pub mod storage;

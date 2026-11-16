@@ -38,6 +38,13 @@ pub use volume::{
 };
 pub use watch::{DirectoryWatcher, WatchAction, WatchEvent};
 
+/// Atomically replace a same-volume JSON/state file and flush the rename to
+/// stable storage. Kept alongside the other safe filesystem contracts so
+/// provider-owned cache journals do not depend on credential internals.
+pub fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> windows::core::Result<()> {
+    crate::ffi::file::replace_file(source, destination)
+}
+
 /// Structured, non-secret filesystem error.
 ///
 /// Every variant is safe to log and persist in diagnostics; OS failures carry

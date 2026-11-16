@@ -703,6 +703,72 @@
         "changes"
       ]
     },
+    "import_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner_kind": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "organization"
+          ]
+        },
+        "owner_id": {
+          "type": "string"
+        },
+        "owner_namespace": {
+          "type": "string"
+        },
+        "bucket_id": {
+          "type": "string"
+        },
+        "bucket_name": {
+          "type": "string"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "private",
+            "public"
+          ]
+        }
+      },
+      "required": [
+        "owner_kind",
+        "owner_id",
+        "owner_namespace",
+        "bucket_id",
+        "bucket_name",
+        "visibility"
+      ]
+    },
+    "import_file_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "xet_file_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "size",
+        "sha256",
+        "xet_file_id"
+      ]
+    },
     "conflict_record": {
       "type": "object",
       "additionalProperties": false,
@@ -3370,6 +3436,101 @@
       ],
       "description": "body.result of a \"exit_provider\" response"
     },
+    "import_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "import_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "target": {
+          "$ref": "#/$defs/import_target"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "files_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        }
+      },
+      "required": [
+        "operation_id",
+        "import_id",
+        "target",
+        "sources"
+      ],
+      "description": "body of a \"import\" request"
+    },
+    "import_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "import_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/import_file_result"
+          }
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "nullable; optional object properties are omitted from canonical output"
+        },
+        "file_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "total_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "empty_directory_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "import_id",
+        "prefix",
+        "files",
+        "file_count",
+        "total_bytes",
+        "empty_directory_count"
+      ],
+      "description": "body.result of a \"import\" response"
+    },
     "response_body": {
       "type": "object",
       "additionalProperties": false,
@@ -3453,6 +3614,7 @@
         "free_space",
         "get_status",
         "hello",
+        "import",
         "inspect_drive",
         "list_activity",
         "list_buckets",

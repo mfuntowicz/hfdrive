@@ -2,7 +2,7 @@
 .SYNOPSIS
     Builds, assembles, signs and verifies the single multi-executable HF Drive
     MSIX package (HfDrive.Desktop.exe + provider/hfdrive-provider.exe +
-    cli/hfdrive.exe).
+    cli/hfdrive.exe + shell/HfDrive.Shell/HfDrive.Shell.dll).
 
 .DESCRIPTION
     Publishes the WinUI desktop application self-contained (.NET 11 runtime
@@ -136,10 +136,16 @@ try {
 
     # ---- Required built binaries -------------------------------------------
     $rustProfile = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
-    $rustDir = Join-Path $repoRoot "target\x86_64-pc-windows-msvc\$rustProfile"
+    $cargoTargetDir = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $repoRoot 'target'
+    } else {
+        $env:CARGO_TARGET_DIR
+    }
+    $rustDir = Join-Path $cargoTargetDir "x86_64-pc-windows-msvc\$rustProfile"
     $providerExe = Join-Path $rustDir 'hfdrive-provider.exe'
     $cliExe = Join-Path $rustDir 'hfdrive.exe'
-    foreach ($required in @($providerExe, $cliExe)) {
+    $shellDll = Join-Path $rustDir 'hfdrive_shell.dll'
+    foreach ($required in @($providerExe, $cliExe, $shellDll)) {
         if (-not (Test-Path -LiteralPath $required)) {
             throw ("Required binary '$required' is missing. Build the workspace first: " +
                 "pwsh -NoProfile -File scripts/build.ps1 -Configuration $Configuration -Locked")
@@ -149,6 +155,10 @@ try {
     if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
         $OutputDirectory = Join-Path $repoRoot 'artifacts\package'
     }
+    elseif (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
+        $OutputDirectory = Join-Path $repoRoot $OutputDirectory
+    }
+    $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
     $stagingDir = Join-Path $OutputDirectory 'staging'
     $publishDir = Join-Path $stagingDir 'desktop\'
     $layoutDir = Join-Path $OutputDirectory 'layout'
@@ -184,8 +194,11 @@ try {
     Copy-Item -Path (Join-Path $publishDir '*') -Destination $layoutDir -Recurse -Force
     New-Item -ItemType Directory -Force -Path (Join-Path $layoutDir 'provider') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $layoutDir 'cli') | Out-Null
+    # Explorer context-menu COM DLL at the manifest's com:Class/@Path.
+    New-Item -ItemType Directory -Force -Path (Join-Path $layoutDir 'shell\HfDrive.Shell') | Out-Null
     Copy-Item -LiteralPath $providerExe -Destination (Join-Path $layoutDir 'provider\hfdrive-provider.exe') -Force
     Copy-Item -LiteralPath $cliExe -Destination (Join-Path $layoutDir 'cli\hfdrive.exe') -Force
+    Copy-Item -LiteralPath $shellDll -Destination (Join-Path $layoutDir 'shell\HfDrive.Shell\HfDrive.Shell.dll') -Force
 
     # App-local release v145 CRT beside every executable group.
     $crtSource = Join-Path $buildEnv.VsInstallationPath `
@@ -205,7 +218,8 @@ try {
             throw "CRT redist '$crtSource' is missing '$required'."
         }
     }
-    foreach ($target in @($layoutDir, (Join-Path $layoutDir 'provider'), (Join-Path $layoutDir 'cli'))) {
+    foreach ($target in @($layoutDir, (Join-Path $layoutDir 'provider'), (Join-Path $layoutDir 'cli'),
+            (Join-Path $layoutDir 'shell\HfDrive.Shell'))) {
         Copy-Item -Path (Join-Path $crtSource '*.dll') -Destination $target -Force
     }
 
@@ -223,10 +237,15 @@ try {
     Set-Content -LiteralPath (Join-Path $layoutDir 'AppxManifest.xml') -Value $renderedManifest -Encoding utf8
 
     # ---- Self-contained / layout assertions (fail closed) ------------------
+    # The shell COM class must reference exactly the DLL path we just staged.
+    if ($renderedManifest -notmatch [regex]::Escape('Path="shell\HfDrive.Shell\HfDrive.Shell.dll"')) {
+        throw 'The rendered manifest does not register shell\HfDrive.Shell\HfDrive.Shell.dll; layout and manifest disagree.'
+    }
     foreach ($required in @(
             (Join-Path $layoutDir 'HfDrive.Desktop.exe'),
             (Join-Path $layoutDir 'provider\hfdrive-provider.exe'),
             (Join-Path $layoutDir 'cli\hfdrive.exe'),
+            (Join-Path $layoutDir 'shell\HfDrive.Shell\HfDrive.Shell.dll'),
             (Join-Path $layoutDir 'System.Private.CoreLib.dll'),
             (Join-Path $layoutDir 'Microsoft.WinUI.dll'))) {
         if (-not (Test-Path -LiteralPath $required)) {
@@ -239,9 +258,10 @@ try {
         throw ("No Microsoft.WindowsAppRuntime*.dll was published; the Windows App SDK is not app-local " +
             "(found: $($found -join ', ')). Refusing a framework-dependent package.")
     }
-    foreach ($exeGroup in @($layoutDir, (Join-Path $layoutDir 'provider'), (Join-Path $layoutDir 'cli'))) {
-        if (-not (Test-Path -LiteralPath (Join-Path $exeGroup 'vcruntime140.dll'))) {
-            throw "App-local CRT is missing beside '$exeGroup'."
+    foreach ($moduleDir in @($layoutDir, (Join-Path $layoutDir 'provider'), (Join-Path $layoutDir 'cli'),
+            (Join-Path $layoutDir 'shell\HfDrive.Shell'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $moduleDir 'vcruntime140.dll'))) {
+            throw "App-local CRT is missing beside '$moduleDir'."
         }
     }
     $debugCrt = @(Get-ChildItem -LiteralPath $layoutDir -Recurse -File | Where-Object { $_.Name -match '(?i)(140d\.dll|ucrtbased)' })
@@ -356,6 +376,7 @@ try {
                 HFDrive  = 'HfDrive.Desktop.exe'
                 Provider = 'provider\hfdrive-provider.exe'
                 Cli      = 'cli\hfdrive.exe'
+                Shell    = 'shell\HfDrive.Shell\HfDrive.Shell.dll (Explorer IExplorerCommand parent, CLSID 3071D4E7-5A86-4356-8BCE-CBB4E4C76734)'
             }
         }
         signing         = [ordered]@{
@@ -385,7 +406,7 @@ try {
         dependencies    = [ordered]@{
             dotnet_mode             = 'self-contained (runtime 11.0.0 app-local)'
             windows_app_sdk_mode    = 'self-contained (app-local)'
-            vc_crt_mode             = "app-local release $($buildEnv.VcToolsVersion) beside HfDrive.Desktop.exe, provider\hfdrive-provider.exe, cli\hfdrive.exe"
+            vc_crt_mode             = "app-local release $($buildEnv.VcToolsVersion) beside HfDrive.Desktop.exe, provider\hfdrive-provider.exe, cli\hfdrive.exe, shell\HfDrive.Shell\HfDrive.Shell.dll"
             framework_dependencies  = $frameworkDependencies
             framework_dependencies_dir = if ($frameworkDependencies.Count -gt 0) { $dependenciesDir } else { $null }
             vc_crt_files            = $crtInventory
@@ -393,6 +414,7 @@ try {
                 HfDrive_Desktop_exe   = Get-FileVersionSafe (Join-Path $layoutDir 'HfDrive.Desktop.exe')
                 hfdrive_provider_exe  = Get-FileVersionSafe (Join-Path $layoutDir 'provider\hfdrive-provider.exe')
                 hfdrive_exe           = Get-FileVersionSafe (Join-Path $layoutDir 'cli\hfdrive.exe')
+                HfDrive_Shell_dll     = Get-FileVersionSafe (Join-Path $layoutDir 'shell\HfDrive.Shell\HfDrive.Shell.dll')
                 System_Private_CoreLib_dll = Get-FileVersionSafe (Join-Path $layoutDir 'System.Private.CoreLib.dll')
                 Microsoft_WinUI_dll   = Get-FileVersionSafe (Join-Path $layoutDir 'Microsoft.WinUI.dll')
             }

@@ -144,6 +144,8 @@ const OPTION_ABSENCE = new Set([
   "settings_patch.value_json",
   "inspect_item.parent_id",
   "start_login.organization_id",
+  "import_request.files_cursor",
+  "import_result.next_cursor",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -473,6 +475,86 @@ gold("repair_storage_response_result",
     }),
   }));
 
+// Raw bucket import (initiated by Explorer): the target object, the source
+// paths, the exact import prefix, and the per-file result fields are the
+// contract; the decimal u64 fields exercise the full wire range. Per-directory
+// empty outcomes and source-to-key mappings stay in the provider journal; only
+// the bounded empty-directory count is repeated on each wire-result page.
+const IMPORT_ID = uuidFor("import_id");
+const IMPORT_PREFIX = `hfdrive-imports/${IMPORT_ID}`;
+const sha256Hex = (text) => require("crypto").createHash("sha256").update(text, "utf8").digest("hex");
+
+gold("import_request",
+  "import request with the exact target object and raw bucket source paths (mutation operation id)",
+  requestEnvelope(REQUEST_ID, "import", {
+    operation_id: uuidFor("operation_id"),
+    import_id: IMPORT_ID,
+    target: sampleObject("import_target"),
+    sources: [
+      "C:\\Users\\Public\\HFDriveTest\\import-source\\hello.txt",
+      "C:\\Users\\Public\\HFDriveTest\\import-source\\docs\\data.bin",
+    ],
+  }));
+
+gold("import_response_result",
+  "import result with the exact hfdrive-imports/<import_id> prefix (no trailing slash), per-file result records and full-width decimal u64 sizes/counts",
+  responseEnvelope(REQUEST_ID, "import", {
+    result: {
+      import_id: IMPORT_ID,
+      prefix: IMPORT_PREFIX,
+      files: [
+        {
+          key: `${IMPORT_PREFIX}/folder-a/report.txt`,
+          size: "18446744073709551615",
+          sha256: sha256Hex("hfdrive-import-fixture-file-a"),
+          xet_file_id: sha256Hex("hfdrive-import-fixture-xet-a"),
+        },
+        {
+          key: `${IMPORT_PREFIX}/empty.bin`,
+          size: "0",
+          sha256: sha256Hex("hfdrive-import-fixture-file-b"),
+          xet_file_id: sha256Hex("hfdrive-import-fixture-xet-b"),
+        },
+      ],
+      file_count: 2,
+      total_bytes: "18446744073709551615",
+      empty_directory_count: 0,
+    },
+  }));
+
+gold("import_response_result_paged",
+  "import result page carrying next_cursor: one page of per-file records with complete import_id/prefix/file_count/total_bytes repeated on every page",
+  responseEnvelope(REQUEST_ID, "import", {
+    result: {
+      import_id: IMPORT_ID,
+      prefix: IMPORT_PREFIX,
+      files: [
+        {
+          key: `${IMPORT_PREFIX}/folder-a/report.txt`,
+          size: "1024",
+          sha256: sha256Hex("hfdrive-import-fixture-file-a"),
+          xet_file_id: sha256Hex("hfdrive-import-fixture-xet-a"),
+        },
+      ],
+      next_cursor: "import-files-v1:00112233-0000-4000-8000-000000000000:1",
+      file_count: 2,
+      total_bytes: "18446744073709551615",
+      empty_directory_count: 0,
+    },
+  }));
+
+gold("import_request_files_cursor",
+  "import request page continuation carrying files_cursor for the same operation (read replay, never a second mutation)",
+  requestEnvelope(REQUEST_ID, "import", {
+    operation_id: uuidFor("operation_id"),
+    import_id: IMPORT_ID,
+    target: sampleObject("import_target"),
+    sources: [
+      "C:\\Users\\Public\\HFDriveTest\\import-source\\hello.txt",
+    ],
+    files_cursor: "import-files-v1:00112233-0000-4000-8000-000000000000:1",
+  }));
+
 // ---------------------------------------------------------------------------
 // Invalid fixtures.
 // ---------------------------------------------------------------------------
@@ -558,6 +640,93 @@ inv("reject_raw_control_character", "unescaped control byte inside a string lite
   "envelope", "malformed_frame", frameHex(controlRaw), "invalid JSON payload");
 inv("reject_non_utf8_payload", "payload bytes are not valid UTF-8",
   "envelope", "malformed_frame", frameHex(new Uint8Array([0x22, 0xC3, 0x28, 0x22])), "payload is not UTF-8");
+
+// Import contract fixtures: the exact target object, source array, prefix and
+// per-file fields, and the decimal u64 sizes/counts are enforced by the typed
+// codecs; unknown members and non-canonical values are rejected.
+const importRequestRaw = (bodyRaw) =>
+  "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID +
+  "\",\"kind\":\"request\",\"method\":\"import\",\"body\":" + bodyRaw + "}";
+const importResponseRaw = (resultRaw) =>
+  "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID +
+  "\",\"kind\":\"response\",\"method\":\"import\",\"body\":{\"result\":" + resultRaw + "}}";
+const IMPORT_OPERATION_ID = uuidFor("operation_id");
+const IMPORT_TARGET_RAW =
+  "{\"bucket_id\":\"6581f0d3a1b2c3d4e5f60719\",\"bucket_name\":\"hfdrive-test-bucket\"," +
+  "\"owner_id\":\"6581f0d3a1b2c3d4e5f60718\",\"owner_kind\":\"organization\"," +
+  "\"owner_namespace\":\"acme-labs\",\"visibility\":\"private\"}";
+const importRequestBody = (targetRaw, sourcesRaw) =>
+  "{\"import_id\":\"" + IMPORT_ID + "\",\"operation_id\":\"" + IMPORT_OPERATION_ID +
+  "\",\"sources\":" + sourcesRaw + ",\"target\":" + targetRaw + "}";
+const importResultBody = (prefixRaw, filesRaw, fileCountRaw, totalBytesRaw, emptyDirectoryCountRaw = "0") =>
+  "{\"file_count\":" + fileCountRaw + ",\"files\":" + filesRaw + ",\"import_id\":\"" + IMPORT_ID +
+  "\",\"prefix\":" + prefixRaw + ",\"total_bytes\":" + totalBytesRaw +
+  ",\"empty_directory_count\":" + emptyDirectoryCountRaw + "}";
+const IMPORT_FILE_RAW = (suffix, sizeRaw) =>
+  "{\"key\":\"" + IMPORT_PREFIX + "/folder-" + suffix + "/report.txt" +
+  "\",\"sha256\":\"" + sha256Hex("hfdrive-import-fixture-file-" + suffix) +
+  "\",\"size\":" + sizeRaw +
+  ",\"xet_file_id\":\"" + sha256Hex("hfdrive-import-fixture-xet-" + suffix) + "\"}";
+const importInvalids = [
+  ["reject_import_target_unknown_member",
+    "import request whose target object carries an unknown member is rejected",
+    importRequestRaw(importRequestBody("{\"bucket_id\":\"x\",\"bucket_name\":\"y\",\"owner_id\":\"z\",\"owner_kind\":\"organization\",\"owner_namespace\":\"acme-labs\",\"visibility\":\"private\",\"extra\":1}", "[\"src/a.txt\"]"))],
+  ["reject_import_target_missing_field",
+    "import request whose target object omits a required field is rejected",
+    importRequestRaw(importRequestBody("{\"bucket_id\":\"x\",\"bucket_name\":\"y\",\"owner_id\":\"z\",\"owner_kind\":\"organization\",\"owner_namespace\":\"acme-labs\"}", "[\"src/a.txt\"]"))],
+  ["reject_import_target_enum",
+    "import request whose target visibility is an unknown enum variant is rejected",
+    importRequestRaw(importRequestBody("{\"bucket_id\":\"x\",\"bucket_name\":\"y\",\"owner_id\":\"z\",\"owner_kind\":\"organization\",\"owner_namespace\":\"acme-labs\",\"visibility\":\"secret\"}", "[\"src/a.txt\"]"))],
+  ["reject_import_sources_not_string",
+    "import request whose sources array contains a non-string entry is rejected",
+    importRequestRaw(importRequestBody(IMPORT_TARGET_RAW, "[\"src/a.txt\",7]"))],
+  ["reject_import_sources_missing",
+    "import request without the required sources array is rejected",
+    importRequestRaw("{\"import_id\":\"" + IMPORT_ID + "\",\"operation_id\":\"" + IMPORT_OPERATION_ID + "\",\"target\":" + IMPORT_TARGET_RAW + "}")],
+  ["reject_import_unknown_body_member",
+    "import request body with an unknown member is rejected",
+    importRequestRaw("{\"import_id\":\"" + IMPORT_ID + "\",\"operation_id\":\"" + IMPORT_OPERATION_ID + "\",\"sources\":[\"src/a.txt\"],\"target\":" + IMPORT_TARGET_RAW + ",\"dry_run\":true}")],
+  ["reject_import_result_prefix_wrong_type",
+    "import result whose prefix is not a string is rejected",
+    importResponseRaw(importResultBody("7", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "1", "\"1\""))],
+  ["reject_import_result_prefix_mismatch",
+    "import result whose prefix is not exactly hfdrive-imports/<import_id> (no trailing slash) is rejected",
+    importResponseRaw(importResultBody("\"hfdrive-imports/other-import/\"", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "1", "\"42\""))],
+  ["reject_import_result_file_unknown_member",
+    "import result whose per-file record carries an unknown member is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "\"42\"").replace(/\}$/, ",\"etag\":\"x\"") + "]", "1", "\"42\""))],
+  ["reject_import_result_file_missing_field",
+    "import result whose per-file record omits xet_file_id is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"",
+      "[{\"key\":\"" + IMPORT_PREFIX + "/folder-a/report.txt" + "\",\"sha256\":\"" + sha256Hex("hfdrive-import-fixture-file-a") + "\",\"size\":\"42\"}]",
+      "1", "\"42\""))],
+  ["reject_import_size_number",
+    "import result per-file size sent as a JSON number instead of a decimal string is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "42") + "]", "1", "\"42\""))],
+  ["reject_import_size_leading_zero",
+    "import result total_bytes with a leading zero is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "1", "\"00\""))],
+  ["reject_import_size_overflow",
+    "import result total_bytes beyond u64 range is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "1", "\"18446744073709551616\""))],
+  ["reject_import_files_cursor_number",
+    "import request files_cursor sent as a JSON number instead of a string is rejected",
+    importRequestRaw("{\"import_id\":\"" + IMPORT_ID + "\",\"operation_id\":\"" + IMPORT_OPERATION_ID +
+      "\",\"sources\":[\"src/a.txt\"],\"target\":" + IMPORT_TARGET_RAW + ",\"files_cursor\":7}")],
+  ["reject_import_next_cursor_number",
+    "import result next_cursor sent as a JSON number instead of a string is rejected",
+    importResponseRaw("{\"file_count\":1,\"files\":[],\"import_id\":\"" + IMPORT_ID +
+      "\",\"next_cursor\":7,\"prefix\":\"" + IMPORT_PREFIX + "\",\"total_bytes\":\"1\",\"empty_directory_count\":0}")],
+  ["reject_import_file_count_string",
+    "import result file_count sent as a decimal string instead of a u32 JSON number is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "\"1\"", "\"42\""))],
+  ["reject_import_empty_directory_count_string",
+    "import result empty_directory_count sent as a decimal string instead of a u32 JSON number is rejected",
+    importResponseRaw(importResultBody("\"" + IMPORT_PREFIX + "\"", "[" + IMPORT_FILE_RAW("a", "\"42\"") + "]", "1", "\"42\"", "\"0\""))],
+];
+for (const [name, description, raw] of importInvalids) {
+  inv(name, description, "envelope", "malformed_frame", frameHex(toBytes(raw)), description);
+}
 
 // ---------------------------------------------------------------------------
 // spec/ipc-v1.schema.json

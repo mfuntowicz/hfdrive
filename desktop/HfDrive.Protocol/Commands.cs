@@ -818,6 +818,107 @@ public sealed record ExitProviderResult
     public required bool Accepted { get; init; }
 }
 
+/// <summary>The target bucket/owner object of a raw bucket import.</summary>
+/// <remarks>
+/// The import destination is exactly the <c>hfdrive-imports/&lt;import_id&gt;</c>
+/// prefix (no trailing slash) reported by the import result; nothing else in the bucket is touched.
+/// </remarks>
+public sealed record ImportTarget
+{
+    /// <summary>Whether the target owner is the person or an organization.</summary>
+    public required OwnerKind OwnerKind { get; init; }
+
+    /// <summary>Stable server-side owner identifier (retained across display renames).</summary>
+    public required string OwnerId { get; init; }
+
+    /// <summary>Canonical owner namespace.</summary>
+    public required string OwnerNamespace { get; init; }
+
+    /// <summary>Stable server-side bucket identifier.</summary>
+    public required string BucketId { get; init; }
+
+    /// <summary>Bucket name.</summary>
+    public required string BucketName { get; init; }
+
+    /// <summary>Bucket visibility as reported by the service.</summary>
+    public required Visibility Visibility { get; init; }
+}
+
+/// <summary>One imported file in an import result.</summary>
+public sealed record ImportFileResult
+{
+    /// <summary>Exact raw key created under hfdrive-imports/&lt;import_id&gt;.</summary>
+    public required string Key { get; init; }
+
+    /// <summary>Imported byte length (decimal string on the wire).</summary>
+    public required ulong Size { get; init; }
+
+    /// <summary>Lowercase hex SHA-256 of the imported bytes.</summary>
+    public required string Sha256 { get; init; }
+
+    /// <summary>Xet file identifier of the imported payload.</summary>
+    public required string XetFileId { get; init; }
+}
+
+/// <summary>
+/// import request (raw bucket import initiated by Explorer).
+/// A durable mutation: operation_id identifies the import operation and a
+/// reconnect/retry reusing it must not duplicate the import. import_id
+/// determines the exact destination prefix hfdrive-imports/&lt;import_id&gt; (no trailing slash).
+/// Per-file result records are paged: the first call carries no FilesCursor and
+/// runs the import; a request carrying FilesCursor continues the same
+/// operation's persisted result (read replay, never a second mutation).
+/// </summary>
+public sealed record ImportRequest
+{
+    /// <summary>Unique durable operation identifier for this mutation.</summary>
+    public required Guid OperationId { get; init; }
+
+    /// <summary>Import identifier; fixes the destination prefix.</summary>
+    public required Guid ImportId { get; init; }
+
+    /// <summary>Exact target bucket/owner object.</summary>
+    public required ImportTarget Target { get; init; }
+
+    /// <summary>Absolute local source paths to import.</summary>
+    public required IReadOnlyList<string> Sources { get; init; }
+
+    /// <summary>
+    /// Continuation cursor from a previous import result page. Present only for
+    /// page continuations of the same operation; absent on the first call.
+    /// </summary>
+    public string? FilesCursor { get; init; }
+}
+
+/// <summary>
+/// import result. Files is one page of per-file records (at most 200); the
+/// complete import_id, prefix, file_count, total_bytes and empty_directory_count
+/// are repeated on every page so each page is self-describing.
+/// </summary>
+public sealed record ImportResult
+{
+    /// <summary>Import identifier echoed back.</summary>
+    public required Guid ImportId { get; init; }
+
+    /// <summary>Exact destination prefix: hfdrive-imports/&lt;import_id&gt; (no trailing slash).</summary>
+    public required string Prefix { get; init; }
+
+    /// <summary>One page of per-file result records.</summary>
+    public required IReadOnlyList<ImportFileResult> Files { get; init; }
+
+    /// <summary>Continuation cursor for the next page, null on the last page.</summary>
+    public string? NextCursor { get; init; }
+
+    /// <summary>Total number of imported files (all pages).</summary>
+    public required int FileCount { get; init; }
+
+    /// <summary>Total imported bytes across all files (decimal string on the wire).</summary>
+    public required ulong TotalBytes { get; init; }
+
+    /// <summary>Directories that produced no files; native buckets have no standalone directory objects.</summary>
+    public required int EmptyDirectoryCount { get; init; }
+}
+
 /// <summary>A compile-safe request/result pair bound to its wire method.</summary>
 /// <typeparam name="TRequest">Typed request body.</typeparam>
 /// <typeparam name="TResult">Typed result body.</typeparam>
@@ -942,6 +1043,9 @@ public static class Commands
     /// <summary>exit_provider.</summary>
     public static readonly CommandSpec<ExitProviderRequest, ExitProviderResult> ExitProvider = new("exit_provider");
 
+    /// <summary>import (raw bucket import initiated by Explorer).</summary>
+    public static readonly CommandSpec<ImportRequest, ImportResult> Import = new("import");
+
     /// <summary>All wire methods, in canonical order.</summary>
     public static IReadOnlyList<string> AllMethods { get; } =
     [
@@ -952,6 +1056,7 @@ public static class Commands
         "set_selective_sync", "update_settings", "list_activity", "list_history", "restore",
         "list_conflicts", "resolve_conflict",
         "export_diagnostics", "prepare_unlink", "unlink", "prepare_upgrade", "exit_provider",
+        "import",
     ];
 
     /// <summary>

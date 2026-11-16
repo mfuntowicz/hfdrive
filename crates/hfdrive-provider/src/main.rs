@@ -94,6 +94,7 @@ async fn run() -> Result<(), HostError> {
     let provider = Provider::open(StatePaths::new(state_root), std::env::var(hfdrive_auth::OAUTH_CLIENT_ID_ENV).ok(), _lease.user_sid().to_owned()).await?;
     let server = IpcServer::bind(policy)?;
     tokio::spawn(provider.clone().observe_accounts());
+    tokio::spawn(provider.clone().import_menu_loop());
     let permits = Arc::new(Semaphore::new(MAX_CLIENTS));
     let mut clients = JoinSet::new();
     tracing::info!(protocol_major = 1, protocol_minor = 0, "provider IPC ready");

@@ -64,6 +64,8 @@ const OBJECTS = {
   proposed_action_record: ["item_id:opt:uuid", "action:enum:proposed_action", "description:string"],
   history_change: ["item_id:uuid", "kind:enum:history_change_kind", "name:string", "parent_id:opt:uuid"],
   history_record: ["commit_id:uuid", "parent_commit_id:opt:uuid", "generation:opt:uuid", "device_id:uuid", "created_at:string", "changes:arr:obj:history_change"],
+  import_target: ["owner_kind:enum:owner_kind", "owner_id:string", "owner_namespace:string", "bucket_id:string", "bucket_name:string", "visibility:enum:visibility"],
+  import_file_result: ["key:string", "size:dec64", "sha256:string", "xet_file_id:string"],
   conflict_record: ["conflict_id:uuid", "item_id:uuid", "kind:enum:conflict_kind", "competing_operation_ids:arr:uuid", "revisions:arr:uuid", "original_names:arr:string", "detected_at:string", "resolution_state:enum:conflict_resolution"],
   activity_record: ["activity_id:uuid", "connection_id:uuid", "item_id:opt:uuid", "item_name:string", "direction:enum:activity_direction", "phase:enum:activity_phase", "bytes_completed:dec64", "bytes_total:opt:dec64", "started_at:string", "last_error:opt:obj:error_object"],
   connection_status: ["connection_id:uuid", "workspace_id:uuid", "owner:obj:owner", "bucket:obj:bucket", "prefix:string", "root_path:string", "mode:enum:connection_mode", "capability:enum:capability_state", "state:enum:connection_state", "pin:enum:pin_state", "hydration:enum:hydration_state", "observed_commit:opt:uuid", "published_commit:opt:uuid", "applied_commit:opt:uuid", "observed_generation:opt:dec64", "pending_files:u32", "dirty_files:u32", "conflict_files:u32", "online_only_files:u32", "pinned_files:u32", "pending_upload_bytes:dec64", "local_bytes:dec64", "staging_used_bytes:dec64", "range_cache_used_bytes:dec64", "transfer_memory_used_bytes:dec64", "last_error:opt:obj:error_object", "updated_at:string"],
@@ -110,6 +112,7 @@ const REQUESTS = {
   unlink: ["operation_id:uuid", "connection_id:uuid", "mode:enum:unlink_mode"],
   prepare_upgrade: ["operation_id:uuid"],
   exit_provider: ["operation_id:uuid"],
+  import: ["operation_id:uuid", "import_id:uuid", "target:obj:import_target", "sources:arr:string", "files_cursor:opt:string"],
 };
 
 const RESULTS = {
@@ -146,6 +149,7 @@ const RESULTS = {
   unlink: ["connection_id:uuid", "unregistered:bool", "retained_for_recovery:bool"],
   prepare_upgrade: ["checkpointed:bool", "pending_operations:u32"],
   exit_provider: ["accepted:bool"],
+  import: ["import_id:uuid", "prefix:string", "files:arr:obj:import_file_result", "next_cursor:opt:string", "file_count:u32", "total_bytes:dec64", "empty_directory_count:u32"],
 };
 
 const EVENTS = {
@@ -158,7 +162,7 @@ const MUTATION_REQUESTS = new Set([
   "start_login", "cancel_login", "sign_out", "create_bucket", "begin_setup", "set_publication_credentials",
   "probe_storage", "repair_storage", "preview_connect", "connect", "pause", "resume", "set_pin", "free_space",
   "set_selective_sync", "update_settings", "restore", "resolve_conflict", "export_diagnostics",
-  "prepare_unlink", "unlink", "prepare_upgrade", "exit_provider",
+  "prepare_unlink", "unlink", "prepare_upgrade", "exit_provider", "import",
 ]);
 
 function parseField(spec) {

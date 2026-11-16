@@ -321,6 +321,13 @@ impl Db {
                 None,
                 None,
             ),
+            OperationResolution::ResumeVerified => self.set_operation_state(
+                operation_id,
+                &[OperationState::ExternalPending],
+                OperationState::Pending,
+                None,
+                None,
+            ),
             OperationResolution::GiveUp { reason } => {
                 self.set_operation_state(
                     operation_id,
@@ -2946,6 +2953,9 @@ pub enum CompletionOutcome {
 pub enum OperationResolution {
     EffectFound { result: serde_json::Value },
     EffectAbsentSafeToRetry,
+    /// Durable operation-specific evidence proves that partial effects can be
+    /// resumed without duplication or overwriting an unrelated remote object.
+    ResumeVerified,
     GiveUp { reason: String },
 }
 

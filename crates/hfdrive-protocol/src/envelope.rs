@@ -83,6 +83,7 @@ pub const ALL_METHODS: &[&str] = &[
     "unlink",
     "prepare_upgrade",
     "exit_provider",
+    "import",
 ];
 
 /// Envelope discriminant.
@@ -154,6 +155,7 @@ pub enum Request {
     Unlink(UnlinkRequest),
     PrepareUpgrade(PrepareUpgradeRequest),
     ExitProvider(ExitProviderRequest),
+    Import(ImportRequest),
 }
 
 /// Typed response result body: one variant per command.
@@ -194,6 +196,7 @@ pub enum ResponseResult {
     Unlink(UnlinkResult),
     PrepareUpgrade(PrepareUpgradeResult),
     ExitProvider(ExitProviderResult),
+    Import(ImportResult),
 }
 
 /// Typed event payload.
@@ -277,6 +280,7 @@ impl Request {
             Request::Unlink(_) => UnlinkRequest::METHOD,
             Request::PrepareUpgrade(_) => PrepareUpgradeRequest::METHOD,
             Request::ExitProvider(_) => ExitProviderRequest::METHOD,
+            Request::Import(_) => ImportRequest::METHOD,
         }
     }
 
@@ -309,6 +313,7 @@ impl Request {
             Request::Unlink(r) => Some(r.operation_id),
             Request::PrepareUpgrade(r) => Some(r.operation_id),
             Request::ExitProvider(r) => Some(r.operation_id),
+            Request::Import(r) => Some(r.operation_id),
             Request::Hello(_)
             | Request::GetStatus(_)
             | Request::SubscribeStatus(_)
@@ -603,12 +608,13 @@ fn decode_request(method: &str, value: Value) -> Result<Request, ProtocolCodecEr
         "prepare_unlink" => (PrepareUnlink, PrepareUnlinkRequest),
         "unlink" => (Unlink, UnlinkRequest),
         "prepare_upgrade" => (PrepareUpgrade, PrepareUpgradeRequest),
-        "exit_provider" => (ExitProvider, ExitProviderRequest)
+        "exit_provider" => (ExitProvider, ExitProviderRequest),
+        "import" => (Import, ImportRequest)
     )
 }
 
 pub(crate) fn decode_result(method: &str, value: Value) -> Result<ResponseResult, ProtocolCodecError> {
-    dispatch!(
+    let result = dispatch!(
         value,
         method,
         ResponseResult,
@@ -645,8 +651,19 @@ pub(crate) fn decode_result(method: &str, value: Value) -> Result<ResponseResult
         "prepare_unlink" => (PrepareUnlink, PrepareUnlinkResult),
         "unlink" => (Unlink, UnlinkResult),
         "prepare_upgrade" => (PrepareUpgrade, PrepareUpgradeResult),
-        "exit_provider" => (ExitProvider, ExitProviderResult)
-    )
+        "exit_provider" => (ExitProvider, ExitProviderResult),
+        "import" => (Import, ImportResult)
+    );
+    // The `import` destination prefix is exactly `hfdrive-imports/<import_id>`
+    // with no trailing slash (contract invariant, not a producer hint).
+    let result = result?;
+    if let ResponseResult::Import(import) = &result {
+        let expected = format!("hfdrive-imports/{}", import.import_id);
+        if import.prefix != expected {
+            return Err(ProtocolCodecError::InvalidField("prefix"));
+        }
+    }
+    Ok(result)
 }
 
 fn decode_event(method: &str, value: Value) -> Result<Event, ProtocolCodecError> {

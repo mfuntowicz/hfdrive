@@ -23,6 +23,12 @@ pub enum Command {
     Logout,
     Owners,
     Buckets { #[arg(long)] owner: String },
+    /// Import selected files/folders into an authorized bucket through the provider.
+    Import {
+        /// UUID of the shell-written request file (never a credential or raw path).
+        #[arg(long)]
+        request: Uuid,
+    },
     /// Preview a connection, then accept that exact unchanged preview.
     Connect {
         #[arg(long)] owner: Option<String>,

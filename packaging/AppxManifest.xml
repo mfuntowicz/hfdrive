@@ -7,6 +7,9 @@
     - Application IDs:    HFDrive (desktop/tray), Provider (hfdrive-provider.exe),
                           Cli (hfdrive.exe + hfdrive.exe execution alias)
     - Startup task ID:    HFDrive.Provider (disabled by default)
+    - Shell command CLSID (HfDrive.Shell.dll IExplorerCommand parent,
+      "Hugging Face Drive" Explorer context menu):
+                          3071D4E7-5A86-4356-8BCE-CBB4E4C76734
 
   Tokens (rendered by scripts/package.ps1; never left in a packed manifest):
     - {{HFDRIVE_PACKAGE_PUBLISHER}}  Development: "CN=HFDrive Development".
@@ -30,12 +33,15 @@
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
-  IgnorableNamespaces="uap uap5 uap10 rescap virtualization">
+  IgnorableNamespaces="com desktop4 desktop5 uap uap5 uap10 rescap virtualization">
 
   <Identity
     Name="HFDrive"
@@ -89,6 +95,43 @@
         <uap:DefaultTile Wide310x150Logo="assets\Wide310x150Logo.png" />
         <uap:SplashScreen Image="assets\SplashScreen.png" />
       </uap:VisualElements>
+      <Extensions>
+        <!--
+          Explorer context menu: a native x64 COM DLL implements the parent
+          IExplorerCommand "Hugging Face Drive" (one child per import target
+          from %LOCALAPPDATA%\HFDrive\shell\import-targets.json). The DLL is
+          loaded in a COM surrogate (STA); menu construction reads only the
+          bounded local cache and never touches the network or the provider.
+          Child Invoke writes shell\requests\<operation_id>.json and starts the
+          packaged cli\hfdrive.exe hidden with only the request UUID.
+          Registered for files (*) and folders (Directory) only — not
+          Directory\Background.
+        -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="HF Drive shell commands">
+              <com:Class
+                Id="3071D4E7-5A86-4356-8BCE-CBB4E4C76734"
+                Path="shell\HfDrive.Shell\HfDrive.Shell.dll"
+                ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb
+                Id="HuggingFaceDrive"
+                Clsid="3071D4E7-5A86-4356-8BCE-CBB4E4C76734" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb
+                Id="HuggingFaceDrive"
+                Clsid="3071D4E7-5A86-4356-8BCE-CBB4E4C76734" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+      </Extensions>
     </Application>
 
     <!--

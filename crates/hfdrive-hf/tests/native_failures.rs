@@ -14,7 +14,7 @@ use hfdrive_core::storage::{
     OwnerKind, PayloadKey, RelativeKey, RemotePrefix, Sha256Digest, StableSnapshot, XetFileId,
 };
 use hfdrive_hf::{
-    BatchAdd, BatchOp, HeadRead, NativeApi, NativeBucketStore, NativeConfig, NativeControl, NativeError, OwnerRef,
+    BatchAdd, BatchOp, HeadRead, NativeApi, NativeBucketStore, NativeConfig, NativeControl, NativeError, NativeRawStore, OwnerRef,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -610,4 +610,68 @@ async fn committed_checkpoint_binds_without_reingesting_snapshot() {
     foreign.target_key = "other-workspace/payload".to_owned();
     assert!(matches!(store.resume_committed(&lease, &snapshot, &foreign), Err(NativeError::SourceChanged)));
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn raw_store_resumes_exact_import_key_without_workspace_or_reingestion() {
+    let route: Route = Arc::new(|method, path, _index, lines| {
+        if method == "POST" && path.ends_with("/batch") && lines == 1 {
+            response("200 OK", &[], r#"{"success":true,"processed":1,"succeeded":1,"failed":[]}"#)
+        } else {
+            response("404 Not Found", &[], "{}")
+        }
+    });
+    let server = fixture(route).await;
+    let key = account("raw-checkpoint-resume");
+    let api = NativeApi::new(stub(key, key), key, format!("http://{}", server.addr)).unwrap();
+    let bucket = bucket_binding("64b0000000000000000000ff", "ns", "imports");
+    let store = NativeRawStore::new(api, key, bucket, config(format!("http://{}", server.addr))).unwrap();
+    let upload_id = UploadId::new();
+    let snapshot = StableSnapshot {
+        snapshot_id: hfdrive_core::ids::SnapshotId::new(),
+        upload_id,
+        path: std::path::PathBuf::from("not-needed-after-cas.bin"),
+        size: 7,
+        sha256: Sha256Digest::of(b"fixture"),
+    };
+    let target = RelativeKey::new(format!("hfdrive-imports/{upload_id}/folder/file.bin")).unwrap();
+    let checkpoint = hfdrive_hf::CasCommitCheckpoint {
+        target_key: target.to_string(),
+        xet_file_id: XetFileId::new("bb".repeat(32)).unwrap(),
+        size: snapshot.size,
+        sha256: snapshot.sha256,
+        sdk_task_id: 1,
+    };
+    let lease = store.capture_lease().unwrap();
+    let bound = store.resume_raw_committed(&lease, &target, &checkpoint).unwrap()
+        .bind(&CancellationToken::new()).await.unwrap();
+    assert_eq!(bound.key, target);
+    assert_eq!(bound.size, 7);
+    assert_eq!(bound.xet_file_id, checkpoint.xet_file_id);
+    assert_eq!(store.bucket().bucket_name.as_str(), "imports");
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn raw_begin_upload_rechecks_snapshot_without_network() {
+    let route: Route = Arc::new(|_m, _p, _i, _l| response("404 Not Found", &[], "{}"));
+    let server = fixture(route).await;
+    let key = account("raw-missing-source");
+    let api = NativeApi::new(stub(key, key), key, format!("http://{}", server.addr)).unwrap();
+    let bucket = bucket_binding("64b0000000000000000000fe", "ns", "imports");
+    let store = NativeRawStore::new(api, key, bucket, config(format!("http://{}", server.addr))).unwrap();
+    let upload_id = UploadId::new();
+    let snapshot = StableSnapshot {
+        snapshot_id: hfdrive_core::ids::SnapshotId::new(),
+        upload_id,
+        path: std::path::PathBuf::from("missing-raw-import.bin"),
+        size: 0,
+        sha256: Sha256Digest::of(b""),
+    };
+    let lease = store.capture_lease().unwrap();
+    let target = RelativeKey::new(format!("hfdrive-imports/{upload_id}/empty.bin")).unwrap();
+    let error = store.begin_raw_upload(&lease, target, hfdrive_hf::UploadSource::Snapshot(snapshot))
+        .err().expect("missing raw source must be refused");
+    assert!(matches!(error, NativeError::SourceChanged));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 0);
 }

@@ -539,6 +539,42 @@ pub struct ConflictRecord {
     pub resolution_state: ConflictResolution,
 }
 
+/// The target bucket/owner object of a raw bucket import.
+///
+/// The import destination is exactly the `hfdrive-imports/<import_id>` prefix (no trailing slash)
+/// reported by the `import` result; nothing else in the bucket is touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ImportTarget {
+    /// Whether the target owner is the person or an organization.
+    pub owner_kind: OwnerKind,
+    /// Stable server-side owner identifier (retained across display renames).
+    pub owner_id: String,
+    /// Canonical owner namespace.
+    pub owner_namespace: String,
+    /// Stable server-side bucket identifier.
+    pub bucket_id: String,
+    /// Bucket name.
+    pub bucket_name: String,
+    /// Bucket visibility as reported by the service.
+    pub visibility: Visibility,
+}
+
+/// One imported file in an `import` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ImportFileResult {
+    /// Exact object key created under `hfdrive-imports/<import_id>`.
+    pub key: String,
+    /// Imported byte length (decimal string on the wire).
+    #[serde(with = "crate::dec_u64")]
+    pub size: u64,
+    /// Lowercase hex SHA-256 of the imported bytes.
+    pub sha256: String,
+    /// Xet file identifier of the imported payload.
+    pub xet_file_id: String,
+}
+
 /// An activity record for the Activity page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -1556,6 +1592,61 @@ request_method!(ExitProviderRequest, "exit_provider");
 pub struct ExitProviderResult {
     /// True when the provider accepted the exit request.
     pub accepted: bool,
+}
+
+/// `import` request (raw bucket import initiated by Explorer).
+///
+/// A durable mutation: `operation_id` identifies the import operation and a
+/// reconnect/retry reusing it must not duplicate the import. `import_id`
+/// determines the exact destination prefix `hfdrive-imports/<import_id>` (no trailing slash).
+///
+/// Per-file result records are paged: the first call carries no `files_cursor`
+/// and runs the import; a request carrying `files_cursor` is a continuation of
+/// the same operation's persisted result (never a second mutation — it must
+/// not be admitted as a new operation). See [`ImportResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ImportRequest {
+    /// Unique durable operation identifier for this mutation.
+    pub operation_id: Uuid,
+    /// Import identifier; fixes the destination prefix.
+    pub import_id: Uuid,
+    /// Exact target bucket/owner object.
+    pub target: ImportTarget,
+    /// Absolute local source paths to import.
+    pub sources: Vec<String>,
+    /// Continuation cursor from a previous `import` result page. Present only
+    /// for page continuations of the same operation; absent on the first call.
+    pub files_cursor: Option<String>,
+}
+request_method!(ImportRequest, "import");
+
+/// `import` result.
+///
+/// `files` is **one page** of per-file result records (at most the protocol
+/// page bound of 200 records); `next_cursor` is present exactly when more
+/// records remain and is passed back as [`ImportRequest::files_cursor`] on the
+/// same operation. Every page repeats the complete `import_id`, `prefix`,
+/// `file_count`, `total_bytes` and `empty_directory_count`, so each page is self-describing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ImportResult {
+    /// Import identifier echoed back.
+    pub import_id: Uuid,
+    /// Exact destination prefix: `hfdrive-imports/<import_id>` (no trailing slash).
+    pub prefix: String,
+    /// One page of per-file result records.
+    pub files: Vec<ImportFileResult>,
+    /// Continuation cursor for the next page, `None` on the last page.
+    pub next_cursor: Option<String>,
+    /// Total number of imported files (all pages).
+    pub file_count: u32,
+    /// Total imported bytes across all files (decimal string on the wire).
+    #[serde(with = "crate::dec_u64")]
+    pub total_bytes: u64,
+    /// Directories that produced no files. Native buckets have no standalone
+    /// directory objects; per-directory evidence remains in the local journal.
+    pub empty_directory_count: u32,
 }
 
 // ---------------------------------------------------------------------------
