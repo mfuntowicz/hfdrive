@@ -179,8 +179,8 @@
                     <TextBlock Text="Selected conflict"
                                Style="{StaticResource BodyStrongTextBlockStyle}"
                                TextWrapping="Wrap" />
-                    <Border Background="{ThemeResource HfCardBackgroundBrush}"
-                            BorderBrush="{ThemeResource HfCardBorderBrush}"
+                    <Border Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1"
                             CornerRadius="6"
                             Padding="12">

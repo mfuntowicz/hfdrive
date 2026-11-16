@@ -735,3 +735,22 @@ verification.
 Evidence: `artifacts/acceptance/tray-menu-anchor.png` and
 `tray-menu-anchor.png.json`. The temporary native callback probe was removed
 after verification.
+
+## Selected conflict Fluent colors — 2026-11-16
+
+- **fixed** — the Selected conflict detail no longer uses the tray's hardcoded
+  navy `HfCardBackgroundBrush`/`HfCardBorderBrush`. It uses native
+  `CardBackgroundFillColorSecondaryBrush` and `CardStrokeColorDefaultBrush`,
+  matching the surrounding Mica/Fluent page and theme contrast behavior.
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 178/178.
+  Evidence: `artifacts/tests/selected-conflict-colors-build.log` and
+  `selected-conflict-colors-tests.log`.
+- **passed** — the actual Advanced page showed the placeholder and disabled
+  resolution actions with a neutral `#393935` detail-background sample instead
+  of the former `#0D121E`. Text remains readable and actions retain the default
+  Fluent disabled styling. No conflict was loaded or resolved.
+
+Evidence: `artifacts/acceptance/selected-conflict-colors.png` and
+`selected-conflict-colors.png.json`. The temporary visual probe was removed
+after verification.
