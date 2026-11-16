@@ -773,3 +773,24 @@ after verification.
 Evidence: `artifacts/acceptance/selected-conflict-typography.png` and
 `selected-conflict-typography.png.json`. The temporary visual probe and isolated
 build output were removed after verification.
+
+## Recent activity tab selection — 2026-11-16
+
+- **fixed** — the provider returned five real commits (six records including the
+  initial no-change commit), so remote history was not missing. Independent
+  two-way `IsSyncingTabSelected`/`IsHistoryTabSelected` flags could both become
+  false during RadioButton check/uncheck ordering, hiding both cards. One
+  `SelectedActivityTab` value now owns selection; unchecked notifications never
+  clear the other button's selection.
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 180/180,
+  including both RadioButton transition orders. Evidence:
+  `artifacts/tests/recent-history-selection-build.log` and
+  `recent-history-selection-tests.log`.
+- **passed** — the actual first Recent activity selection displayed all six
+  committed records with `Recent activity` selected and `TrayHistory` visible.
+  No provider state or remote history was mutated.
+
+Evidence: `artifacts/acceptance/recent-history-fixed.json` and
+`recent-history-fixed.png`. The temporary delayed-state probe was removed after
+verification.

@@ -35,6 +35,7 @@
     <Compile Include="..\HfDrive.Desktop\ViewModels\TrayIssueProjection.cs" Link="TrayIssueProjection.cs" />
     <Compile Include="..\HfDrive.Desktop\ViewModels\SettingsQuantity.cs" Link="SettingsQuantity.cs" />
     <Compile Include="..\HfDrive.Desktop\Services\TrayMenuPlacement.cs" Link="TrayMenuPlacement.cs" />
+    <Compile Include="..\HfDrive.Desktop\ViewModels\TrayActivityTabSelection.cs" Link="TrayActivityTabSelection.cs" />
   </ItemGroup>
 
 </Project>

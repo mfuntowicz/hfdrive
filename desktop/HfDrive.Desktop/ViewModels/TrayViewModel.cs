@@ -249,21 +249,21 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     // ── Activity tab selection (view state only; no provider mutation) ────
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(IsHistoryTabSelected))]
-    public partial bool IsSyncingTabSelected { get; set; } = true;
+    [NotifyPropertyChangedFor(nameof(IsSyncingTabSelected), nameof(IsHistoryTabSelected))]
+    public partial TrayActivityTab SelectedActivityTab { get; set; } = TrayActivityTab.Syncing;
 
-    [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(IsSyncingTabSelected))]
-    public partial bool IsHistoryTabSelected { get; set; }
-
-    partial void OnIsSyncingTabSelectedChanged(bool value)
+    public bool IsSyncingTabSelected
     {
-        if (value) IsHistoryTabSelected = false;
+        get => SelectedActivityTab == TrayActivityTab.Syncing;
+        set => SelectedActivityTab = TrayActivityTabSelection.ApplyChecked(
+            SelectedActivityTab, TrayActivityTab.Syncing, value);
     }
 
-    partial void OnIsHistoryTabSelectedChanged(bool value)
+    public bool IsHistoryTabSelected
     {
-        if (value) IsSyncingTabSelected = false;
+        get => SelectedActivityTab == TrayActivityTab.History;
+        set => SelectedActivityTab = TrayActivityTabSelection.ApplyChecked(
+            SelectedActivityTab, TrayActivityTab.History, value);
     }
 
     // ── All-synced state (the only state that may celebrate) ─────────────
