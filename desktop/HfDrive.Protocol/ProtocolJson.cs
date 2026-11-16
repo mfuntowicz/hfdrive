@@ -80,6 +80,10 @@ public static class ProtocolJson
             UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
             NumberHandling = JsonNumberHandling.Strict,
         };
+        // Options converters take precedence over enum attributes. Register the
+        // exact error-code map before the general enum converter so acronym
+        // spellings such as oauth_client_not_configured are not rewritten.
+        options.Converters.Add(new ProtocolErrorCodeConverter());
         options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false));
         options.Converters.Add(new DecimalStringUInt64Converter());
         options.Converters.Add(new NullableDecimalStringUInt64Converter());

@@ -849,3 +849,26 @@ verification.
   bucket for this run. No such effects or credentials were used. The exact gate
   is recorded in `artifacts/acceptance/external-gates.json`; deterministic
   fixtures and the DLL smoke are not live HF/Explorer acceptance.
+
+## OAuth configuration error-code conversion — 2026-11-16
+
+- **fixed** — `ProtocolJson.Options` registered its general snake-case enum
+  converter ahead of the specific `ProtocolErrorCodeConverter`. Options
+  converters take precedence over the enum's attribute, so .NET expected
+  `o_auth_client_not_configured` while Rust correctly emitted
+  `oauth_client_not_configured`. The specific converter now runs first; the
+  canonical spelling is accepted and the legacy/Pascal spellings are rejected.
+- **passed** — a new golden `start_login` OAuth-configuration error round-trips
+  through both codecs, and an invalid fixture rejects the general .NET acronym
+  spelling. All 180 managed protocol tests and all 4 Rust fixture suites passed.
+  Evidence: `artifacts/tests/oauth-error-code-build.log`,
+  `artifacts/tests/protocol/oauth-error-code-tests.trx`, and
+  `artifacts/tests/oauth-error-code-rust-fixtures.log`.
+- **passed** — the actual updated Debug desktop rendered the sign-in page with
+  no `MalformedFrame`. Invoking Sign in displayed
+  `OAuthClientNotConfigured: the product OAuth client is not configured` instead
+  of the former decoder failure. The provider stayed running; no OAuth flow or
+  remote resource was started. Evidence:
+  `artifacts/acceptance/oauth-error-code-fixed.png` and
+  `artifacts/acceptance/oauth-error-code-fixed.json`. The temporary UI harness
+  was removed after verification.

@@ -1,0 +1,11 @@
+{
+  "name": "reject_oauth_client_not_configured_legacy_spelling",
+  "description": "OAuth configuration error rejects the general .NET acronym spelling",
+  "class": "invalid",
+  "stage": "envelope",
+  "expectation": {
+    "error_code": "malformed_frame",
+    "reason": "OAuth configuration error rejects the general .NET acronym spelling"
+  },
+  "frame_hex": "cb0000007b2270726f746f636f6c5f6d616a6f72223a312c2270726f746f636f6c5f6d696e6f72223a302c22726571756573745f6964223a2263306165623339612d326535352d346565662d386565662d303030323730363164643765222c226b696e64223a22726573706f6e7365222c226d6574686f64223a2273746172745f6c6f67696e222c22626f6479223a7b226572726f72223a7b22636f6465223a226f5f617574685f636c69656e745f6e6f745f636f6e66696775726564222c226d657373616765223a2278227d7d7d"
+}

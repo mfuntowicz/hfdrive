@@ -52,6 +52,14 @@
       }
     },
     {
+      "name": "start_login_response_oauth_client_not_configured",
+      "file": "golden/start_login_response_oauth_client_not_configured.json",
+      "description": "OAuth configuration error uses the canonical cross-language wire spelling",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
       "name": "subscribe_status_request",
       "file": "golden/subscribe_status_request.json",
       "description": "subscribe_status request with last_sequence",
@@ -347,6 +355,13 @@
       "stage": "envelope",
       "error_code": "malformed_frame",
       "description": "envelope without body"
+    },
+    {
+      "name": "reject_oauth_client_not_configured_legacy_spelling",
+      "file": "invalid/reject_oauth_client_not_configured_legacy_spelling.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "OAuth configuration error rejects the general .NET acronym spelling"
     },
     {
       "name": "reject_both_result_and_error",

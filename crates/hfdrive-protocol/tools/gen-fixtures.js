@@ -321,6 +321,12 @@ gold("get_status_response_error", "response error shape with retry hint",
     error: { code: "busy", message: "provider is at capacity", retry_after_ms: "250" },
   }));
 
+gold("start_login_response_oauth_client_not_configured",
+  "OAuth configuration error uses the canonical cross-language wire spelling",
+  responseEnvelope(REQUEST_ID, "start_login", {
+    error: { code: "oauth_client_not_configured", message: "the product OAuth client is not configured" },
+  }));
+
 gold("subscribe_status_request", "subscribe_status request with last_sequence",
   requestEnvelope(REQUEST_ID, "subscribe_status", requestBody("subscribe_status", { last_sequence: "7" })));
 
@@ -600,6 +606,10 @@ const payloadCases = [
     "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID + "\",\"kind\":\"request\",\"method\":\"get_status\",\"body\":{\"nope\":1}}"],
   ["reject_missing_body", "envelope without body", "malformed_frame",
     "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID + "\",\"kind\":\"request\",\"method\":\"get_status\"}"],
+  ["reject_oauth_client_not_configured_legacy_spelling",
+    "OAuth configuration error rejects the general .NET acronym spelling",
+    "malformed_frame",
+    "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID + "\",\"kind\":\"response\",\"method\":\"start_login\",\"body\":{\"error\":{\"code\":\"o_auth_client_not_configured\",\"message\":\"x\"}}}"],
   ["reject_both_result_and_error", "response body with both result and error", "malformed_frame",
     "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID + "\",\"kind\":\"response\",\"method\":\"get_status\",\"body\":{\"result\":{},\"error\":{\"code\":\"busy\",\"message\":\"x\"}}}"],
   ["reject_neither_result_nor_error", "response body with neither result nor error", "malformed_frame",
