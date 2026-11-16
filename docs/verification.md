@@ -646,3 +646,25 @@ The temporary native QA script was removed after verification.
 Evidence: `artifacts/acceptance/activity-tabs.json`,
 `activity-tabs-sync.png`, and `activity-tabs-history.png`. No settings or remote
 resources were mutated. The temporary tab-verification script was removed.
+
+## Compact tray activity layout — 2026-11-16
+
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 175/175.
+  Evidence: `artifacts/tests/tray-layout-refinement-build.log` and
+  `tray-layout-refinement-tests.log`.
+- **passed** — the actual tray uses a 64px celebration card and a 48×48 GIF
+  layout box (96px decode), followed immediately by two 184px tabs spanning the
+  368px content width. The measured celebration-to-tab gap is zero. Optional
+  warning and folder-selector controls own their margins; no negative layout
+  offset remains.
+- **passed** — Recent activity renders real committed history in the bounded
+  body while Issues and all three footer actions remain visible. A fresh
+  all-synced cycle produced different early GIF frame hashes and identical late
+  hashes after the two-play budget; reopening an exhausted cycle stays stopped.
+- No settings, provider sync state, or remote resources were mutated.
+
+Evidence: `artifacts/acceptance/activity-layout-sync.json`,
+`activity-layout-sync.png`, `activity-layout-history.json`,
+`activity-layout-history.png`, and `compact-animation.json`. The temporary
+layout and animation probes were removed after verification.

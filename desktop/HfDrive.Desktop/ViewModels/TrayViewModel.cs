@@ -208,7 +208,10 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     public bool IsUnavailableView => PanelState == TrayPanelState.Unavailable;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasWarningText))]
     public partial string? WarningText { get; set; }
+
+    public bool HasWarningText => !string.IsNullOrWhiteSpace(WarningText);
 
     // ── Account avatar (display identity only; never a credential) ──────
 
@@ -242,6 +245,26 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     public partial string FeatureUnavailableText { get; set; } = string.Empty;
+
+    // ── Activity tab selection (view state only; no provider mutation) ────
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsHistoryTabSelected))]
+    public partial bool IsSyncingTabSelected { get; set; } = true;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsSyncingTabSelected))]
+    public partial bool IsHistoryTabSelected { get; set; }
+
+    partial void OnIsSyncingTabSelectedChanged(bool value)
+    {
+        if (value) IsHistoryTabSelected = false;
+    }
+
+    partial void OnIsHistoryTabSelectedChanged(bool value)
+    {
+        if (value) IsSyncingTabSelected = false;
+    }
 
     // ── All-synced state (the only state that may celebrate) ─────────────
 
