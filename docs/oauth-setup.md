@@ -107,6 +107,10 @@ Connection errors and failed activity/history/conflict requests appear under
 Each request retains its own error until a fresh successful response; an older
 page response cannot clear a newer authorization failure. Storage-access actions
 manage the existing connection rather than opening **Add drive**.
+Equal-width **Syncing now** and **Recent activity** tabs present their contents
+in separate cards, keeping **Issues** visible below. Syncing shows a green check
+and “Everything is up to date” only when the provider proves all synced; blocked,
+unknown, or failed states retain their actual status instead.
 
 The header shows only the HF Drive title. The signed-in profile picture comes
 from verified OIDC userinfo's `picture` claim, is restricted to HTTPS Hugging

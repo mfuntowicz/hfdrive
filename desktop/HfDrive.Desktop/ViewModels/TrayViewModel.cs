@@ -258,12 +258,16 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     /// paused, failed, disconnected and no-drive states are never "all synced".
     /// </summary>
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(AllSyncedText))]
+    [NotifyPropertyChangedFor(nameof(AllSyncedText), nameof(IsActivityStatusVisible))]
     public partial bool IsAllSynced { get; set; }
 
     public string AllSyncedText => IsAllSynced
         ? "Everything is up to date"
         : string.Empty;
+
+    /// <summary>Hide the ordinary empty-queue text while the green all-synced
+    /// confirmation is shown; blocked or unknown states keep their real text.</summary>
+    public bool IsActivityStatusVisible => !IsAllSynced;
 
     /// <summary>
     /// First reason the celebration is withheld (diagnostics only); null while

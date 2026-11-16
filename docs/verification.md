@@ -631,3 +631,18 @@ Evidence: `artifacts/acceptance/tray-feedback.json`,
 frame/layout captures. Rust builds used an isolated Cargo target because the
 original target's proc-macro DLLs were locked; no build artifacts were deleted.
 The temporary native QA script was removed after verification.
+
+## Activity tabs and idle confirmation — 2026-11-16
+
+- **passed** — desktop solution build with locked restore and 175/175 managed
+  regression tests. Evidence: `artifacts/tests/activity-tabs-desktop-build.log`
+  and `activity-tabs-managed-tests.log`.
+- **passed** — actual tray presents equal-width Syncing now / Recent activity
+  tabs with card content. Syncing shows a green check and “Everything is up to
+  date” only for the provider's proven all-synced state. Recent activity
+  selection displays real committed history; Issues and footer actions remain
+  visible and unchanged.
+
+Evidence: `artifacts/acceptance/activity-tabs.json`,
+`activity-tabs-sync.png`, and `activity-tabs-history.png`. No settings or remote
+resources were mutated. The temporary tab-verification script was removed.

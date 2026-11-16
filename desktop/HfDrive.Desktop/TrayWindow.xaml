@@ -223,45 +223,102 @@
                                   HorizontalAlignment="Stretch" />
                     </StackPanel>
 
-                    <!-- Files and folders currently syncing (real list_activity). -->
-                    <StackPanel Spacing="8"
-                                AutomationProperties.AutomationId="TrayActivity"
-                                AutomationProperties.Name="Syncing now">
-                        <TextBlock Style="{StaticResource TraySectionHeaderStyle}" Text="Syncing now" />
-                        <TextBlock Text="{x:Bind ViewModel.ActivityStateText, Mode=OneWay}"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   Opacity="0.8"
-                                   TextWrapping="Wrap" />
-                        <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityItems, Mode=OneWay}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate x:DataType="vm:TrayActivityRow">
-                                    <Border Margin="0,4,0,0" Padding="8,6"
-                                            Background="{ThemeResource HfCardBackgroundBrush}"
-                                            CornerRadius="6">
-                                        <StackPanel Spacing="2">
-                                            <TextBlock Text="{x:Bind ItemName, Mode=OneTime}"
-                                                       TextWrapping="Wrap"
-                                                       FontWeight="SemiBold" />
-                                            <TextBlock Text="{x:Bind PhaseText, Mode=OneTime}"
-                                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                                       Opacity="0.8" />
-                                            <TextBlock Text="{x:Bind ProgressText, Mode=OneTime}"
-                                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                                       Opacity="0.8" />
-                                            <TextBlock Text="{x:Bind ErrorText, Mode=OneTime}"
-                                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                                                       TextWrapping="Wrap" />
-                                        </StackPanel>
-                                    </Border>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
-                        <Button Content="Show more"
-                                HorizontalAlignment="Left"
-                                Command="{x:Bind ViewModel.LoadMoreActivityCommand}"
-                                Visibility="{Binding HasMoreActivity, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                    </StackPanel>
+                    <!-- Activity and committed history share a compact tabbed card. -->
+                    <TabView SelectedIndex="0"
+                             TabWidthMode="Equal"
+                             IsAddTabButtonVisible="False"
+                             CanReorderTabs="False"
+                             AllowDrop="False"
+                             AutomationProperties.Name="Activity views">
+                        <TabViewItem Header="Syncing now" IsClosable="False">
+                            <Border Style="{StaticResource TrayCardBorderStyle}"
+                                    AutomationProperties.AutomationId="TrayActivity"
+                                    AutomationProperties.Name="Syncing now">
+                                <StackPanel Spacing="8">
+                                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                                Visibility="{Binding IsAllSynced, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                        <FontIcon Glyph="&#xE73E;"
+                                                  FontSize="16"
+                                                  VerticalAlignment="Center"
+                                                  Foreground="{ThemeResource SystemFillColorSuccessBrush}" />
+                                        <TextBlock Text="Everything is up to date"
+                                                   Style="{StaticResource TraySectionHeaderStyle}"
+                                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <TextBlock Text="{x:Bind ViewModel.ActivityStateText, Mode=OneWay}"
+                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                               Opacity="0.8"
+                                               TextWrapping="Wrap"
+                                               Visibility="{Binding IsActivityStatusVisible, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                    <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityItems, Mode=OneWay}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:TrayActivityRow">
+                                                <Border Margin="0,4,0,0" Padding="8,6"
+                                                        Background="{ThemeResource HfCardBackgroundBrush}"
+                                                        CornerRadius="6">
+                                                    <StackPanel Spacing="2">
+                                                        <TextBlock Text="{x:Bind ItemName, Mode=OneTime}"
+                                                                   TextWrapping="Wrap"
+                                                                   FontWeight="SemiBold" />
+                                                        <TextBlock Text="{x:Bind PhaseText, Mode=OneTime}"
+                                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                                   Opacity="0.8" />
+                                                        <TextBlock Text="{x:Bind ProgressText, Mode=OneTime}"
+                                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                                   Opacity="0.8" />
+                                                        <TextBlock Text="{x:Bind ErrorText, Mode=OneTime}"
+                                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                                                   TextWrapping="Wrap" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <Button Content="Show more"
+                                            HorizontalAlignment="Left"
+                                            Command="{x:Bind ViewModel.LoadMoreActivityCommand}"
+                                            Visibility="{Binding HasMoreActivity, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                </StackPanel>
+                            </Border>
+                        </TabViewItem>
+                        <TabViewItem Header="Recent activity" IsClosable="False">
+                            <Border Style="{StaticResource TrayCardBorderStyle}"
+                                    AutomationProperties.AutomationId="TrayHistory"
+                                    AutomationProperties.Name="Recent activity">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="{x:Bind ViewModel.HistoryStateText, Mode=OneWay}"
+                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                               Opacity="0.8"
+                                               TextWrapping="Wrap" />
+                                    <ItemsControl ItemsSource="{x:Bind ViewModel.HistoryItems, Mode=OneWay}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:TrayHistoryRow">
+                                                <Border Margin="0,4,0,0" Padding="8,6"
+                                                        Background="{ThemeResource HfCardBackgroundBrush}"
+                                                        CornerRadius="6">
+                                                    <StackPanel Spacing="2">
+                                                        <TextBlock Text="{x:Bind SummaryText, Mode=OneTime}"
+                                                                   TextWrapping="Wrap"
+                                                                   FontWeight="SemiBold" />
+                                                        <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                                                                   Opacity="0.8"
+                                                                   TextWrapping="Wrap"
+                                                                   Text="{x:Bind MetaText, Mode=OneTime}" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <Button Content="Show older changes"
+                                            HorizontalAlignment="Left"
+                                            Command="{x:Bind ViewModel.LoadMoreHistoryCommand}"
+                                            Visibility="{Binding HasMoreHistory, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                </StackPanel>
+                            </Border>
+                        </TabViewItem>
+                    </TabView>
 
                     <!-- Provider capability gap for live activity (old provider). -->
                     <StackPanel Spacing="8"
@@ -272,40 +329,6 @@
                         <TextBlock Text="{x:Bind ViewModel.FeatureUnavailableText, Mode=OneWay}"
                                    TextWrapping="Wrap"
                                    Opacity="0.8" />
-                    </StackPanel>
-
-                    <!-- Real committed history (paginated list_history). -->
-                    <StackPanel Spacing="8"
-                                AutomationProperties.AutomationId="TrayHistory"
-                                AutomationProperties.Name="Recent activity">
-                        <TextBlock Style="{StaticResource TraySectionHeaderStyle}" Text="Recent activity" />
-                        <TextBlock Text="{x:Bind ViewModel.HistoryStateText, Mode=OneWay}"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   Opacity="0.8"
-                                   TextWrapping="Wrap" />
-                        <ItemsControl ItemsSource="{x:Bind ViewModel.HistoryItems, Mode=OneWay}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate x:DataType="vm:TrayHistoryRow">
-                                    <Border Margin="0,4,0,0" Padding="8,6"
-                                            Background="{ThemeResource HfCardBackgroundBrush}"
-                                            CornerRadius="6">
-                                        <StackPanel Spacing="2">
-                                            <TextBlock Text="{x:Bind SummaryText, Mode=OneTime}"
-                                                       TextWrapping="Wrap"
-                                                       FontWeight="SemiBold" />
-                                            <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
-                                                       Opacity="0.8"
-                                                       TextWrapping="Wrap"
-                                                       Text="{x:Bind MetaText, Mode=OneTime}" />
-                                        </StackPanel>
-                                    </Border>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
-                        <Button Content="Show older changes"
-                                HorizontalAlignment="Left"
-                                Command="{x:Bind ViewModel.LoadMoreHistoryCommand}"
-                                Visibility="{Binding HasMoreHistory, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
                     </StackPanel>
 
                     <!-- Actionable issues: conflicts and connection/transfer failures. -->
