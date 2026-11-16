@@ -489,3 +489,145 @@ Evidence: `artifacts/tests/reconciliation-provider.log`.
 These are deterministic local-state/temporary-filesystem gates. No readable
 bucket projection, arbitrary website-edit import, live migration, or new
 two-device acceptance is claimed by this change.
+
+## Fluent desktop settings — 2026-11-16
+
+- **passed** — Debug/x64 desktop solution build with locked restore, the pinned
+  Build Tools 2026 MSBuild, .NET SDK 11.0.100, and Windows SDK 28000.
+  Evidence: `artifacts/tests/settings-desktop-final-build.log`.
+- **passed** — 175 managed regression tests, including 90 exact quantity and
+  settings-draft tests. Coverage includes full-width integer round trips,
+  fractional-byte rejection, unlimited rates, and preserving a dirty field
+  without turning an untouched remotely changed field into a stale overwrite.
+  Evidence: `artifacts/tests/settings-managed-final/settings-managed-final.trx`
+  and `artifacts/tests/settings-quantities.log`.
+- **passed** — actual WinUI settings, account, connections, advanced operations,
+  and setup navigation. Native captures cover 1100×820 and 800×720 viewports;
+  lower storage fields scroll into view while all three settings actions remain
+  visible. The configured caption returns `HTCAPTION`, retains resizing, and
+  uses native DWM rounding; setup retains exactly one custom close control.
+- **passed** — actual provider-backed load, malformed-input feedback, dirty
+  draft preservation on reload, cancel/confirm discard, tray Settings routing,
+  close-to-tray and reopening. Live settings stayed at revision 1. No valid
+  settings mutation, root reset, registration change, or provider restart was
+  requested; existing connection/workspace/bucket/prefix/root/mode bindings
+  match their before/after records.
+
+Consolidated evidence: `artifacts/acceptance/settings-rework.json`. Visuals:
+`settings-final.png`, `settings-narrow-storage.png`, `settings-account.png`,
+`settings-connections.png`, `settings-advanced.png`, and `settings-setup.png`
+in that acceptance directory. The temporary native QA script was removed.
+
+Visual inspection covered the current Windows 11 x64 dark theme; other themes,
+DPI settings, and packaged installation were not exercised in this change.
+C# LSP was unavailable, so diagnostics came from the real build and runtime.
+MVVM Toolkit/CsWinRT AOT advisories remain with NativeAOT/trimming disabled.
+Optional full-file whitespace verification reported five DTO-initializer layout
+diagnostics in `MainViewModel.cs`; those layouts were left untouched.
+
+## HF palette, quiet status, and Mica — 2026-11-16
+
+- **passed** — Debug/x64 desktop build with locked restore; zero errors. The
+  existing 96 MVVM Toolkit/CsWinRT AOT advisories remain. Evidence:
+  `artifacts/tests/hf-palette-desktop-build.log`.
+- **passed** — actual WinUI composition Mica backdrop visible through the
+  transparent shell, caption, and navigation. HF content remains opaque:
+  sampled card `#0D121E` and input `#0B0F19`. The selected left navigation
+  item is rectangular; its corner and interior both sample `#192331`.
+- **passed** — clean provider-loaded settings show neither “No unsaved
+  changes.” nor “Settings loaded.” A temporary valid draft displayed “You have
+  unsaved changes.” and enabled Save; it was never submitted, and the restarted
+  UI shows the persisted `Unlimited` value with Save disabled.
+
+Evidence: `artifacts/acceptance/hf-palette.json`,
+`hf-palette-settings.json`, and `hf-palette-settings.png`. The temporary UI
+verification script was removed. Verification covered the current Windows 11
+x64 desktop and theme, not packaged installation or other themes/DPI settings.
+
+## Default Fluent content over Mica — 2026-11-16
+
+- **passed** — Debug/x64 desktop build with locked restore; zero errors. The
+  custom settings textbox, button, expander, accent, and navy card overrides
+  were removed in favor of native WinUI theme resources. Evidence:
+  `artifacts/tests/default-mica-desktop-build.log`.
+- **passed** — actual Mica settings window uses neutral default card/input
+  surfaces (sampled `#32332E` and `#3F3E3A` on the current desktop), not the
+  previous navy `#0D121E`/`#0B0F19`. Square left navigation and Mica remain.
+- **passed** — provider values remain loaded (`Upload speed = Unlimited`), Save
+  remains disabled without edits, and neither clean-state footer message is
+  present. No settings mutation was requested.
+
+Evidence: `artifacts/acceptance/default-mica.json`,
+`default-mica-settings.json`, and `default-mica-settings.png`. The temporary
+capture script was removed after use.
+
+## Account navigation resource fix — 2026-11-16
+
+- **fixed** — removing the custom primary-button style left five cross-page
+  `StaticResource` consumers: two in Account and three in Advanced. Those
+  buttons now use WinUI's `AccentButtonStyle`, matching Settings and avoiding
+  the runtime missing-resource navigation failure.
+- **passed** — Debug/x64 desktop build with locked restore; zero errors.
+  Evidence: `artifacts/tests/account-navigation-fix-build.log`.
+- **passed** — actual desktop navigation opened Account, Connections, Advanced,
+  and returned to Settings without the UI process exiting. Account rendered
+  its signed-in identity and storage owners; Advanced rendered its connection,
+  conflict, and history controls. Settings still showed the persisted values,
+  disabled Save without edits, and no clean-state footer messages.
+
+Evidence: `artifacts/acceptance/account-navigation-fix.json` and the
+`account-navigation-*.json`/PNG files in that directory. The provider remained
+running and no settings mutation was requested. The temporary UI navigation
+script was removed after verification.
+
+## Tray launch, theme scope, and bucket creation — 2026-11-16
+
+- **passed** — final Debug/x64 desktop build with locked restore; zero errors.
+  Evidence: `artifacts/tests/tray-launch-theme-creation-build.log`.
+- **passed** — launching the desktop left both native windows hidden. The
+  provider session started independently of window `Loaded`. The tray panel
+  opened with its opaque HF page/header (`#0B0F19`) and Huggy branding; the
+  main window did not appear until Open HF Drive was explicitly invoked.
+- **passed** — explicit Settings retained default Fluent/Mica content and the
+  persisted `Unlimited` values. Add Drive now uses the same default card,
+  action, and footer resources rather than its former navy surfaces. The
+  existing `drive-private-test` draft and Use an existing HF Drive selection
+  were restored without submitting them, then the UI returned to tray-only.
+- **fixed** — Create private bucket now requests `manage-repos` before creation
+  when that grant is absent, includes the selected organization in re-consent,
+  and places creation/consent failures beside the button with scroll-into-view.
+  The original provider denial was `PermissionDenied: Storage access was denied`.
+- **not_run** — no new re-consent or live bucket creation was attempted during
+  verification, so remote creation success is not claimed. No settings or
+  remote resources were mutated; the existing provider remained running.
+
+Evidence: `artifacts/acceptance/shell-regression.json` and the
+`shell-regression-*.json`/PNG files in that directory. The temporary native UI
+script was removed after verification. An optional shell icon-rectangle query
+in the QA harness returned `E_INVALIDARG`; it is not used as acceptance evidence.
+
+## Tray profile, playback, and actions — 2026-11-16
+
+- **passed** — desktop solution build with locked restore; zero errors. Managed
+  protocol/tray/settings suite: 175/175. Rust IPC protocol: 31/31. Auth:
+  48/48, including bearer-only userinfo with no OAuth client ID and subject
+  mismatch rejection. Provider/CLI: 127/127 with one authorized-live-CFAPI
+  test intentionally ignored. C# LSP and the rustfmt component were unavailable.
+- **passed** — the restored account with no `HFDRIVE_OAUTH_CLIENT_ID` received
+  its real HF `picture` URL through bounded, subject-validated userinfo. The
+  circular profile image renders in the left header slot with Huggy fallback;
+  HF Drive is centered with Inter/native-font fallback, and no signed-in text
+  remains in the header or body. No bearer token is attached to the image load.
+- **passed** — the celebration occupies the former body account line. Frame
+  hashes differ during playback and are identical at 10.5 and 11.5 seconds,
+  confirming the GIF stopped after its two-play, 9.68-second budget.
+- **passed** — Pause/Add/Open have equal heights and alignment (widths differ
+  only by one rounded pixel). Add bucket has an HF yellow background and dark
+  plus, and opens bucket setup without creating storage or starting consent.
+  The app returned to tray-only afterward; provider and settings were unchanged.
+
+Evidence: `artifacts/acceptance/tray-feedback.json`,
+`tray-feedback-tray.png`, `tray-feedback-two-play.json`, and the associated
+frame/layout captures. Rust builds used an isolated Cargo target because the
+original target's proc-macro DLLs were locked; no build artifacts were deleted.
+The temporary native QA script was removed after verification.

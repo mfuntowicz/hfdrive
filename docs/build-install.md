@@ -202,9 +202,12 @@ hfdrive status --json                                        # CLI alias
 ```
 
 On first launch, or when the provider reports no configured drives, the desktop
-shows compact onboarding instead of the navigation shell. Configured users go
-directly to the normal app; **Add drive** reopens the compact form. See
-[Desktop onboarding](oauth-setup.md#desktop-onboarding) for the four-step flow.
+shows compact onboarding instead of the navigation shell. Configured users open
+the branded **Settings** page; **Account**, **Connections**, and **Advanced**
+remain available in navigation. The tray's **Settings** action opens that page.
+**Add drive** reopens the compact form without changing existing connections.
+See [Desktop onboarding](oauth-setup.md#desktop-onboarding) and
+[Desktop settings](oauth-setup.md#desktop-settings) for the implemented flows.
 
 
 ## Static regression tests (no packaging/signing/install performed)

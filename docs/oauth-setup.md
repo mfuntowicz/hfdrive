@@ -53,7 +53,11 @@ explicit account, connection, and issue actions still navigate to their pages.
    remains an explicit alternative. An already signed-in account skips this page.
 2. **Bucket** — choose the account/organization, bucket, and new or existing drive.
    Optional private-bucket creation and the exact managed location have expandable
-   details. Continue inspects the location without creating remote objects.
+   details. If the current grant lacks `manage-repos`, Create private bucket starts
+   an explicit re-consent instead of submitting the creation, scoped to the selected
+   organization when applicable; the user then retries after consent. Creation and
+   consent failures appear beside that button and scroll into view. Continue
+   inspects the location without creating remote objects.
 3. **Folder & access** — use the native folder picker or edit the suggested
    unused `%USERPROFILE%\HF Drive\<bucket>` path. Occupied names receive a numeric
    suffix; entered paths and the same bucket's prior suggestion are preserved.
@@ -70,8 +74,8 @@ through **Connections**; a new setup must use another folder rather than taking
 over the existing registration. Root validation reports its specific filesystem
 rejection instead of replacing every failure with a generic invalid-root message.
 
-The form uses CatchingHuggy artwork and Storage-inspired blue/neutral resources
-with native light, dark, and high-contrast controls. Technical identifiers
+The form uses CatchingHuggy artwork with the same default Mica-aware Fluent
+cards, footer, actions, and native theme controls as Settings. Technical identifiers
 and probe results stay expandable, including failed checks before review. Secret
 fields are cleared before any asynchronous submission; immutable .NET strings
 still cannot be guaranteed erased. No local “setup complete” flag overrides
@@ -104,10 +108,57 @@ Each request retains its own error until a fresh successful response; an older
 page response cannot clear a newer authorization failure. Storage-access actions
 manage the existing connection rather than opening **Add drive**.
 
-`VibingHuggy.gif` plays only when every configured drive has fresh, healthy,
-up-to-date status and a proven empty activity queue. No drives, pending work,
-paused or failed drives, conflicts, or stale status never qualify. Both GIFs
-respect Windows animation preferences and stop while their surface is hidden.
+The header shows only the HF Drive title. The signed-in profile picture comes
+from verified OIDC userinfo's `picture` claim, is restricted to HTTPS Hugging
+Face hosts, and loads without bearer credentials; CatchingHuggy is the loading,
+missing, or failed-image fallback. It occupies the left identity slot beside the
+centered Inter-font HF Drive title; Refresh/Close remain on the right.
+
+`VibingHuggy.gif` appears at the top of the body only when every configured
+drive has fresh, healthy, up-to-date status and a proven empty activity queue.
+No drives, pending work, paused or failed drives, conflicts, or stale status
+qualify. Each continuous all-synced state plays the 121-frame, 40 ms GIF exactly
+twice (9.68 seconds total). Routine status refreshes do not restart it; hiding
+the panel or disabling animations pauses it and preserves the remaining budget.
+The footer has equal-width Pause/Add/Open actions. The Add bucket button has
+an HF yellow background and dark plus glyph; it opens the existing bucket setup
+only and never creates storage or starts consent by itself.
+
+## Desktop settings
+
+Launching the desktop creates only the tray icon; it does not open Settings or
+setup. Provider startup still runs independently of window visibility. The tray
+menu's **Settings** action opens that page explicitly; **Open HF Drive** reopens
+whichever page or unfinished setup was already active. CatchingHuggy and native
+rounded corners match onboarding and
+the tray. MainWindow scopes its transparent surfaces to its own Mica backdrop;
+the tray retains its opaque HF background, header, cards, and Huggy branding.
+Settings cards, inputs, expanders, and actions use the default Mica-aware
+Fluent brushes rather than custom navy fills. Left navigation selection and
+hover surfaces are rectangular. Windows/WinUI owns focus, accent, and high
+contrast colors. The configured window keeps resize and standard window
+controls in a theme-integrated caption.
+
+**Transfer speeds** contains upload and download limits. Enter `Unlimited` or
+`0` for no limit, an exact byte count, or an IEC quantity such as `10 MiB/s`.
+**Local storage** contains transfer memory, range cache, staging admission, and
+the free-space reserve; quantities such as `512 MiB` and `10 GiB` are accepted.
+Decimal quantities must resolve to whole bytes. Leaving a field empty preserves
+its stored value; displaying or saving another field never rounds that value.
+
+Values load from the provider before editing is enabled. **Save settings**
+submits only changed values against the observed revision. **Reload settings**
+refreshes the provider state while preserving an unsaved draft; **Discard my
+changes** asks for confirmation before replacing it. A revision conflict keeps
+the draft for review instead of silently retrying or overwriting another client.
+The clean loaded state has no footer status text; unsaved drafts, successful
+saves, preserved-draft reloads, and errors still report their status.
+
+**Account** contains sign-in, owners, and expandable provider details.
+**Connections** shows the actual drive health and local folders. UUID-scoped
+sync controls, selective sync, history, restore, conflicts, and diagnostics remain
+available under **Advanced**. These pages share the existing provider session;
+opening settings never recreates a drive or changes its storage binding.
 
 
 ## Flows
