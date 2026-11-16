@@ -122,6 +122,8 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
 
     // ── Settings ─────────────────────────────────────────────────────────
 
+    // Draft text exactly as the user typed it (or as the provider's stored
+    // value formats). A reload never silently overwrites a dirty draft.
     [ObservableProperty] private string _settingsUploadBpsText = string.Empty;
     [ObservableProperty] private string _settingsDownloadBpsText = string.Empty;
     [ObservableProperty] private string _settingsTransferMemoryText = string.Empty;
@@ -129,11 +131,117 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _settingsStagingAdmissionText = string.Empty;
     [ObservableProperty] private string _settingsMinimumFreeText = string.Empty;
 
-    [ObservableProperty] private string _settingsRevisionText = "Revision: not read from the provider yet.";
+    [ObservableProperty] private string _settingsRevisionText = "Revision: not read yet.";
 
     [ObservableProperty] private string _settingsResultText = string.Empty;
 
-    [ObservableProperty] private string? _settingsErrorText;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasSettingsErrorText))]
+    private string? _settingsErrorText;
+
+    /// <summary>True once the provider's actual settings and revision are known for this session.</summary>
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ApplySettingsCommand))]
+    [NotifyPropertyChangedFor(nameof(IsSettingsEditingEnabled), nameof(SettingsNotReadyText), nameof(HasSettingsNotReadyText))]
+    private bool _isSettingsReady;
+
+    /// <summary>True while any field differs from the last observed provider value.</summary>
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ApplySettingsCommand))]
+    [NotifyPropertyChangedFor(nameof(SettingsDirtyText))]
+    private bool _isSettingsDirty;
+
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ReloadSettingsCommand), nameof(ApplySettingsCommand))]
+    private bool _settingsHasError;
+
+    [ObservableProperty] private bool _settingsHasSuccess;
+
+    /// <summary>Fields are editable only with observed values and no busy work.</summary>
+    public bool IsSettingsEditingEnabled => IsSettingsReady && !IsBusy;
+
+    public string SettingsNotReadyText => IsSettingsReady
+        ? string.Empty
+        : "The values below are not loaded yet. Use Reload settings to read them.";
+
+    /// <summary>True while the not-ready notice should take footer space.</summary>
+    public bool HasSettingsNotReadyText => SettingsNotReadyText.Length != 0;
+
+    /// <summary>True while a save/reload feedback message should take footer space.</summary>
+    public bool HasSettingsResultText => SettingsResultText.Length != 0;
+
+    /// <summary>True while a provider error should take footer space.</summary>
+    public bool HasSettingsErrorText => !string.IsNullOrEmpty(SettingsErrorText);
+
+    public string SettingsDirtyText => IsSettingsDirty
+        ? "You have unsaved changes."
+        : "No unsaved changes.";
+
+    public string SettingsRateExamplesText =>
+        $"Examples: 10 MiB/s, 250 KiB/s, {SettingsQuantity.UnlimitedWord} (= 0, no limit). Plain digits mean bytes per second.";
+
+    public string SettingsSizeExamplesText =>
+        "Examples: 512 MiB, 10 GiB, 0 B. Units are binary (IEC): 1 KiB = 1024 B; B, KiB, MiB, GiB, TiB.";
+
+    /// <summary>Provider values as last observed; null when the provider has no stored entry for the key.</summary>
+    private readonly Dictionary<string, ulong?> _settingsLoadedValues = new();
+
+    /// <summary>Session generation the loaded settings belong to; a change invalidates readiness.</summary>
+    private long _settingsReadGeneration = -1;
+
+    private bool _settingsWriteInFlight;
+    private int _settingsOpSerial;
+
+    /// <summary>The six provider-wide settings keys, in display order.</summary>
+    private static readonly string[] SettingsKeys =
+    {
+        "upload_bytes_per_second", "download_bytes_per_second", "transfer_memory_bytes",
+        "range_cache_bytes", "staging_admission_bytes", "minimum_free_bytes",
+    };
+
+    /// <summary>Draft text for one settings key.</summary>
+    private string SettingsTextFor(string key) => key switch
+    {
+        "upload_bytes_per_second" => SettingsUploadBpsText,
+        "download_bytes_per_second" => SettingsDownloadBpsText,
+        "transfer_memory_bytes" => SettingsTransferMemoryText,
+        "range_cache_bytes" => SettingsRangeCacheText,
+        "staging_admission_bytes" => SettingsStagingAdmissionText,
+        "minimum_free_bytes" => SettingsMinimumFreeText,
+        _ => string.Empty,
+    };
+
+    /// <summary>Writes one field's draft text through the generated property.</summary>
+    private void SetSettingsText(string key, string text)
+    {
+        switch (key)
+        {
+            case "upload_bytes_per_second": SettingsUploadBpsText = text; break;
+            case "download_bytes_per_second": SettingsDownloadBpsText = text; break;
+            case "transfer_memory_bytes": SettingsTransferMemoryText = text; break;
+            case "range_cache_bytes": SettingsRangeCacheText = text; break;
+            case "staging_admission_bytes": SettingsStagingAdmissionText = text; break;
+            case "minimum_free_bytes": SettingsMinimumFreeText = text; break;
+        }
+    }
+
+    /// <summary>Human label for one settings key.</summary>
+    private static string LabelFor(string key) => key switch
+    {
+        "upload_bytes_per_second" => "Upload speed",
+        "download_bytes_per_second" => "Download speed",
+        "transfer_memory_bytes" => "Transfer memory",
+        "range_cache_bytes" => "Range cache size",
+        "staging_admission_bytes" => "Staging limit",
+        "minimum_free_bytes" => "Free space reserve",
+        _ => key,
+    };
+
+    /// <summary>Only the two transfer speeds accept "Unlimited" (zero means no limit).</summary>
+    private static SettingsQuantityKind KindFor(string key) =>
+        key is "upload_bytes_per_second" or "download_bytes_per_second"
+            ? SettingsQuantityKind.Rate
+            : SettingsQuantityKind.Size;
 
     // ── Connection controls ──────────────────────────────────────────────
 
@@ -199,52 +307,69 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
 
     // ── Settings commands ────────────────────────────────────────────────
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanReloadSettings))]
     private Task ReloadSettingsAsync(CancellationToken cancellationToken) =>
-        ReadSettingsAsync(true, cancellationToken);
+        ReadSettingsAsync(isReload: true, discardDraft: false, cancellationToken);
+
+    /// <summary>
+    /// Explicit review path: discards the draft text (the page asks first) and
+    /// reads the provider's current values again. Without this, a reload never
+    /// silently destroys what the user has typed.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanReloadSettings))]
+    private Task DiscardAndReloadSettingsAsync(CancellationToken cancellationToken) =>
+        ReadSettingsAsync(isReload: true, discardDraft: true, cancellationToken);
+
+    private bool CanReloadSettings() => !_settingsWriteInFlight && !IsBusy;
 
     /// <summary>
     /// Reads the provider's actual settings revision and resolved values once,
-    /// the first time the Operations page is opened. Later navigations reuse
-    /// the tracked revision; "Reload settings" refetches it explicitly.
+    /// the first time the Settings page is opened. Later navigations reuse the
+    /// tracked revision; "Reload settings" refetches it explicitly. A dirty
+    /// draft is never overwritten by this automatic load.
     /// </summary>
     public Task EnsureSettingsLoadedAsync() =>
-        _settingsRevisionKnown || IsBusy
+        (_settingsRevisionKnown && _settingsReadGeneration == _session.Generation) || _settingsWriteInFlight || IsBusy
             ? Task.CompletedTask
-            : ReadSettingsAsync(false, CancellationToken.None);
+            : ReadSettingsAsync(isReload: false, discardDraft: false, CancellationToken.None);
 
-    private async Task ReadSettingsAsync(bool isReload, CancellationToken cancellationToken)
+    private async Task ReadSettingsAsync(bool isReload, bool discardDraft, CancellationToken cancellationToken)
     {
-        if (IsBusy) return;
+        if (_settingsWriteInFlight || IsBusy) return;
         using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
         long scope = BeginScope();
+        int serial = ++_settingsOpSerial;
         IsBusy = true;
-        BusyText = "Reading current settings from the provider…";
-        SettingsErrorText = null;
+        BusyText = "Loading settings…";
+        SetSettingsError(null);
         try
         {
+            // An empty patch is the provider's read: it returns the resolved
+            // settings and revision without mutation (the expected revision is
+            // not checked on this path).
             UpdateSettingsResult result = await _session.SendAsync(
                 Commands.UpdateSettings,
                 new UpdateSettingsRequest
                 {
                     OperationId = Guid.NewGuid(),
                     ScopeId = GlobalScopeId,
-                    ExpectedRevision = _settingsRevisionKnown ? _settingsRevision : 0,
+                    ExpectedRevision = 0,
                     Settings = Array.Empty<SettingsPatch>(),
                 },
                 request.Token).ConfigureAwait(true);
-            if (IsScopeStale(scope)) return;
-            ApplySettingsResult(result);
-            SettingsResultText = isReload
-                ? "Settings reloaded from the provider (empty patch; nothing was changed)."
-                : "Current settings read from the provider (empty patch; nothing was changed).";
+            if (IsScopeStale(scope) || serial != _settingsOpSerial) return;
+            bool keptDraft = ApplyLoadedSettings(result, discardDraft);
+            SettingsHasSuccess = false;
+            SettingsResultText = keptDraft
+                ? (isReload ? "Settings reloaded." : "Settings loaded.") + " Your unsaved entries were kept."
+                : string.Empty;
         }
         catch (OperationCanceledException) when (request.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            if (!IsScopeStale(scope))
+            if (!IsScopeStale(scope) && serial == _settingsOpSerial)
             {
-                SettingsErrorText = ErrorMessage(ex);
+                SetSettingsError(ErrorMessage(ex));
                 SettingsResultText = string.Empty;
             }
         }
@@ -255,26 +380,95 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void ApplySettingsResult(UpdateSettingsResult result)
+    /// <summary>
+    /// Adopts one provider response as the observed baseline: revision and
+    /// exact stored values. Per field, only an unsaved change against the
+    /// previous baseline keeps its exact text (including invalid text the user
+    /// still has to correct); every other field adopts the fresh provider
+    /// value, so an untouched field can never become an edit of a stale value.
+    /// </summary>
+    /// <returns>True when any field kept unsaved user text.</returns>
+    private bool ApplyLoadedSettings(UpdateSettingsResult result, bool discardDraft)
     {
+        // Dirty intent is evaluated against the PREVIOUS baseline, before the
+        // baseline is replaced by the new provider values.
+        var previousValues = new ulong?[SettingsKeys.Length];
+        var keepText = new bool[SettingsKeys.Length];
+        for (int i = 0; i < SettingsKeys.Length; i++)
+        {
+            previousValues[i] = StoredFor(SettingsKeys[i]);
+            keepText[i] = SettingsQuantity.DiffersFrom(
+                SettingsTextFor(SettingsKeys[i]), KindFor(SettingsKeys[i]), previousValues[i]);
+        }
+
         _settingsRevision = result.Revision;
         _settingsRevisionKnown = true;
-        SettingsRevisionText = $"Revision: {result.Revision} (expected revision for the next update).";
-        SettingsUploadBpsText = ValueOf(result.Settings, "upload_bytes_per_second");
-        SettingsDownloadBpsText = ValueOf(result.Settings, "download_bytes_per_second");
-        SettingsTransferMemoryText = ValueOf(result.Settings, "transfer_memory_bytes");
-        SettingsRangeCacheText = ValueOf(result.Settings, "range_cache_bytes");
-        SettingsStagingAdmissionText = ValueOf(result.Settings, "staging_admission_bytes");
-        SettingsMinimumFreeText = ValueOf(result.Settings, "minimum_free_bytes");
+        _settingsReadGeneration = _session.Generation;
+        IsSettingsReady = true;
+        _settingsLoadedValues.Clear();
+        foreach (string key in SettingsKeys)
+        {
+            string? valueJson = ValueOf(result.Settings, key);
+            // The provider encodes each u64 as canonical decimal JSON. A key
+            // the provider did not return is not stored (the provider uses its
+            // own default) and is never touched by a save.
+            _settingsLoadedValues[key] = valueJson is not null
+                && ulong.TryParse(valueJson, NumberStyles.None, CultureInfo.InvariantCulture, out ulong stored)
+                    ? stored
+                    : null;
+        }
+        for (int i = 0; i < SettingsKeys.Length; i++)
+        {
+            string key = SettingsKeys[i];
+            // Discarding is rebase of an empty draft: the field adopts the
+            // fresh stored value whatever it was holding.
+            string draft = discardDraft ? string.Empty : SettingsTextFor(key);
+            SetSettingsText(key, SettingsQuantity.RebaseDraft(
+                draft, KindFor(key), previousValues[i], _settingsLoadedValues[key]));
+        }
+        SettingsRevisionText = $"Revision: {result.Revision}";
+        UpdateSettingsDirty();
+        return !discardDraft && keepText.Any(static kept => kept);
     }
 
-    private static string ValueOf(IReadOnlyList<SettingsEntry> settings, string key) =>
-        settings.FirstOrDefault(entry => entry.Key == key)?.ValueJson ?? string.Empty;
+    /// <summary>Stored value as last observed for one key; null when not stored.</summary>
+    private ulong? StoredFor(string key) =>
+        _settingsLoadedValues.TryGetValue(key, out ulong? stored) ? stored : null;
 
-    [RelayCommand]
+    /// <summary>The provider's raw JSON value for one key, or null when not stored.</summary>
+    private static string? ValueOf(IReadOnlyList<SettingsEntry> settings, string key) =>
+        settings.FirstOrDefault(entry => entry.Key == key)?.ValueJson;
+
+    /// <summary>True when one field's text would change or add a stored value.</summary>
+    private bool FieldDiffers(string key) =>
+        SettingsQuantity.DiffersFrom(SettingsTextFor(key), KindFor(key), StoredFor(key));
+
+    private void UpdateSettingsDirty()
+    {
+        foreach (string key in SettingsKeys)
+        {
+            if (FieldDiffers(key))
+            {
+                IsSettingsDirty = true;
+                return;
+            }
+        }
+        IsSettingsDirty = false;
+    }
+
+    partial void OnSettingsUploadBpsTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsDownloadBpsTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsTransferMemoryTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsRangeCacheTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsStagingAdmissionTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsMinimumFreeTextChanged(string value) => UpdateSettingsDirty();
+    partial void OnSettingsResultTextChanged(string value) =>
+        OnPropertyChanged(nameof(HasSettingsResultText));
+
+    [RelayCommand(CanExecute = nameof(CanApplySettings))]
     private async Task ApplySettingsAsync(CancellationToken cancellationToken)
     {
-        if (IsBusy) return;
+        if (_settingsWriteInFlight || IsBusy) return;
         var patch = new List<SettingsPatch>();
         var error = CollectSetting(SettingsUploadBpsText, "upload_bytes_per_second", patch)
                  ?? CollectSetting(SettingsDownloadBpsText, "download_bytes_per_second", patch)
@@ -284,28 +478,32 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                  ?? CollectSetting(SettingsMinimumFreeText, "minimum_free_bytes", patch);
         if (error is not null)
         {
-            SettingsErrorText = error;
+            // Malformed input never produces a request; the whole save stops.
+            SetSettingsError(error);
             SettingsResultText = string.Empty;
             return;
         }
         if (patch.Count == 0)
         {
-            SettingsErrorText = "Enter at least one nonnegative integer value to update.";
-            SettingsResultText = string.Empty;
+            SetSettingsError(null);
+            SettingsResultText = "Nothing to save: every field matches the stored values.";
             return;
         }
-        if (!_settingsRevisionKnown)
+        if (!_settingsRevisionKnown || _settingsReadGeneration != _session.Generation)
         {
-            SettingsErrorText = "Read the current settings first so the expected revision is known.";
+            SetSettingsError("The provider connection changed. Reload settings before saving.");
             SettingsResultText = string.Empty;
             return;
         }
 
         using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
         long scope = BeginScope();
+        int serial = ++_settingsOpSerial;
+        SetSettingsWriteInFlight(true);
         IsBusy = true;
-        BusyText = "Applying settings…";
-        SettingsErrorText = null;
+        BusyText = "Saving settings…";
+        SetSettingsError(null);
+        SettingsHasSuccess = false;
         try
         {
             UpdateSettingsResult result = await _session.SendAsync(
@@ -314,45 +512,51 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                 {
                     OperationId = Guid.NewGuid(),
                     ScopeId = GlobalScopeId,
+                    // The revision actually observed from the provider's read;
+                    // a write against any other revision is rejected there.
                     ExpectedRevision = _settingsRevision,
                     Settings = patch,
                 },
                 request.Token).ConfigureAwait(true);
-            if (IsScopeStale(scope)) return;
-            ApplySettingsResult(result);
-            SettingsResultText =
-                $"Applied revision {result.Revision}. Resolved settings: {Describe(result.Settings)}";
+            if (IsScopeStale(scope) || serial != _settingsOpSerial) return;
+            ApplyLoadedSettings(result, discardDraft: true);
+            // Success is reported only after the provider's response arrived.
+            SettingsHasSuccess = true;
+            SettingsResultText = "Settings saved.";
         }
         catch (ProtocolException ex) when (ex.Error.Code == ProtocolErrorCode.Conflict)
         {
-            if (IsScopeStale(scope)) return;
+            if (IsScopeStale(scope) || serial != _settingsOpSerial) return;
             await ReloadAfterConflictAsync(scope, request.Token).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (request.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            if (!IsScopeStale(scope))
+            if (!IsScopeStale(scope) && serial == _settingsOpSerial)
             {
-                SettingsErrorText = ErrorMessage(ex);
+                SetSettingsError(ErrorMessage(ex));
                 SettingsResultText = string.Empty;
             }
         }
         finally
         {
+            SetSettingsWriteInFlight(false);
             IsBusy = false;
             BusyText = string.Empty;
         }
     }
 
+    private bool CanApplySettings() => IsSettingsReady && IsSettingsDirty && !_settingsWriteInFlight && !IsBusy;
+
     /// <summary>
     /// A revision conflict means another client changed the settings. Reload
-    /// them through the same UpdateSettings empty-patch read and show the
-    /// actual revision plus resolved values so the user can reapply.
+    /// the actual revision and values, keep every dirty draft exactly as typed
+    /// and require the user to review it against the reloaded values before
+    /// saving again — a conflicting write is never blindly retried.
     /// </summary>
     private async Task ReloadAfterConflictAsync(long scope, CancellationToken cancellationToken)
     {
-        ulong expected = _settingsRevision;
-        BusyText = "Settings changed elsewhere; reloading the actual revision and values…";
+        BusyText = "Settings changed elsewhere; reloading…";
         try
         {
             UpdateSettingsResult reloaded = await _session.SendAsync(
@@ -366,35 +570,78 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
                 },
                 cancellationToken).ConfigureAwait(true);
             if (IsScopeStale(scope)) return;
-            ApplySettingsResult(reloaded);
-            SettingsErrorText =
-                $"Settings changed since they were loaded (expected revision {expected}); the update was not applied.";
-            SettingsResultText =
-                $"Reloaded actual revision {reloaded.Revision}. Resolved settings: {Describe(reloaded.Settings)}";
+            // Per-field rebase: only fields that actually carry unsaved text
+            // keep it; untouched fields adopt the fresh provider values.
+            bool keptDraft = ApplyLoadedSettings(reloaded, discardDraft: false);
+            SettingsHasSuccess = false;
+            SetSettingsError(
+                "Settings changed elsewhere, so your changes were not saved. "
+              + (keptDraft
+                    ? "Your entries were kept — review them and save again."
+                    : "The latest values are now shown — review them, then save again."));
+            SettingsResultText = "Settings reloaded.";
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             if (!IsScopeStale(scope))
-                SettingsErrorText = $"The settings update hit a revision conflict (expected {expected}) and the reload also failed: {ErrorMessage(ex)}";
+            {
+                SettingsHasSuccess = false;
+                SetSettingsError(
+                    $"Settings changed elsewhere and reloading also failed: {ErrorMessage(ex)}. "
+                  + "Your entries were kept.");
+                SettingsResultText = string.Empty;
+            }
         }
     }
 
-    private static string? CollectSetting(string text, string key, List<SettingsPatch> patch)
+    /// <summary>
+    /// Converts one draft field into a patch entry. Empty text keeps the
+    /// stored value (no entry); text that resolves to the stored value is
+    /// never resent. Malformed, negative, fractional-byte or overflowing text
+    /// fails the whole save before any request is sent.
+    /// </summary>
+    private string? CollectSetting(string text, string key, List<SettingsPatch> patch)
     {
         string trimmed = text.Trim();
         if (trimmed.Length == 0) return null;
-        if (!ulong.TryParse(trimmed, NumberStyles.None, CultureInfo.InvariantCulture, out ulong value))
-            return $"{key} must be a nonnegative integer (decimal digits only); \"{trimmed}\" is not one.";
-        // Canonical decimal JSON number (no leading zeros) as required for u64 values.
+        if (!SettingsQuantity.TryParse(trimmed, KindFor(key), out ulong value, out SettingsQuantityError error))
+            return $"{LabelFor(key)}: {DescribeQuantityError(error, trimmed)}";
+        if (_settingsLoadedValues.TryGetValue(key, out ulong? stored) && stored == value)
+            return null; // identical to the stored value: nothing to submit
+        // Canonical decimal JSON number (no leading zeros) as the provider
+        // requires for u64 values.
         patch.Add(new SettingsPatch { Key = key, ValueJson = value.ToString(CultureInfo.InvariantCulture) });
         return null;
     }
 
-    private static string Describe(IReadOnlyList<SettingsEntry> settings) =>
-        settings.Count == 0
-            ? "(no keys stored)"
-            : string.Join(", ", settings.Select(entry => $"{entry.Key}={entry.ValueJson}"));
+    private static string DescribeQuantityError(SettingsQuantityError error, string text) => error switch
+    {
+        SettingsQuantityError.Negative =>
+            $"\"{text}\" is negative; settings cannot be negative.",
+        SettingsQuantityError.FractionalBytes =>
+            $"\"{text}\" is a fraction of one byte; use whole bytes (for example 1.5 KiB = 1536 B).",
+        SettingsQuantityError.Overflow =>
+            $"\"{text}\" is larger than the provider's maximum 18446744073709551615.",
+        SettingsQuantityError.UnlimitedNotAllowed =>
+            $"\"{text}\" is only valid for transfer speeds; this field is a byte amount.",
+        _ => $"\"{text}\" is not a valid quantity. Use IEC units like 512 MiB, 10 GiB or 10 MiB/s, "
+           + $"or plain bytes; {SettingsQuantity.UnlimitedWord} is only for transfer speeds.",
+    };
+
+    private void SetSettingsError(string? message)
+    {
+        SettingsErrorText = message;
+        SettingsHasError = message is not null;
+    }
+
+    private void SetSettingsWriteInFlight(bool value)
+    {
+        _settingsWriteInFlight = value;
+        ReloadSettingsCommand.NotifyCanExecuteChanged();
+        DiscardAndReloadSettingsCommand.NotifyCanExecuteChanged();
+        ApplySettingsCommand.NotifyCanExecuteChanged();
+    }
 
     // ── Connection controls ──────────────────────────────────────────────
 
@@ -1166,7 +1413,21 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
         {
             if (_disposed) return;
             SessionStateText = _session.StatusText;
+            if (_settingsReadGeneration != _session.Generation)
+            {
+                // The provider connection changed underneath the settings
+                // read: the revision and values are no longer trustworthy, so
+                // editing/saving needs a fresh read first. Dirty drafts stay.
+                IsSettingsReady = false;
+                SettingsRevisionText = "Revision: reload required — the provider connection changed.";
+            }
         });
+
+    partial void OnIsBusyChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsSettingsEditingEnabled));
+        OnPropertyChanged(nameof(SettingsNotReadyText));
+    }
 
     public void Dispose()
     {

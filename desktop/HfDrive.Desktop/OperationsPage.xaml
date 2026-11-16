@@ -4,159 +4,307 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:vm="using:HfDrive.Desktop.ViewModels">
 
+    <!-- Advanced / activity and recovery surface. Cards, section titles,
+         descriptions and primary buttons come from the shared keys the shell
+         defines in App.xaml. Provider-wide settings are NOT on this page —
+         SettingsPage owns that surface. Content stretches inside a ~900px
+         column with 24px gutters; button rows use star-column grids or
+         full-width rows so they reflow instead of clipping at narrow widths. -->
     <ScrollViewer Padding="24,16">
-        <StackPanel Spacing="16" MaxWidth="900" HorizontalAlignment="Left">
+        <StackPanel Spacing="16" MaxWidth="900" HorizontalAlignment="Stretch">
 
+            <!-- Heading -->
             <StackPanel Spacing="4">
-                <TextBlock Text="Operations" Style="{StaticResource TitleTextBlockStyle}" />
-                <TextBlock Text="Every action below is a real provider RPC. Results and errors shown here come from the provider's typed responses; nothing is simulated."
-                           TextWrapping="Wrap" Opacity="0.8" />
-                <TextBlock Text="{x:Bind ViewModel.SessionStateText, Mode=OneWay}" TextWrapping="Wrap" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <ProgressRing IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}" Width="24" Height="24" />
-                    <TextBlock Text="{x:Bind ViewModel.BusyText, Mode=OneWay}" TextWrapping="Wrap" />
-                </StackPanel>
+                <TextBlock Text="Operations &amp; recovery"
+                           Style="{StaticResource TitleTextBlockStyle}"
+                           TextWrapping="Wrap" />
+                <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                           Text="Manage sync controls, review conflicts and restore previous versions." />
             </StackPanel>
 
-            <!-- Settings -->
-            <StackPanel Spacing="8">
-                <TextBlock Text="Settings (provider-wide)" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBlock Text="Values are nonnegative integers. Upload/download are bytes per second (0 = unlimited). Leave a field empty to keep its stored value."
-                           TextWrapping="Wrap" Opacity="0.8" />
-                <TextBox Header="Upload bytes per second"
-                         Text="{x:Bind ViewModel.SettingsUploadBpsText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Download bytes per second"
-                         Text="{x:Bind ViewModel.SettingsDownloadBpsText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Transfer memory bytes"
-                         Text="{x:Bind ViewModel.SettingsTransferMemoryText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Range cache bytes"
-                         Text="{x:Bind ViewModel.SettingsRangeCacheText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Staging admission bytes"
-                         Text="{x:Bind ViewModel.SettingsStagingAdmissionText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Minimum free bytes"
-                         Text="{x:Bind ViewModel.SettingsMinimumFreeText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Reload settings" Command="{x:Bind ViewModel.ReloadSettingsCommand}" />
-                    <Button Content="Apply settings" Command="{x:Bind ViewModel.ApplySettingsCommand}" />
+            <!-- Live session status -->
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Provider session"
+                               Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.SessionStateText, Mode=OneWay}"
+                               TextWrapping="Wrap" />
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <ProgressRing Grid.Column="0"
+                                      IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
+                                      Width="24" Height="24"
+                                      VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1"
+                                   Text="{x:Bind ViewModel.BusyText, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   VerticalAlignment="Center"
+                                   AutomationProperties.LiveSetting="Polite" />
+                    </Grid>
                 </StackPanel>
-                <TextBlock Text="{x:Bind ViewModel.SettingsRevisionText, Mode=OneWay}" TextWrapping="Wrap" />
-                <TextBlock Text="{x:Bind ViewModel.SettingsResultText, Mode=OneWay}"
-                           TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <TextBlock Text="{x:Bind ViewModel.SettingsErrorText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-            </StackPanel>
+            </Border>
 
             <!-- Connection controls -->
-            <StackPanel Spacing="8">
-                <TextBlock Text="Connection controls" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBox Header="Connection ID (UUID; leave empty for Pause/Resume to cover every connection)"
-                         Text="{x:Bind ViewModel.ConnectionIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Optional item ID (subtree target for Pin/Unpin and Free Space)"
-                         Text="{x:Bind ViewModel.ControlItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Pause" Command="{x:Bind ViewModel.PauseCommand}" />
-                    <Button Content="Resume" Command="{x:Bind ViewModel.ResumeCommand}" />
-                    <Button Content="Pin" Command="{x:Bind ViewModel.PinCommand}" />
-                    <Button Content="Unpin" Command="{x:Bind ViewModel.UnpinCommand}" />
-                </StackPanel>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Free all local space" Command="{x:Bind ViewModel.FreeAllCommand}" />
-                    <Button Content="Free all except pinned" Command="{x:Bind ViewModel.FreeExceptPinnedCommand}" />
-                </StackPanel>
-                <TextBox Header="Selective-sync exclusions (complete item UUIDs, comma-separated)"
-                         Text="{x:Bind ViewModel.SelectiveSyncItemIdsText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <Button Content="Apply selective sync" Command="{x:Bind ViewModel.ApplySelectiveSyncCommand}" />
-                <TextBlock Text="{x:Bind ViewModel.ConnectionResultText, Mode=OneWay}"
-                           TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <TextBlock Text="{x:Bind ViewModel.ConnectionErrorText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-            </StackPanel>
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="12">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Connection controls"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Scope each action to one connection, or leave the connection ID empty to pause or resume every connection at once. Connection, item and version IDs are the provider's UUIDs (8-4-4-4-12 hex)." />
+                    </StackPanel>
 
-            <!-- Diagnostics -->
-            <StackPanel Spacing="8">
-                <TextBlock Text="Diagnostics" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBox Header="Absolute destination path for the diagnostics ZIP"
-                         Text="{x:Bind ViewModel.DiagnosticsPathText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <Button Content="Export diagnostics" Command="{x:Bind ViewModel.ExportDiagnosticsCommand}" />
-                <TextBlock Text="{x:Bind ViewModel.DiagnosticsResultText, Mode=OneWay}"
-                           TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <TextBlock Text="{x:Bind ViewModel.DiagnosticsErrorText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-            </StackPanel>
+                    <TextBox Header="Connection ID (UUID; leave empty for Pause/Resume to cover every connection)"
+                             Text="{x:Bind ViewModel.ConnectionIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    <TextBox Header="Optional item ID (subtree target for Pin/Unpin and Free Space)"
+                             Text="{x:Bind ViewModel.ControlItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Sync state"
+                                   Style="{StaticResource BodyStrongTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Pause stops new transfer and publication scheduling but keeps observation and queued work; resume revalidates access before dispatching again." />
+                        <Grid ColumnSpacing="8" RowSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" Content="Pause"
+                                    HorizontalAlignment="Stretch"
+                                    Command="{x:Bind ViewModel.PauseCommand}" />
+                            <Button Grid.Column="1" Content="Resume"
+                                    HorizontalAlignment="Stretch"
+                                    Command="{x:Bind ViewModel.ResumeCommand}" />
+                        </Grid>
+                    </StackPanel>
+
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Local content"
+                                   Style="{StaticResource BodyStrongTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Pin requests the subtree be fully hydrated for offline use; unpin releases that request. The result reports how many files are actually hydrated." />
+                        <Grid ColumnSpacing="8" RowSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" Content="Pin"
+                                    HorizontalAlignment="Stretch"
+                                    Command="{x:Bind ViewModel.PinCommand}" />
+                            <Button Grid.Column="1" Content="Unpin"
+                                    HorizontalAlignment="Stretch"
+                                    Command="{x:Bind ViewModel.UnpinCommand}" />
+                        </Grid>
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Freeing local space dehydrates clean, committed, unpinned content in scope. Dirty, conflicting and pending files are never discarded silently." />
+                        <Button Content="Free all local space"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.FreeAllCommand}" />
+                        <Button Content="Free all except pinned"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.FreeExceptPinnedCommand}" />
+                    </StackPanel>
+
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Header="Selective-sync exclusions (advanced)">
+                        <StackPanel Spacing="8">
+                            <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                       Text="Complete item UUIDs to exclude from sync, comma-separated. Excluding clean content removes local placeholders through a journaled provider action and never publishes deletions; items holding unsynchronized work are retained and listed in the result." />
+                            <TextBox Header="Selective-sync exclusions (complete item UUIDs, comma-separated)"
+                                     Text="{x:Bind ViewModel.SelectiveSyncItemIdsText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Content="Apply selective sync"
+                                    HorizontalAlignment="Stretch"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    Command="{x:Bind ViewModel.ApplySelectiveSyncCommand}" />
+                        </StackPanel>
+                    </Expander>
+
+                    <TextBlock Text="{x:Bind ViewModel.ConnectionResultText, Mode=OneWay}"
+                               TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                    <TextBlock Text="{x:Bind ViewModel.ConnectionErrorText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+                </StackPanel>
+            </Border>
+
+            <!-- Conflicts: visible by default — tray "Manage" lands here with a
+                 preselected record, so the detail and resolutions must be
+                 reachable without hunting. -->
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="12">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Conflicts"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Recorded conflicts from real provider state for the connection selected above. Opening this page from the tray's Manage action selects the exact record it pointed at; nothing is resolved until you choose a resolution here. No records are listed until you load them." />
+                    </StackPanel>
+
+                    <Grid ColumnSpacing="8" RowSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button Grid.Column="0" Content="Load conflicts"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.LoadConflictsCommand}" />
+                        <Button Grid.Column="1" Content="Load more"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.LoadMoreConflictsCommand}" />
+                    </Grid>
+
+                    <TextBlock Text="{x:Bind ViewModel.ConflictsResultText, Mode=OneWay}"
+                               TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+
+                    <ListView ItemsSource="{x:Bind ViewModel.Conflicts, Mode=OneWay}"
+                              SelectedItem="{x:Bind ViewModel.SelectedConflict, Mode=TwoWay}"
+                              SelectionMode="Single"
+                              MaxHeight="260"
+                              AutomationProperties.Name="Recorded conflicts">
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="vm:ConflictRow">
+                                <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                           TextWrapping="Wrap"
+                                           FontSize="12"
+                                           Margin="0,4" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+
+                    <TextBlock Text="Selected conflict"
+                               Style="{StaticResource BodyStrongTextBlockStyle}"
+                               TextWrapping="Wrap" />
+                    <Border Background="{ThemeResource HfCardBackgroundBrush}"
+                            BorderBrush="{ThemeResource HfCardBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="12">
+                        <TextBlock Text="{x:Bind ViewModel.SelectedConflictDetailText, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   FontFamily="Consolas"
+                                   FontSize="12"
+                                   IsTextSelectionEnabled="True" />
+                    </Border>
+
+                    <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                               Text="Keep local publishes the local version, keep remote keeps the remote version (unsynchronized local bytes are preserved for recovery first), and keep both retains both under the recorded conflict name." />
+                    <Grid ColumnSpacing="8" RowSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button Grid.Column="0" Content="Keep local"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.ResolveKeepLocalCommand}" />
+                        <Button Grid.Column="1" Content="Keep remote"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.ResolveKeepRemoteCommand}" />
+                        <Button Grid.Column="2" Content="Keep both"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.ResolveKeepBothCommand}" />
+                    </Grid>
+
+                    <TextBlock Text="{x:Bind ViewModel.ConflictsErrorText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+                </StackPanel>
+            </Border>
 
             <!-- History and restore -->
-            <StackPanel Spacing="8">
-                <TextBlock Text="History" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBox Header="Optional subtree item ID (history filter)"
-                         Text="{x:Bind ViewModel.HistoryItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Load history" Command="{x:Bind ViewModel.LoadHistoryCommand}" />
-                    <Button Content="Load more" Command="{x:Bind ViewModel.LoadMoreHistoryCommand}" />
-                </StackPanel>
-                <TextBlock Text="{x:Bind ViewModel.HistoryResultText, Mode=OneWay}"
-                           TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <ListView ItemsSource="{x:Bind ViewModel.History, Mode=OneWay}" SelectionMode="None">
-                    <ListView.ItemTemplate>
-                        <DataTemplate x:DataType="vm:HistoryRow">
-                            <TextBlock Text="{x:Bind Display, Mode=OneWay}"
-                                       TextWrapping="Wrap"
-                                       FontFamily="Consolas"
-                                       FontSize="12"
-                                       IsTextSelectionEnabled="True"
-                                       Margin="0,4" />
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
-                </ListView>
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="12">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="History &amp; restore"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Committed history for the connection selected at the top of this page, paged a bounded number of records at a time. Restoring an earlier version publishes it as a new committed operation — it never rewrites history or replaces stored objects. No records are listed until you load them." />
+                    </StackPanel>
 
-                <TextBlock Text="Restore" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-                <TextBox Header="Item ID to restore (UUID)"
-                         Text="{x:Bind ViewModel.RestoreItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Header="Version ID to restore (UUID)"
-                         Text="{x:Bind ViewModel.RestoreVersionIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                <Button Content="Restore" Command="{x:Bind ViewModel.RestoreCommand}" />
-                <TextBlock Text="{x:Bind ViewModel.HistoryErrorText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-            </StackPanel>
+                    <TextBox Header="Optional subtree item ID (history filter)"
+                             Text="{x:Bind ViewModel.HistoryItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    <Grid ColumnSpacing="8" RowSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button Grid.Column="0" Content="Load history"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.LoadHistoryCommand}" />
+                        <Button Grid.Column="1" Content="Load more"
+                                HorizontalAlignment="Stretch"
+                                Command="{x:Bind ViewModel.LoadMoreHistoryCommand}" />
+                    </Grid>
 
-            <!-- Conflicts -->
-            <StackPanel Spacing="8">
-                <TextBlock Text="Conflicts" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Load conflicts" Command="{x:Bind ViewModel.LoadConflictsCommand}" />
-                    <Button Content="Load more" Command="{x:Bind ViewModel.LoadMoreConflictsCommand}" />
+                    <TextBlock Text="{x:Bind ViewModel.HistoryResultText, Mode=OneWay}"
+                               TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                    <ListView ItemsSource="{x:Bind ViewModel.History, Mode=OneWay}"
+                              SelectionMode="None"
+                              MaxHeight="320"
+                              AutomationProperties.Name="Committed history records">
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="vm:HistoryRow">
+                                <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                           TextWrapping="Wrap"
+                                           FontFamily="Consolas"
+                                           FontSize="12"
+                                           IsTextSelectionEnabled="True"
+                                           Margin="0,4" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+
+                    <Expander HorizontalAlignment="Stretch"
+                              IsExpanded="False"
+                              Header="Restore an earlier version (advanced)">
+                        <StackPanel Spacing="8">
+                            <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                       Text="Enter the complete item and version UUIDs from a history record above. The restore is scoped to the connection selected at the top of this page." />
+                            <TextBox Header="Item ID to restore (UUID)"
+                                     Text="{x:Bind ViewModel.RestoreItemIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBox Header="Version ID to restore (UUID)"
+                                     Text="{x:Bind ViewModel.RestoreVersionIdText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Content="Restore"
+                                    HorizontalAlignment="Stretch"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    Command="{x:Bind ViewModel.RestoreCommand}" />
+                        </StackPanel>
+                    </Expander>
+
+                    <TextBlock Text="{x:Bind ViewModel.HistoryErrorText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
                 </StackPanel>
-                <TextBlock Text="{x:Bind ViewModel.ConflictsResultText, Mode=OneWay}"
-                           TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <ListView ItemsSource="{x:Bind ViewModel.Conflicts, Mode=OneWay}"
-                          SelectedItem="{x:Bind ViewModel.SelectedConflict, Mode=TwoWay}"
-                          SelectionMode="Single">
-                    <ListView.ItemTemplate>
-                        <DataTemplate x:DataType="vm:ConflictRow">
-                            <TextBlock Text="{x:Bind Display, Mode=OneWay}"
-                                       TextWrapping="Wrap"
-                                       FontSize="12"
-                                       Margin="0,4" />
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
-                </ListView>
-                <TextBlock Text="{x:Bind ViewModel.SelectedConflictDetailText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           FontFamily="Consolas"
-                           FontSize="12"
-                           IsTextSelectionEnabled="True" />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Keep local" Command="{x:Bind ViewModel.ResolveKeepLocalCommand}" />
-                    <Button Content="Keep remote" Command="{x:Bind ViewModel.ResolveKeepRemoteCommand}" />
-                    <Button Content="Keep both" Command="{x:Bind ViewModel.ResolveKeepBothCommand}" />
+            </Border>
+
+            <!-- Diagnostics -->
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="12">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Diagnostics"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Exports a redacted diagnostics archive (versions, health, counts and sanitized logs). User paths and names are replaced with stable per-export aliases; the archive never contains credentials, database files, snapshots or file contents. Uses the connection ID above when it is set; leave it empty for provider-wide diagnostics." />
+                    </StackPanel>
+
+                    <TextBox Header="Absolute destination path for the diagnostics ZIP"
+                             Text="{x:Bind ViewModel.DiagnosticsPathText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    <Button Content="Export diagnostics"
+                            HorizontalAlignment="Stretch"
+                            Style="{StaticResource AccentButtonStyle}"
+                            Command="{x:Bind ViewModel.ExportDiagnosticsCommand}" />
+                    <TextBlock Text="{x:Bind ViewModel.DiagnosticsResultText, Mode=OneWay}"
+                               TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                    <TextBlock Text="{x:Bind ViewModel.DiagnosticsErrorText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
                 </StackPanel>
-                <TextBlock Text="{x:Bind ViewModel.ConflictsErrorText, Mode=OneWay}"
-                           TextWrapping="Wrap"
-                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-            </StackPanel>
+            </Border>
 
         </StackPanel>
     </ScrollViewer>

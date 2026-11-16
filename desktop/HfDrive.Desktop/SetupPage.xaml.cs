@@ -70,6 +70,14 @@ public sealed partial class SetupPage : Page
                 if (ViewModel.IsCredentialsVisible != Visibility.Visible)
                     ClearCredentialFields();
                 break;
+            case nameof(SetupViewModel.CreationErrorText):
+                if (ViewModel.HasCreationError)
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        if (ViewModel.HasCreationError)
+                            CreationErrorInfoBar.StartBringIntoView();
+                    });
+                break;
         }
         UpdateCompletionAnimation();
     }

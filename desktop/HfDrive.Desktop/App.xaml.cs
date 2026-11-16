@@ -60,20 +60,14 @@ public partial class App : Application
         // process exit (ExitUi), never on a hide.
         _window.AppWindow.Closing += OnMainWindowClosing;
 
-        // Activate the main window first so its real HWND exists before the
-        // tray icon subclasses it.
-        _window.Activate();
-
-        // The tray panel and icon share the same provider session and view
-        // state; they are created once and survive every hide/show cycle.
+        // MainWindow constructs the real HWND needed by TrayService, but
+        // launching the app never shows it. Settings/setup open only through
+        // an explicit tray action. Provider startup is independent of Loaded.
         _trayViewModel = new TrayViewModel(Session);
         _trayWindow = new TrayWindow(_trayViewModel);
         _tray = new TrayService(_window);
         _trayWindow.AttachTray(_tray);
-
-        // The tray window's hidden HWND initialization can steal activation
-        // from the main window; restore foreground to the onboarding surface.
-        _window.Activate();
+        _window.StartProviderSession();
     }
 
     /// <summary>Reopens the current surface without navigating away from unfinished setup.</summary>
@@ -86,8 +80,9 @@ public partial class App : Application
 
     /// <summary>
     /// Shows and activates the main window at one of the contracted sections
-    /// (account, connections, operations, setup). Preserves an unfinished
-    /// onboarding flow exactly as <c>MainWindow.OpenSection</c> defines it.
+    /// (settings, account, connections, operations, setup). Preserves an
+    /// unfinished onboarding flow exactly as <c>MainWindow.OpenSection</c>
+    /// defines it.
     /// </summary>
     public void OpenMainSection(string tag) => OpenMainSection(tag, null, null);
 

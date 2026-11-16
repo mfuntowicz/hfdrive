@@ -4,49 +4,101 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:vm="using:HfDrive.Desktop.ViewModels">
 
-    <Grid Padding="24,16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-        </Grid.RowDefinitions>
+    <!--
+      Connected folders section. Each card renders one status record observed
+      from the provider through the shared MainViewModel; empty and stale states
+      stay explicit, and nothing is invented when no status has arrived.
+    -->
+    <Grid Background="{ThemeResource HfPageBackgroundBrush}">
+        <ScrollViewer Padding="24,16"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      HorizontalScrollMode="Disabled"
+                      ZoomMode="Disabled">
+            <StackPanel MaxWidth="900" HorizontalAlignment="Stretch" Spacing="16">
 
-        <StackPanel Grid.Row="0" Spacing="4" MaxWidth="900" HorizontalAlignment="Left">
-            <TextBlock Text="Connections" Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock Text="Every row below is an observed status record from the HF Drive provider. Nothing on this page is simulated."
-                       TextWrapping="Wrap"
-                       Opacity="0.8" />
-        </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Connections"
+                               Style="{StaticResource TitleTextBlockStyle}"
+                               TextWrapping="Wrap" />
+                    <TextBlock Text="Folders synced with Hugging Face Storage, with live status from the HF Drive provider."
+                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                </StackPanel>
 
-        <TextBlock Grid.Row="1"
-                   x:Name="EmptyText"
-                   Margin="0,12,0,0"
-                   TextWrapping="Wrap"
-                   Text="{x:Bind ViewModel.ConnectionsEmptyText, Mode=OneWay}" />
+                <TextBlock x:Name="EmptyText"
+                           Style="{StaticResource HfSettingsDescriptionStyle}"
+                           TextWrapping="Wrap"
+                           Text="{x:Bind ViewModel.ConnectionsEmptyText, Mode=OneWay}" />
 
-        <ListView Grid.Row="2"
-                  Margin="0,12,0,0"
-                  ItemsSource="{x:Bind ViewModel.Connections, Mode=OneWay}"
-                  SelectionMode="None">
-            <ListView.ItemTemplate>
-                <DataTemplate x:DataType="vm:ConnectionViewModel">
-                    <Border Padding="12" Margin="0,0,0,8" CornerRadius="4"
-                            BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="1">
-                        <StackPanel Spacing="4">
-                            <TextBlock Text="{x:Bind TitleDisplay, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind SummaryDisplay, Mode=OneWay}" TextWrapping="Wrap" FontSize="18" />
-                            <TextBlock Text="{x:Bind CountsText, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind PendingBytesText, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind PinText, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind HydrationText, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind RootPathDisplay, Mode=OneWay}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" />
-                            <TextBlock Text="{x:Bind ErrorText, Mode=OneWay}"
-                                       TextWrapping="Wrap"
-                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
-                        </StackPanel>
-                    </Border>
-                </DataTemplate>
-            </ListView.ItemTemplate>
-        </ListView>
+                <ItemsControl ItemsSource="{x:Bind ViewModel.Connections, Mode=OneWay}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ConnectionViewModel">
+                            <Border Style="{StaticResource HfSettingsCardStyle}" Margin="0,0,0,12">
+                                <StackPanel Spacing="12">
+
+                                    <!-- Identity: owner / bucket and folder path. -->
+                                    <StackPanel Spacing="4">
+                                        <TextBlock Text="{x:Bind TitleDisplay, Mode=OneTime}"
+                                                   Style="{StaticResource HfSettingsSectionTitleStyle}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock Text="{x:Bind LocationText, Mode=OneTime}"
+                                                   Style="{StaticResource HfSettingsDescriptionStyle}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock Text="{x:Bind RootPathDisplay, Mode=OneTime}"
+                                                   FontSize="12"
+                                                   TextWrapping="Wrap"
+                                                   IsTextSelectionEnabled="True" />
+                                    </StackPanel>
+
+                                    <!-- Live health line: exact state, access mode, capability. -->
+                                    <TextBlock Text="{x:Bind SummaryDisplay, Mode=OneTime}"
+                                               Style="{StaticResource BodyStrongTextBlockStyle}"
+                                               Foreground="{ThemeResource HfStorageAccentForegroundBrush}"
+                                               TextWrapping="Wrap" />
+
+                                    <!-- Observed workload. -->
+                                    <TextBlock Text="{x:Bind CountsText, Mode=OneTime}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                    <TextBlock Text="{x:Bind PendingBytesText, Mode=OneTime}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+
+                                    <!-- Offline availability: pin request and actual hydration. -->
+                                    <StackPanel Orientation="Horizontal" Spacing="16">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <FontIcon Glyph="&#xE734;" FontSize="14"
+                                                      VerticalAlignment="Center"
+                                                      Foreground="{ThemeResource HfStorageAccentBrush}" />
+                                            <TextBlock Text="{x:Bind PinText, Mode=OneTime}"
+                                                       VerticalAlignment="Center"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <FontIcon Glyph="&#xE896;" FontSize="14"
+                                                      VerticalAlignment="Center"
+                                                      Foreground="{ThemeResource HfStorageAccentBrush}" />
+                                            <TextBlock Text="{x:Bind HydrationText, Mode=OneTime}"
+                                                       VerticalAlignment="Center"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </StackPanel>
+
+                                    <TextBlock Text="{x:Bind ErrorText, Mode=OneTime}"
+                                               TextWrapping="Wrap"
+                                               Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                               IsTextSelectionEnabled="True" />
+
+                                    <!-- Timestamps and commit identity: only when the provider reported one. -->
+                                    <TextBlock Text="{x:Bind UpdatedAtText, Mode=OneTime}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}"
+                                               FontSize="12"
+                                               TextWrapping="Wrap" />
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Page>

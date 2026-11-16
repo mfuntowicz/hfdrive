@@ -12,23 +12,86 @@
       content host receives either the single page frame (compact) or the
       navigation shell (configured) from code-behind.
 
-      Compact chrome: while compact, the window has no system caption strip
-      (no minimize/maximize/close buttons). The caption and painted border are
-      removed with OverlappedPresenter.SetBorderAndTitleBar(false,false) so no
-      1px nonclient frame paints; the explicit DWM corner opt-in in the shared
-      WindowChrome helper keeps the rounded corners and shadow — and the top
-      row replaces the strip with exactly one accessible close control on the
-      existing AppWindow.Closing close-to-tray path plus an OS-designated
-      caption drag region. The normal shell restores the standard title bar
-      and min/max/resize controls in the same window.
+      Chrome: the window always owns its caption (ExtendsContentIntoTitleBar),
+      so no separate white title strip ever paints. The compact setup flow
+      shows exactly one accessible close control on the existing
+      AppWindow.Closing close-to-tray path; the configured shell shows the
+      branded CatchingHuggy caption below. Both caption rows are registered as
+      the OS caption drag region through InputNonClientPointerSource, so the
+      OS moves the window (no screen-coordinate drag loop). The shared
+      WindowChrome DWM opt-in keeps rounded corners and shadow in both modes;
+      the configured shell keeps the native resize frame and min/max/close
+      window controls in the caption's right inset.
     -->
     <Grid x:Name="RootLayout">
+        <!-- Only the Mica-owning window makes its shell transparent. Application
+             resources stay opaque for the tray, which has no SystemBackdrop. -->
+        <Grid.Resources>
+            <ResourceDictionary>
+                <ResourceDictionary.ThemeDictionaries>
+                    <ResourceDictionary x:Key="Light">
+                        <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="Transparent" />
+                        <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="Transparent" />
+                    </ResourceDictionary>
+                    <ResourceDictionary x:Key="Dark">
+                        <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="Transparent" />
+                        <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="Transparent" />
+                    </ResourceDictionary>
+                </ResourceDictionary.ThemeDictionaries>
+            </ResourceDictionary>
+        </Grid.Resources>
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
+
+        <!--
+          Normal-shell branded caption (extends into the native caption area;
+          the system caption buttons draw in the right inset reserved by
+          code-behind). The brand text area is the OS caption drag region;
+          the logo stays plain client content. Hidden while compact.
+        -->
+        <Grid x:Name="ShellCaptionBar"
+              Grid.Row="0"
+              Height="40"
+              Visibility="Collapsed"
+              Background="{ThemeResource HfHeaderBackgroundBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Image Grid.Column="0"
+                   Width="24" Height="22"
+                   Stretch="Uniform"
+                   Margin="12,0,6,0"
+                   AutomationProperties.Name="HF Drive">
+                <Image.Source>
+                    <BitmapImage UriSource="ms-appx:///Assets/CatchingHuggy.png" DecodePixelWidth="48" />
+                </Image.Source>
+            </Image>
+            <!-- Draggable brand area (never interactive controls). -->
+            <Grid x:Name="ShellDragHeader"
+                  Grid.Column="1"
+                  Background="{ThemeResource HfHeaderBackgroundBrush}"
+                  AutomationProperties.AutomationId="ShellDragHeader"
+                  AutomationProperties.Name="HF Drive title bar">
+                <StackPanel VerticalAlignment="Center"
+                            HorizontalAlignment="Left"
+                            Spacing="0">
+                    <TextBlock Text="HF Drive"
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                    <TextBlock Text="Hugging Face Storage on your PC"
+                               FontSize="11"
+                               Opacity="0.8"
+                               Foreground="{ThemeResource HfHeaderForegroundBrush}" />
+                </StackPanel>
+            </Grid>
+        </Grid>
 
         <!--
           Compact-only replacement for the system caption strip. The drag
@@ -39,7 +102,7 @@
           No screen-coordinate drag loop: the OS moves the window.
         -->
         <Grid x:Name="SetupCaptionBar"
-              Grid.Row="0"
+              Grid.Row="1"
               Height="40"
               Visibility="Collapsed"
               Background="{ThemeResource HfHeaderBackgroundBrush}">
@@ -76,7 +139,7 @@
         <!-- Visible retry surface for bounded provider startup failures. -->
         <Grid
             x:Name="StartupErrorBanner"
-            Grid.Row="1"
+            Grid.Row="2"
             Visibility="Collapsed"
             Padding="12,8"
             BorderThickness="0,0,0,1"
@@ -103,7 +166,7 @@
         <!-- Compact-flow header: a way back to the normal shell once one exists. -->
         <Grid
             x:Name="CompactHeader"
-            Grid.Row="2"
+            Grid.Row="3"
             Visibility="Collapsed"
             Padding="12,8,12,0">
             <Button
@@ -113,6 +176,6 @@
                 Click="OnBackToShellClick" />
         </Grid>
 
-        <Grid x:Name="ShellHost" Grid.Row="3" />
+        <Grid x:Name="ShellHost" Grid.Row="4" />
     </Grid>
 </Window>

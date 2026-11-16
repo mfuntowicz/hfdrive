@@ -98,7 +98,7 @@ internal sealed class TrayService : IDisposable
     /// <summary>Reopen the current main-window surface without changing its navigation.</summary>
     public event Action? OpenMainRequested;
 
-    /// <summary>Open the main window at a section tag (account/connections/operations/setup).</summary>
+    /// <summary>Open the main window at a section tag (settings/account/connections/operations/setup).</summary>
     public event Action<string>? OpenSectionRequested;
 
     /// <summary>Open the selected connection's local folder.</summary>
@@ -420,7 +420,7 @@ internal sealed class TrayService : IDisposable
                 OpenSectionRequested?.Invoke("connections");
                 break;
             case SettingsCommand:
-                OpenSectionRequested?.Invoke("operations");
+                OpenSectionRequested?.Invoke("settings");
                 break;
             case PauseResumeCommand:
                 PauseResumeRequested?.Invoke();

@@ -33,6 +33,7 @@
   <ItemGroup>
     <Compile Include="..\HfDrive.Desktop\ViewModels\TraySyncReadiness.cs" Link="TraySyncReadiness.cs" />
     <Compile Include="..\HfDrive.Desktop\ViewModels\TrayIssueProjection.cs" Link="TrayIssueProjection.cs" />
+    <Compile Include="..\HfDrive.Desktop\ViewModels\SettingsQuantity.cs" Link="SettingsQuantity.cs" />
   </ItemGroup>
 
 </Project>

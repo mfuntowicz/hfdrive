@@ -4,75 +4,207 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:vm="using:HfDrive.Desktop.ViewModels">
 
-    <ScrollViewer Padding="24,16">
-        <StackPanel Spacing="12" MaxWidth="820" HorizontalAlignment="Left">
-            <TextBlock Text="Account" Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock x:Name="AccountStateText"
-                       TextWrapping="Wrap"
-                       Text="{x:Bind ViewModel.AccountStateText, Mode=OneWay}" />
+    <!--
+      Account settings section. Visuals come from the shell's shared HfSettings*
+      styles and the App.xaml Hf* theme brushes so this page matches the Settings
+      page in light, dark and high contrast. Every value is bound to the shared
+      MainViewModel's observed provider state; no state is invented here.
+    -->
+    <Grid Background="{ThemeResource HfPageBackgroundBrush}">
+        <ScrollViewer Padding="24,16"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      HorizontalScrollMode="Disabled"
+                      ZoomMode="Disabled">
+            <StackPanel MaxWidth="900" HorizontalAlignment="Stretch" Spacing="16">
 
-            <StackPanel Orientation="Horizontal" Spacing="8">
-                <Button Content="Sign in with browser" Command="{x:Bind ViewModel.SignInCommand}" />
-                <Button Content="Use device code" Command="{x:Bind ViewModel.DeviceLoginCommand}" />
-                <Button Content="Cancel sign-in" Command="{x:Bind ViewModel.CancelLoginCommand}" />
-                <Button Content="Sign out" Command="{x:Bind ViewModel.SignOutCommand}" />
-                <ProgressRing IsActive="{x:Bind ViewModel.IsLoginPending, Mode=OneWay}" Width="24" Height="24" />
-            </StackPanel>
-            <TextBlock Text="{x:Bind ViewModel.LoginInstructions, Mode=OneWay}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-            <TextBlock Text="Sign-out disables native and supplemental storage access without deleting local work." TextWrapping="Wrap" />
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Account"
+                               Style="{StaticResource TitleTextBlockStyle}"
+                               TextWrapping="Wrap" />
+                    <TextBlock Text="Your Hugging Face sign-in and the storage owners you can use."
+                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                </StackPanel>
 
-            <TextBlock Text="Verified owner identities" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-            <TextBlock Text="Membership and role labels are not proof of bucket write access." TextWrapping="Wrap" />
-            <TextBlock Text="{x:Bind ViewModel.OwnersEmptyText, Mode=OneWay}" TextWrapping="Wrap" />
-            <ListView ItemsSource="{x:Bind ViewModel.Owners, Mode=OneWay}" SelectionMode="None">
-                <ListView.ItemTemplate>
-                    <DataTemplate x:DataType="vm:OwnerViewModel">
-                        <StackPanel Spacing="2" Margin="0,0,0,8">
-                            <TextBlock Text="{x:Bind HeaderDisplay, Mode=OneWay}"
-                                       Style="{StaticResource BodyStrongTextBlockStyle}"
-                                       TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind NamespaceText, Mode=OneWay}" FontFamily="Consolas" FontSize="12" />
-                            <TextBlock Text="{x:Bind RoleText, Mode=OneWay}" />
-                            <TextBlock Text="{x:Bind RestrictionsText}" TextWrapping="Wrap" />
-                            <TextBlock Text="{x:Bind CapabilityText, Mode=OneWay}" />
+                <!-- Real errors stay visible above every section. -->
+                <TextBlock x:Name="ErrorText"
+                           TextWrapping="Wrap"
+                           IsTextSelectionEnabled="True"
+                           Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                           Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}" />
+
+                <!-- ── Verified sign-in identity ─────────────────────────── -->
+                <Border Style="{StaticResource HfSettingsCardStyle}">
+                    <StackPanel Spacing="12">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Image Grid.Column="0"
+                                   Width="36" Height="34"
+                                   Stretch="Uniform"
+                                   VerticalAlignment="Top"
+                                   AutomationProperties.Name="Hugging Face">
+                                <Image.Source>
+                                    <BitmapImage UriSource="ms-appx:///Assets/CatchingHuggy.png" DecodePixelWidth="72" />
+                                </Image.Source>
+                            </Image>
+                            <StackPanel Grid.Column="1"
+                                        Margin="12,0,0,0"
+                                        VerticalAlignment="Center"
+                                        Spacing="2">
+                                <TextBlock Text="Hugging Face account"
+                                           Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                                <TextBlock x:Name="AccountStateText"
+                                           TextWrapping="Wrap"
+                                           Style="{StaticResource HfSettingsDescriptionStyle}"
+                                           Text="{x:Bind ViewModel.AccountStateText, Mode=OneWay}" />
+                            </StackPanel>
+                            <ProgressRing Grid.Column="2"
+                                          Width="24" Height="24"
+                                          VerticalAlignment="Top"
+                                          IsActive="{x:Bind ViewModel.IsLoginPending, Mode=OneWay}" />
+                        </Grid>
+
+                        <StackPanel Spacing="8">
+                            <Button Content="Sign in with browser"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    HorizontalAlignment="Left"
+                                    Command="{x:Bind ViewModel.SignInCommand}" />
+                            <TextBlock Text="No browser on this PC? Use a device code instead."
+                                       Style="{StaticResource HfSettingsDescriptionStyle}" />
+                            <HyperlinkButton Content="Use a device code instead"
+                                             Padding="0"
+                                             HorizontalAlignment="Left"
+                                             Command="{x:Bind ViewModel.DeviceLoginCommand}" />
+                            <Button Content="Cancel sign-in"
+                                    HorizontalAlignment="Left"
+                                    Visibility="{x:Bind ViewModel.CancelLoginVisibility, Mode=OneWay}"
+                                    Command="{x:Bind ViewModel.CancelLoginCommand}" />
                         </StackPanel>
-                    </DataTemplate>
-                </ListView.ItemTemplate>
-            </ListView>
-            <StackPanel Orientation="Horizontal" Spacing="8">
-                <Button Content="Load more owners" Command="{x:Bind ViewModel.LoadMoreOwnersCommand}" />
-                <ProgressRing IsActive="{x:Bind ViewModel.IsOwnersLoading, Mode=OneWay}" Width="24" Height="24" />
+
+                        <TextBlock Text="{x:Bind ViewModel.LoginInstructions, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   IsTextSelectionEnabled="True" />
+                    </StackPanel>
+                </Border>
+
+                <!-- ── Sign out, clearly separated ───────────────────────── -->
+                <Border Style="{StaticResource HfSettingsCardStyle}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Sign out"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Text="Signing out stops syncing until you sign in again. Your synced folders, local files and pending changes stay on this PC — nothing is deleted."
+                                   Style="{StaticResource HfSettingsDescriptionStyle}" />
+                        <Button Content="Sign out"
+                                HorizontalAlignment="Left"
+                                Command="{x:Bind ViewModel.SignOutCommand}" />
+                    </StackPanel>
+                </Border>
+
+                <!-- ── Owner identities ──────────────────────────────────── -->
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Storage owners"
+                               Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                    <TextBlock Text="Personal and organization identities verified for your sign-in. A role label doesn't grant storage access by itself; access is checked when you connect a drive."
+                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.OwnersEmptyText, Mode=OneWay}"
+                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                    <ListView ItemsSource="{x:Bind ViewModel.Owners, Mode=OneWay}"
+                              SelectionMode="None">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="Padding" Value="0" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="vm:OwnerViewModel">
+                                <Border Style="{StaticResource HfSettingsCardStyle}" Margin="0,0,0,8">
+                                    <StackPanel Spacing="6">
+                                        <TextBlock Text="{x:Bind HeaderDisplay, Mode=OneTime}"
+                                                   Style="{StaticResource HfSettingsSectionTitleStyle}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock Text="{x:Bind NamespaceText, Mode=OneTime}"
+                                                   FontFamily="Consolas"
+                                                   FontSize="12"
+                                                   TextWrapping="Wrap"
+                                                   IsTextSelectionEnabled="True" />
+                                        <TextBlock Text="{x:Bind RoleText, Mode=OneTime}" TextWrapping="Wrap" />
+                                        <TextBlock Text="{x:Bind RestrictionsText, Mode=OneTime}"
+                                                   Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                        <TextBlock Text="{x:Bind CapabilityText, Mode=OneTime}"
+                                                   Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Load more owners"
+                                Command="{x:Bind ViewModel.LoadMoreOwnersCommand}" />
+                        <ProgressRing IsActive="{x:Bind ViewModel.IsOwnersLoading, Mode=OneWay}"
+                                      Width="24" Height="24"
+                                      VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- ── Provider connection (details collapsed) ───────────── -->
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Provider connection"
+                               Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                    <TextBlock Text="HF Drive runs a background provider that keeps your folders in sync."
+                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                    <Border Style="{StaticResource HfSettingsCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock x:Name="ConnectionStateText"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                                       TextWrapping="Wrap"
+                                       Text="{x:Bind ViewModel.ConnectionStateText, Mode=OneWay}" />
+                            <TextBlock x:Name="ConnectionDetailText"
+                                       Style="{StaticResource HfSettingsDescriptionStyle}"
+                                       TextWrapping="Wrap"
+                                       Text="{x:Bind ViewModel.ConnectionDetailText, Mode=OneWay}" />
+
+                            <StackPanel Spacing="8">
+                                <Button Content="Connect to provider"
+                                        Style="{StaticResource AccentButtonStyle}"
+                                        HorizontalAlignment="Left"
+                                        Command="{x:Bind ViewModel.ConnectCommand}"
+                                        IsEnabled="{x:Bind ViewModel.IsDisconnected, Mode=OneWay}" />
+                                <Button Content="Refresh status"
+                                        HorizontalAlignment="Left"
+                                        Command="{x:Bind ViewModel.RefreshCommand}"
+                                        IsEnabled="{x:Bind ViewModel.IsConnected, Mode=OneWay}" />
+                                <ProgressRing IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
+                                              Width="24" Height="24"
+                                              HorizontalAlignment="Left" />
+                            </StackPanel>
+
+                            <Expander HorizontalAlignment="Stretch"
+                                      IsExpanded="False"
+                                      Header="Advanced connection details">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="{x:Bind ViewModel.PeerVerificationText, Mode=OneWay}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                    <TextBlock Text="{x:Bind ViewModel.ProviderVersionText, Mode=OneWay}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                    <TextBlock Text="{x:Bind ViewModel.ProviderFeaturesText, Mode=OneWay}"
+                                               Style="{StaticResource HfSettingsDescriptionStyle}" />
+                                    <TextBlock Text="{x:Bind ViewModel.PipeNameDisplay, Mode=OneTime}"
+                                               FontFamily="Consolas"
+                                               FontSize="12"
+                                               TextWrapping="Wrap"
+                                               IsTextSelectionEnabled="True" />
+                                </StackPanel>
+                            </Expander>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
             </StackPanel>
-
-            <TextBlock Text="Provider connection" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-            <TextBlock x:Name="ConnectionStateText"
-                       TextWrapping="Wrap"
-                       Text="{x:Bind ViewModel.ConnectionStateText, Mode=OneWay}" />
-            <TextBlock x:Name="ConnectionDetailText"
-                       TextWrapping="Wrap"
-                       Text="{x:Bind ViewModel.ConnectionDetailText, Mode=OneWay}" />
-            <TextBlock Text="{x:Bind ViewModel.PeerVerificationText, Mode=OneWay}" TextWrapping="Wrap" />
-            <TextBlock Text="{x:Bind ViewModel.ProviderVersionText, Mode=OneWay}" TextWrapping="Wrap" />
-            <TextBlock Text="{x:Bind ViewModel.ProviderFeaturesText, Mode=OneWay}" TextWrapping="Wrap" />
-            <TextBlock Text="{x:Bind ViewModel.PipeNameDisplay, Mode=OneTime}"
-                       TextWrapping="Wrap"
-                       FontFamily="Consolas"
-                       FontSize="12" />
-
-            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,8,0,0">
-                <Button Content="Connect to provider"
-                        Command="{x:Bind ViewModel.ConnectCommand}"
-                        IsEnabled="{x:Bind ViewModel.IsDisconnected, Mode=OneWay}" />
-                <Button Content="Refresh status"
-                        Command="{x:Bind ViewModel.RefreshCommand}"
-                        IsEnabled="{x:Bind ViewModel.IsConnected, Mode=OneWay}" />
-                <ProgressRing IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}" Width="24" Height="24" />
-            </StackPanel>
-
-            <TextBlock x:Name="ErrorText"
-                       TextWrapping="Wrap"
-                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                       Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}" />
-        </StackPanel>
-    </ScrollViewer>
+        </ScrollViewer>
+    </Grid>
 </Page>

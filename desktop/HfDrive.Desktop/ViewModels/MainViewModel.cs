@@ -115,6 +115,16 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _loginInstructions = string.Empty;
 
+    /// <summary>
+    /// Shows the cancel control only while a sign-in attempt is actually
+    /// pending; the command keeps its own cancellation guards.
+    /// </summary>
+    public Microsoft.UI.Xaml.Visibility CancelLoginVisibility =>
+        IsLoginPending ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+    partial void OnIsLoginPendingChanged(bool value) =>
+        OnPropertyChanged(nameof(CancelLoginVisibility));
+
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(LoadMoreOwnersCommand))]
     private bool _isOwnersLoading;
@@ -265,17 +275,18 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private Task DeviceLoginAsync(CancellationToken cancellationToken) => BeginLoginAsync(LoginFlow.Device, LoginPurpose.Signin, cancellationToken);
 
     /// <summary>
-    /// Explicit storage sign-in for the setup model: requests read or write
-    /// storage scope for the interactive flow the user chose. Never started
+    /// Explicit storage sign-in for the setup model: requests read, write, or
+    /// create scope for the interactive flow the user chose. Never started
     /// automatically — the setup model invokes this from a user CTA only.
     /// </summary>
     /// <param name="flow">The login flow chosen by the user.</param>
-    /// <param name="writable">True requests write storage scope; false requests read storage scope.</param>
+    /// <param name="purpose">The exact storage permission being requested.</param>
     /// <param name="token">Cancellation for the login attempt.</param>
-    public Task SignInForStorageAsync(LoginFlow flow, bool writable, CancellationToken token)
-        => BeginLoginAsync(flow, writable ? LoginPurpose.WriteStorage : LoginPurpose.ReadStorage, token);
+    /// <param name="organizationId">Organization to re-consent, when creating for an organization.</param>
+    public Task SignInForStorageAsync(LoginFlow flow, LoginPurpose purpose, CancellationToken token, string? organizationId = null)
+        => BeginLoginAsync(flow, purpose, token, organizationId);
 
-    private async Task BeginLoginAsync(LoginFlow flow, LoginPurpose purpose, CancellationToken cancellationToken)
+    private async Task BeginLoginAsync(LoginFlow flow, LoginPurpose purpose, CancellationToken cancellationToken, string? organizationId = null)
     {
         IsAccountCommandBusy = true;
         ErrorText = null;
@@ -285,6 +296,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             StartLoginResult login = await _session.SendAsync(Commands.StartLogin, new StartLoginRequest
             {
                 OperationId = Guid.NewGuid(), Flow = flow, Purpose = purpose,
+                OrganizationId = organizationId,
             }, cancellationToken).ConfigureAwait(true);
             if (_account?.Login is not { } observed || observed.SessionId != login.SessionId || observed.Phase == LoginPhase.Pending)
                 LoginInstructions = flow == LoginFlow.Device

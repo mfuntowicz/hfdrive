@@ -26,7 +26,10 @@ public sealed partial class ConnectionViewModel
     }
 
     public string SummaryDisplay =>
-        $"{StatusDisplayText.Get(Status.State)} · {(Status.Mode == ConnectionMode.ReadOnly ? "Read-only" : "Writable")} · {CapabilityText}";
+        $"{StateText} · {ModeText}" +
+        (Status.Capability == (Status.Mode == ConnectionMode.ReadOnly ? CapabilityState.ReadOnly : CapabilityState.Writable)
+            ? string.Empty
+            : $" · {CapabilityText}");
 
     public string StateText => StatusDisplayText.Get(Status.State);
 
@@ -58,6 +61,10 @@ public sealed partial class ConnectionViewModel
     };
 
     public string RootPathDisplay => Status.RootPath;
+
+    /// <summary>Bucket and managed location as shown on the connection card.</summary>
+    public string LocationText =>
+        $"{Status.Bucket.Namespace}/{Status.Bucket.Name} · managed folder {Status.Prefix}";
 
     public string CountsText =>
         $"{Status.PendingFiles} pending · {Status.DirtyFiles} local changes · {Status.ConflictFiles} conflicts · {Status.OnlineOnlyFiles} online-only · {Status.PinnedFiles} pinned";

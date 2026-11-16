@@ -5,19 +5,17 @@
     xmlns:vm="using:HfDrive.Desktop.ViewModels">
 
     <Page.Resources>
-        <!-- Neutral rounded card with a thin border; backgrounds come from the
-             native theme dictionaries defined in App.xaml. -->
+        <!-- Default Mica-aware Fluent card and primary action; only layout is
+             customized here, so Add Drive matches the Settings content. -->
         <Style x:Key="CardBorderStyle" TargetType="Border">
-            <Setter Property="Background" Value="{ThemeResource HfCardBackgroundBrush}" />
-            <Setter Property="BorderBrush" Value="{ThemeResource HfCardBorderBrush}" />
+            <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+            <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="CornerRadius" Value="8" />
             <Setter Property="Padding" Value="16" />
             <Setter Property="HorizontalAlignment" Value="Stretch" />
         </Style>
         <Style x:Key="StoragePrimaryButtonStyle" TargetType="Button" BasedOn="{StaticResource AccentButtonStyle}">
-            <Setter Property="Background" Value="{ThemeResource HfStorageActionBrush}" />
-            <Setter Property="Foreground" Value="{ThemeResource HfStorageActionForegroundBrush}" />
             <Setter Property="CornerRadius" Value="8" />
             <Setter Property="Padding" Value="20,10" />
         </Style>
@@ -309,6 +307,15 @@
                             <Button Content="Create private bucket"
                                     HorizontalAlignment="Left"
                                     Command="{x:Bind ViewModel.CreateBucketCommand}" />
+                            <InfoBar x:Name="CreationErrorInfoBar"
+                                     Severity="Error"
+                                     IsClosable="False"
+                                     IsOpen="{x:Bind ViewModel.HasCreationError, Mode=OneWay}"
+                                     Title="Bucket creation failed">
+                                <TextBlock Text="{x:Bind ViewModel.CreationErrorText, Mode=OneWay}"
+                                           TextWrapping="Wrap"
+                                           IsTextSelectionEnabled="True" />
+                            </InfoBar>
                             <TextBlock Text="{x:Bind ViewModel.CreatedBucketText, Mode=OneWay}"
                                        TextWrapping="Wrap"
                                        Opacity="0.8" />
@@ -583,8 +590,8 @@
         <!-- ── Fixed footer: back + single primary action ───────────────── -->
         <Grid Grid.Row="2"
               Padding="20,12,20,14"
-              Background="{ThemeResource HfCardBackgroundBrush}"
-              BorderBrush="{ThemeResource HfCardBorderBrush}"
+              Background="{ThemeResource HfHeaderBackgroundBrush}"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
               BorderThickness="0,1,0,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />

@@ -35,21 +35,25 @@ namespace HfDrive.Desktop;
 /// stops processes. Startup failures stay visible with a retry action and are
 /// never reported as an empty configuration.
 ///
-/// Setup chrome: while the compact onboarding surface is shown the window
-/// has no system caption strip — <c>OverlappedPresenter.SetBorderAndTitleBar(false,false)</c>
-/// removes the caption (title bar and its min/max/close buttons) and the
-/// painted border together, so no 1px nonclient frame paints around the
-/// client; DWM rounding/shadow come from the explicit corner opt-in in
-/// <see cref="WindowChrome.ApplyFluentFrame"/>. Exactly one accessible
-/// close control ("Close setup") replaces the strip. The setup header
-/// (AutomationId <c>SetupDragHeader</c>) is designated as the OS caption drag
-/// region through <see cref="InputNonClientPointerSource"/>, so dragging it
-/// moves the window and double-clicking it never maximizes (the compact
-/// presenter has no maximize box). Closing follows the existing
+/// Window chrome: the window always owns its caption
+/// (<c>ExtendsContentIntoTitleBar</c>), so no separate title strip ever
+/// paints. While the compact onboarding surface is shown
+/// <c>OverlappedPresenter.SetBorderAndTitleBar(false,false)</c> removes the
+/// nonclient frame as well; DWM rounding/shadow come from the explicit corner
+/// opt-in in <see cref="WindowChrome.ApplyFluentFrame"/>. Exactly one
+/// accessible close control ("Close setup") replaces the caption buttons. The
+/// configured shell shows the branded CatchingHuggy caption row and keeps the
+/// native resize frame and min/max/close window controls in the caption's
+/// right inset. In both modes the caption row (AutomationIds
+/// <c>SetupDragHeader</c> / <c>ShellDragHeader</c>) is designated as the OS
+/// caption drag region through <see cref="InputNonClientPointerSource"/>, so
+/// dragging it moves the window (never a screen-coordinate drag loop) and
+/// caption gestures keep their native semantics (the compact presenter has
+/// no maximize box, so its header double-click cannot maximize). Closing
+/// follows the existing
 /// <c>AppWindow.Closing</c> close-to-tray semantics: the window's WM_CLOSE is
 /// posted and App cancels the close and hides; the wizard and provider
-/// session are untouched. Returning to the normal shell restores the standard
-/// title bar and min/max/resize controls in the same window.
+/// session are untouched.
 /// </summary>
 public sealed partial class MainWindow : Window
 {
@@ -61,6 +65,12 @@ public sealed partial class MainWindow : Window
     private const double NormalWidth = 1100;
     private const double NormalHeight = 820;
 
+    /// <summary>Native caption-button inset width in DIP (the OS window-caption
+    /// layout contract), clamped to the documented 100–160 range.</summary>
+    private const int CaptionButtonWidth = 138;
+    private const int CaptionButtonWidthMax = 160;
+    private const int CaptionButtonWidthMin = 100;
+
     private readonly ProviderSession _session;
     private readonly MainViewModel _viewModel;
     private readonly SetupViewModel _setupViewModel;
@@ -69,7 +79,7 @@ public sealed partial class MainWindow : Window
     private NavigationView? _navigation;
     private Frame? _contentFrame;
     private Frame? _compactFrame;
-    private string _lastNormalTag = "account";
+    private string _lastNormalTag = "settings";
     private bool _isCompact;
     private bool _hasNormalShell;
     private bool _startupDecisionMade;
@@ -92,6 +102,9 @@ public sealed partial class MainWindow : Window
         _setupViewModel = new SetupViewModel(_session, viewModel);
         _operationsViewModel = new OperationsViewModel(_session);
         InitializeComponent();
+        // Mica owns the shell backdrop; transparent page/caption/navigation
+        // resources expose it while content uses default Fluent brushes.
+        SystemBackdrop = new MicaBackdrop();
         AppWindow.SetIcon(System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "CatchingHuggy.ico"));
 
         // Setup chrome before the first show: the window starts compact and
@@ -100,8 +113,9 @@ public sealed partial class MainWindow : Window
         // strip. The drag region is client-relative physical pixels and is
         // recomputed whenever the caption row lays out or the window resizes
         // (a DPI/monitor change relayouts and therefore re-registers too).
-        RootLayout.SizeChanged += (_, _) => UpdateSetupDragRegion();
-        SetupCaptionBar.LayoutUpdated += (_, _) => UpdateSetupDragRegion();
+        RootLayout.SizeChanged += (_, _) => UpdateCaptionDragRegion();
+        SetupCaptionBar.LayoutUpdated += (_, _) => UpdateCaptionDragRegion();
+        ShellCaptionBar.LayoutUpdated += (_, _) => UpdateCaptionDragRegion();
 
         // WinUI can reapply the presenter frame styles on activation, undoing
         // the borderless setup frame. Re-run only the shared frame cleanup +
@@ -126,7 +140,6 @@ public sealed partial class MainWindow : Window
             // The HWND exists now: re-apply the chrome so the DWM frame helper
             // runs on a real handle and the drag region registers.
             ApplyShellChrome(_isCompact);
-            _ = RunStartupAsync();
         };
         Closed += (_, _) =>
         {
@@ -151,7 +164,7 @@ public sealed partial class MainWindow : Window
     /// unscoped overload: no selection is applied until the operations surface
     /// is actually shown, and no conflict is ever resolved here.
     /// </summary>
-    /// <param name="tag">Section tag (account, connections, operations, setup).</param>
+    /// <param name="tag">Section tag (settings, account, connections, operations, setup).</param>
     /// <param name="connectionId">Connection to scope the surface's operations to.</param>
     /// <param name="conflictId">Recorded conflict to load and select (requires
     /// the operations surface); consumed only when a real provider row with
@@ -164,7 +177,7 @@ public sealed partial class MainWindow : Window
             ShowCompactShell();
         else
         {
-            _lastNormalTag = tag is "connections" or "operations" ? tag : "account";
+            _lastNormalTag = tag is "settings" or "connections" or "operations" ? tag : "account";
             ShowNormalShell();
             if (tag == "operations" && connectionId is { } scoped)
                 _ = ApplyOperationsScopeAsync(scoped, conflictId);
@@ -207,16 +220,16 @@ public sealed partial class MainWindow : Window
         // A way back exists only once a normal shell has been established.
         CompactHeader.Visibility = _hasNormalShell ? Visibility.Visible : Visibility.Collapsed;
         ApplyWindowSize(compact: true);
-        UpdateSetupDragRegion();
+        UpdateCaptionDragRegion();
     }
 
     private void ShowNormalShell()
     {
         _hasNormalShell = true;
         _isCompact = false;
-        // Restore the standard title bar and window controls in this same
-        // window (idempotent): min/max/resize come back exactly as before the
-        // compact flow. Wizard state is untouched.
+        // Themed branded caption chrome (idempotent): the window keeps its
+        // native resize frame and min/max/close window controls while the
+        // branded caption row owns dragging. Wizard state is untouched.
         ApplyShellChrome(compact: false);
         EnsureNormalShell();
         ShellHost.Children.Clear();
@@ -256,16 +269,20 @@ public sealed partial class MainWindow : Window
         {
             IsBackButtonVisible = NavigationViewBackButtonVisible.Collapsed,
             IsSettingsVisible = false,
-            PaneDisplayMode = NavigationViewPaneDisplayMode.Left,
+            // Adaptive: full left pane at desktop widths, compact/minimal for
+            // narrower windows instead of clipping the items.
+            PaneDisplayMode = NavigationViewPaneDisplayMode.Auto,
+            OpenPaneLength = 220,
             Content = _contentFrame,
         };
-        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Account", Tag = "account" });
-        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Connections", Tag = "connections" });
-        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Operations", Tag = "operations" });
-        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Add drive", Tag = "setup" });
+        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Settings", Tag = "settings", Icon = new FontIcon { Glyph = "\uE713" } });
+        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Account", Tag = "account", Icon = new FontIcon { Glyph = "\uE77B" } });
+        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Connections", Tag = "connections", Icon = new FontIcon { Glyph = "\uE8B7" } });
+        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Advanced", Tag = "operations", Icon = new FontIcon { Glyph = "\uE90F" } });
+        _navigation.MenuItems.Add(new NavigationViewItem { Content = "Add drive", Tag = "setup", Icon = new FontIcon { Glyph = "\uE710" } });
         _navigation.SelectionChanged += OnNavigationSelectionChanged;
         _navigation.SelectedItem = _navigation.MenuItems[0];
-        _contentFrame.Navigate(typeof(AccountPage), _viewModel);
+        _contentFrame.Navigate(typeof(SettingsPage), _operationsViewModel);
     }
 
     private void OnNavigationSelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -293,6 +310,10 @@ public sealed partial class MainWindow : Window
         object parameter;
         switch (tag)
         {
+            case "settings":
+                pageType = typeof(SettingsPage);
+                parameter = _operationsViewModel;
+                break;
             case "connections":
                 pageType = typeof(ConnectionsPage);
                 parameter = _viewModel;
@@ -399,6 +420,9 @@ public sealed partial class MainWindow : Window
     // Bounded provider startup with visible retry
     // ------------------------------------------------------------------
 
+    /// <summary>Starts/joins the provider without showing this window.</summary>
+    internal void StartProviderSession() => _ = RunStartupAsync();
+
     private async Task RunStartupAsync()
     {
         if (_startupRunning || _closed) return;
@@ -494,31 +518,32 @@ public sealed partial class MainWindow : Window
     }
 
     // ------------------------------------------------------------------
-    // Setup chrome: caption-free compact shell + OS drag region + close
+    // Window chrome: branded caption + OS drag region + close
     // ------------------------------------------------------------------
 
     /// <summary>The compact setup presenter: fully borderless, no caption
     /// controls, fixed size. Configured once.</summary>
     private OverlappedPresenter? _compactPresenter;
-    /// <summary>The normal shell presenter: full native frame, standard title
-    /// bar and min/max/resize. Configured once.</summary>
+    /// <summary>The normal shell presenter: no painted caption/border (the
+    /// branded caption row replaces the title strip) but native resize frame
+    /// and min/max/close window controls. Configured once.</summary>
     private OverlappedPresenter? _normalPresenter;
     /// <summary>Mode of the presenter currently set on the AppWindow (null =
     /// none yet); SetPresenter runs only on an actual mode change.</summary>
     private bool? _appliedPresenterCompact;
 
     /// <summary>
-    /// Applies the shell's native chrome, idempotently. Compact removes the
-    /// system caption strip (title bar and its min/max/close buttons) and the
-    /// painted border so no 1px nonclient frame paints; the explicit DWM
-    /// corner opt-in in the shared helper keeps rounded corners and shadow,
-    /// then the one custom close control shows and the setup header registers
-    /// as the OS caption drag region. Normal restores the standard title bar
-    /// and window controls in this same window and clears the custom drag
-    /// region. Each mode owns its own <see cref="OverlappedPresenter"/>
-    /// instance: mutating one reused instance between (false,false) and
-    /// (true,true) can retain the compact nonclient state so the native
-    /// caption never paints again.
+    /// Applies the window's native chrome, idempotently. The window always
+    /// owns its caption (<c>ExtendsContentIntoTitleBar</c>), so no separate
+    /// title strip ever paints. Compact removes the nonclient frame and
+    /// caption buttons entirely (the one custom close control shows, the
+    /// setup header registers as the OS caption drag region). The configured
+    /// shell keeps the native resize frame and min/max/close window controls
+    /// in the caption's right inset, paints no title strip, and registers the
+    /// branded header as the drag region. Each mode owns its own
+    /// <see cref="OverlappedPresenter"/> instance: mutating one reused
+    /// instance between the two flag sets can retain the compact nonclient
+    /// state.
     /// </summary>
     private void ApplyShellChrome(bool compact)
     {
@@ -527,13 +552,10 @@ public sealed partial class MainWindow : Window
         // Switch presenters only on an actual mode change. Each instance is
         // configured once in its factory (flags first, then SetBorderAndTitleBar
         // — the tray window's proven order). Compact is fully borderless with
-        // no maximize box (a header double-click can never maximize); normal
-        // restores the full native frame with min/max/resize.
+        // no maximize box (a header double-click can never maximize); the
+        // configured shell keeps the resize frame and min/max/close controls.
         if (_appliedPresenterCompact != compact)
         {
-            if (compact)
-                ExtendsContentIntoTitleBar = true;
-
             OverlappedPresenter presenter;
             if (compact)
             {
@@ -546,16 +568,16 @@ public sealed partial class MainWindow : Window
                 presenter = _normalPresenter;
             }
             AppWindow.SetPresenter(presenter);
-            if (!compact)
-            {
-                // Restore the WinUI title-bar host after installing the
-                // caption-bearing presenter, not while compact chrome owns it.
-                SetTitleBar(null);
-                ExtendsContentIntoTitleBar = false;
-                AppWindow.TitleBar.ResetToDefault();
-            }
             _appliedPresenterCompact = compact;
         }
+
+        // The branded caption row replaces the system title strip in both
+        // modes: content extends into the caption area and the visible
+        // caption row supplies the drag region (registered per row through
+        // InputNonClientPointerSource, so interactive caption controls keep
+        // their input). Native min/max/close window buttons remain in the
+        // caption's right inset.
+        ExtendsContentIntoTitleBar = true;
 
         // The HWND exists from construction (AppWindow.SetIcon above already
         // uses it), but guard so a pre-show call never hits a null handle; the
@@ -567,7 +589,8 @@ public sealed partial class MainWindow : Window
         }
 
         SetupCaptionBar.Visibility = compact ? Visibility.Visible : Visibility.Collapsed;
-        UpdateSetupDragRegion();
+        ShellCaptionBar.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
+        UpdateCaptionDragRegion();
     }
 
     /// <summary>The compact setup presenter: fully borderless (false,false),
@@ -584,14 +607,18 @@ public sealed partial class MainWindow : Window
         return presenter;
     }
 
-    /// <summary>The normal shell presenter: full native frame (true,true),
-    /// standard title bar and min/max/resize. Configured once.</summary>
+    /// <summary>The normal shell presenter: no painted caption/border (the
+    /// branded caption row replaces the title strip through
+    /// ExtendsContentIntoTitleBar) but native resize frame and
+    /// min/max/close window buttons. Configured once.</summary>
     private static OverlappedPresenter CreateShellPresenter()
     {
         var presenter = OverlappedPresenter.Create();
         presenter.IsResizable = true;
         presenter.IsMaximizable = true;
         presenter.IsMinimizable = true;
+        // Keep the caption band's window buttons and the resize frame while
+        // WinUI paints the branded row into the caption area.
         presenter.SetBorderAndTitleBar(true, true);
         return presenter;
     }
@@ -599,10 +626,10 @@ public sealed partial class MainWindow : Window
     /// <summary>
     /// Re-applies only the shared frame cleanup + DWM attributes after a real
     /// activation: WinUI can reapply the presenter's frame styles when the
-    /// window is activated, which would paint the white nonclient edge again.
-    /// Never touches presenter flags or chrome state (no regeneration loop);
-    /// deactivation is ignored. Presenter/chrome changes remain owned by
-    /// <see cref="ApplyShellChrome"/>.
+    /// window is activated, which would paint a separate nonclient caption
+    /// edge over the branded row again. Never touches presenter flags or
+    /// chrome state (no regeneration loop); deactivation is ignored.
+    /// Presenter/chrome changes remain owned by <see cref="ApplyShellChrome"/>.
     /// </summary>
     private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
     {
@@ -619,19 +646,20 @@ public sealed partial class MainWindow : Window
     private readonly RectInt32[] _dragRegionBuffer = new RectInt32[1];
     /// <summary>Physical rect currently registered as the Caption region.</summary>
     private RectInt32 _dragRegionApplied;
-    /// <summary>True while a Caption region is registered (compact mode).</summary>
+    /// <summary>True while a Caption region is registered.</summary>
     private bool _dragRegionRegistered;
 
     /// <summary>
-    /// Registers the blank setup header (AutomationId <c>SetupDragHeader</c>)
-    /// as the window's caption drag region in physical pixels, recomputed on
-    /// layout, resize and DPI change. The close button column is deliberately
-    /// outside this rect so it stays interactive client content; everything
-    /// else in the header is draggable and its double-click cannot maximize
-    /// (the compact presenter has no maximize box). Normal mode clears the
-    /// region so the restored native title bar owns dragging.
+    /// Registers the active caption row's drag header (AutomationId
+    /// <c>SetupDragHeader</c> compact, <c>ShellDragHeader</c> configured) as
+    /// the window's caption drag region in physical pixels, recomputed on
+    /// layout, resize and DPI change. Only the drag header is registered, so
+    /// the compact close button and any other caption content stay
+    /// interactive client content. The OS moves the window for the region and
+    /// keeps its native caption gestures (the compact presenter has no
+    /// maximize box).
     /// </summary>
-    private void UpdateSetupDragRegion()
+    private void UpdateCaptionDragRegion()
     {
         if (_closed) return;
 
@@ -641,13 +669,13 @@ public sealed partial class MainWindow : Window
         // after real layout, so skipping here never loses the registration.
         if (!RootLayout.IsLoaded || RootLayout.XamlRoot is null) return;
 
-        bool wantsDragRegion = _isCompact && SetupCaptionBar.Visibility == Visibility.Visible;
-        if (!wantsDragRegion)
+        FrameworkElement? dragHeader = _isCompact
+            ? (SetupCaptionBar.Visibility == Visibility.Visible ? SetupDragHeader : null)
+            : (ShellCaptionBar.Visibility == Visibility.Visible ? ShellDragHeader : null);
+        if (dragHeader is null)
         {
-            // Normal mode: clear the custom region so the restored native
-            // title bar owns dragging. Deliberately independent of the setup
-            // header's bounds — a collapsed header has zero size and must
-            // never block this clear (stale caption hit regions would remain).
+            // No caption row owns dragging (e.g. mid mode switch): clear the
+            // stale region so an invisible row can never swallow input.
             if (_dragRegionRegistered)
             {
                 InputNonClientPointerSource.GetForWindowId(AppWindow.Id)
@@ -657,24 +685,42 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        // Compact only: the header must be attached and arranged before
-        // TransformToVisual on it (an unattached/pre-layout element throws).
-        // LayoutUpdated retries once real layout exists.
-        if (!SetupDragHeader.IsLoaded
-            || SetupDragHeader.ActualWidth <= 0
-            || SetupDragHeader.ActualHeight <= 0)
+        // The header must be attached and arranged before TransformToVisual
+        // on it (an unattached/pre-layout element throws). LayoutUpdated
+        // retries once real layout exists.
+        if (!dragHeader.IsLoaded
+            || dragHeader.ActualWidth <= 0
+            || dragHeader.ActualHeight <= 0)
         {
             return;
         }
 
         double scale = RootLayout.XamlRoot.RasterizationScale;
-        GeneralTransform transform = SetupDragHeader.TransformToVisual(null);
-        Rect bounds = transform.TransformBounds(new Rect(0, 0, SetupDragHeader.ActualWidth, SetupDragHeader.ActualHeight));
+        GeneralTransform transform = dragHeader.TransformToVisual(null);
+        Rect bounds = transform.TransformBounds(new Rect(0, 0, dragHeader.ActualWidth, dragHeader.ActualHeight));
         var drag = new RectInt32(
             (int)Math.Round(bounds.X * scale),
             (int)Math.Round(bounds.Y * scale),
             (int)Math.Round(bounds.Width * scale),
             (int)Math.Round(bounds.Height * scale));
+
+        // The configured shell reserves the native caption-button inset at the
+        // window's right edge (the caption buttons draw there). The strip is
+        // the OS caption layout's 138-DIP button width, clamped to the
+        // contract's 100–160 DIP range and never past half the window, and it
+        // scales with the display DPI; the drag region stops before it so the
+        // buttons always accept input.
+        if (!_isCompact)
+        {
+            int clientWidth = (int)Math.Round(RootLayout.ActualWidth * scale);
+            int inset = (int)Math.Round(CaptionButtonWidth * scale);
+            int maxInset = Math.Min((int)Math.Round(CaptionButtonWidthMax * scale), Math.Max(0, clientWidth / 2));
+            int minInset = Math.Min((int)Math.Round(CaptionButtonWidthMin * scale), maxInset);
+            inset = Math.Clamp(inset, minInset, maxInset);
+            int maxX = Math.Max(0, clientWidth - inset);
+            int clippedWidth = Math.Min(drag.X + drag.Width, maxX) - drag.X;
+            drag = new RectInt32(drag.X, drag.Y, Math.Max(0, clippedWidth), drag.Height);
+        }
         if (drag.Width <= 0 || drag.Height <= 0) return;
 
         // LayoutUpdated fires on every layout pass: skip the native round-trip

@@ -13,35 +13,52 @@
                     the native Light, Dark and HighContrast theme dictionaries so
                     the UI follows the system contrast theme; pages reference
                     these keys with ThemeResource so theme switches apply live.
-                    The palette is recognizably Hugging Face (yellow logo, dark
-                    slate cards) with the restrained Storage blue accent from
-                    https://huggingface.co/storage.
+                    MainWindow locally makes its shell/caption transparent for
+                    Mica; these shared HF brushes remain opaque for the tray.
+                    Settings cards and form controls use native Mica-aware
+                    Fluent resources rather than custom navy fills. Huggy keeps
+                    brand yellow; focus/accent and high-contrast colors remain
+                    owned by Windows/WinUI.
                 -->
                 <ResourceDictionary>
                     <ResourceDictionary.ThemeDictionaries>
                         <ResourceDictionary x:Key="Light">
-                            <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="#F8FAFC" />
+                            <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="#F9FAFB" />
                             <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="#FFFFFF" />
                             <SolidColorBrush x:Key="HfHeaderForegroundBrush" Color="#111827" />
                             <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="#FFFFFF" />
-                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#E3E5E9" />
+                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#E5E7EB" />
                             <SolidColorBrush x:Key="HfStorageAccentBrush" Color="#2563EB" />
                             <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="#EFF6FF" />
                             <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="#2563EB" />
-                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="#2563EB" />
-                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="#FFFFFF" />
+                            <!-- HF yellow Add-bucket background, dark plus;
+                                 high contrast uses system highlight colors. -->
+                            <SolidColorBrush x:Key="HfAddBucketBackgroundBrush" Color="#FFD21E" />
+                            <SolidColorBrush x:Key="HfAddBucketForegroundBrush" Color="#111827" />
+                            <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewTopPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewItemBackgroundSelected" Color="#E5E7EB" />
                         </ResourceDictionary>
                         <ResourceDictionary x:Key="Dark">
                             <SolidColorBrush x:Key="HfPageBackgroundBrush" Color="#0B0F19" />
                             <SolidColorBrush x:Key="HfHeaderBackgroundBrush" Color="#0B0F19" />
                             <SolidColorBrush x:Key="HfHeaderForegroundBrush" Color="#F3F4F6" />
-                            <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="#111827" />
-                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#273244" />
-                            <SolidColorBrush x:Key="HfStorageAccentBrush" Color="#60A5FA" />
-                            <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="#172554" />
+                            <SolidColorBrush x:Key="HfCardBackgroundBrush" Color="#0D121E" />
+                            <SolidColorBrush x:Key="HfCardBorderBrush" Color="#1F2937" />
+                            <SolidColorBrush x:Key="HfStorageAccentBrush" Color="#3B82F6" />
+                            <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="#172033" />
                             <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="#93C5FD" />
-                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="#2563EB" />
-                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="#FFFFFF" />
+                            <SolidColorBrush x:Key="HfAddBucketBackgroundBrush" Color="#FFD21E" />
+                            <SolidColorBrush x:Key="HfAddBucketForegroundBrush" Color="#111827" />
+
+                            <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewTopPaneBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="NavigationViewItemBackgroundSelected" Color="#192331" />
+                            <SolidColorBrush x:Key="NavigationViewItemBackgroundPointerOver" Color="#141C28" />
+                            <SolidColorBrush x:Key="NavigationViewItemBackgroundPressed" Color="#101827" />
+
                         </ResourceDictionary>
                         <ResourceDictionary x:Key="HighContrast">
                             <!-- Pure system palette: no decorative fills survive a contrast theme. -->
@@ -53,12 +70,46 @@
                             <SolidColorBrush x:Key="HfStorageAccentBrush" Color="{ThemeResource SystemColorHotlightColor}" />
                             <SolidColorBrush x:Key="HfStorageAccentFillBrush" Color="{ThemeResource SystemColorHighlightColor}" />
                             <SolidColorBrush x:Key="HfStorageAccentForegroundBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
-                            <SolidColorBrush x:Key="HfStorageActionBrush" Color="{ThemeResource SystemColorHighlightColor}" />
-                            <SolidColorBrush x:Key="HfStorageActionForegroundBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                            <!-- Decorative yellow never survives a contrast theme. -->
+                            <SolidColorBrush x:Key="HfAddBucketBackgroundBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                            <SolidColorBrush x:Key="HfAddBucketForegroundBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
                         </ResourceDictionary>
                     </ResourceDictionary.ThemeDictionaries>
                 </ResourceDictionary>
             </ResourceDictionary.MergedDictionaries>
+
+            <!--
+                Shared settings surface styles (contract keys). These are the
+                only app-level styles; pages reference them by these exact
+                names. They use semantic and native theme resources with
+                ThemeResource, so live theme switches and contrast themes
+                apply, while native control styles keep standard input
+                rendering untouched.
+            -->
+            <!-- The HF left rail uses rectangular selection/hover surfaces. -->
+            <Style TargetType="NavigationViewItem">
+                <Setter Property="CornerRadius" Value="0" />
+            </Style>
+            <!-- Default Mica-aware Fluent card, retaining the shared layout. -->
+            <Style x:Key="HfSettingsCardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="20" />
+            </Style>
+            <!-- Secondary description text with native theme contrast colors. -->
+            <Style x:Key="HfSettingsDescriptionStyle" TargetType="TextBlock">
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <!-- Section heading inside a settings page. -->
+            <Style x:Key="HfSettingsSectionTitleStyle" TargetType="TextBlock">
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="FontSize" Value="16" />
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Foreground" Value="{ThemeResource HfHeaderForegroundBrush}" />
+            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

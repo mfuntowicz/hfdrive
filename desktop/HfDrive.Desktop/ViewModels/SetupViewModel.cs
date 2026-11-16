@@ -389,6 +389,12 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _createdBucketText = "No private bucket has been created in this session.";
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasCreationError))]
+    private string? _creationErrorText;
+
+    public bool HasCreationError => !string.IsNullOrWhiteSpace(CreationErrorText);
+
     // ── Step 2: inspection ─────────────────────────────────────────────────
 
     [ObservableProperty]
@@ -565,6 +571,8 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
         && !_grantedScopes.Contains("read-repos") && !_grantedScopes.Contains("write-repos");
     private bool NeedsWriteConsent => IsWritable && AccountReady && _grantedScopes is not null
         && !_grantedScopes.Contains("write-repos");
+    private bool NeedsCreateConsent => AccountReady && _grantedScopes is not null
+        && !_grantedScopes.Contains("manage-repos");
     private bool InspectionIsCompatible => _inspectValid
         && (SelectedSource.Source == SetupSource.ExistingManagedDrive ? _inspectedManaged : _inspectedPrefixEmpty);
 
@@ -610,7 +618,7 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
                     }
                     if (_main.Account is { } account) ApplyAccount(account);
                     if (!AccountReady || NeedsReadConsent)
-                        await RequestStorageLoginAsync(LoginFlow.Pkce, false).ConfigureAwait(true);
+                        await RequestStorageLoginAsync(LoginFlow.Pkce, LoginPurpose.ReadStorage).ConfigureAwait(true);
                     if (AccountReady && !NeedsReadConsent) CurrentStep = 1;
                     break;
                 case 1:
@@ -637,7 +645,7 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
                     }
                     if (NeedsWriteConsent)
                     {
-                        await RequestStorageLoginAsync(LoginFlow.Pkce, true).ConfigureAwait(true);
+                        await RequestStorageLoginAsync(LoginFlow.Pkce, LoginPurpose.WriteStorage).ConfigureAwait(true);
                         return;
                     }
                     if (!_setupValid) await BeginSetupAsync(_lifetime.Token).ConfigureAwait(true);
@@ -688,13 +696,14 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand(CanExecute = nameof(CanUseDeviceLogin))]
-    private Task UseDeviceLoginAsync() => RequestStorageLoginAsync(LoginFlow.Device, CurrentStep == 2 && IsWritable);
+    private Task UseDeviceLoginAsync() => RequestStorageLoginAsync(LoginFlow.Device,
+        CurrentStep == 2 && IsWritable ? LoginPurpose.WriteStorage : LoginPurpose.ReadStorage);
 
     private bool CanUseDeviceLogin() => !IsWorking && _main.IsConnected && !_main.IsLoginPending;
 
-    private async Task RequestStorageLoginAsync(LoginFlow flow, bool writable)
+    private async Task RequestStorageLoginAsync(LoginFlow flow, LoginPurpose purpose, string? organizationId = null)
     {
-        await _main.SignInForStorageAsync(flow, writable, _lifetime.Token).ConfigureAwait(true);
+        await _main.SignInForStorageAsync(flow, purpose, _lifetime.Token, organizationId).ConfigureAwait(true);
         if (_disposed) return;
         if (_main.Account is { } account) ApplyAccount(account);
         if (!string.IsNullOrWhiteSpace(_main.ErrorText)) ErrorText = _main.ErrorText;
@@ -711,6 +720,7 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
         SelectedMode = _modeChoices[1];
         RootPathText = string.Empty;
         ErrorText = null;
+        CreationErrorText = null;
         StatusText = string.Empty;
         CurrentStep = AccountReady && !NeedsReadConsent ? 1 : 0;
         SelectPersonalOwner();
@@ -1075,8 +1085,23 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
         IsBusy = true;
         BusyText = $"Creating private bucket {bucketName}…";
         ErrorText = null;
+        CreationErrorText = null;
         try
         {
+            if (NeedsCreateConsent)
+            {
+                StatusText = "Allow Manage repositories in Hugging Face, then select Create private bucket again.";
+                string? organizationId = owner.Owner.OwnerKind == OwnerKind.Organization ? owner.Owner.OwnerId : null;
+                await RequestStorageLoginAsync(LoginFlow.Pkce, LoginPurpose.CreateStorage, organizationId).ConfigureAwait(true);
+                if (!string.IsNullOrWhiteSpace(ErrorText))
+                {
+                    CreationErrorText = $"Bucket creation authorization failed: {ErrorText}";
+                    ErrorText = null;
+                    StatusText = "Private bucket creation was not authorized.";
+                }
+                return;
+            }
+
             Guid operationId = Guid.NewGuid();
             CreateBucketResult result = await _session
                 .SendAsync(Commands.CreateBucket, new CreateBucketRequest
@@ -1102,14 +1127,21 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
             if (!result.Completed)
             {
                 _createdBucketOperationId = null;
-                ErrorText = "The provider did not complete bucket creation; the partial creation is recorded in the setup intent.";
+                CreationErrorText = "The provider did not complete bucket creation; the partial creation is recorded in the setup intent.";
             }
-            StatusText = "Private bucket creation finished.";
+            StatusText = result.Completed ? "Private bucket creation finished." : "Private bucket creation needs attention.";
         }
         catch (OperationCanceledException) when (request.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            if (!IsScopeStale(scope)) ShowError(ex);
+            if (!IsScopeStale(scope))
+            {
+                string message = ErrorMessage(ex);
+                CreationErrorText = ex is ProtocolException protocol && protocol.Error.Code == ProtocolErrorCode.PermissionDenied
+                    ? $"Hugging Face denied bucket creation for {ownerNamespace}. Your account needs Manage repositories consent and permission to create buckets for this owner. No bucket was created. ({message})"
+                    : $"Bucket creation failed: {message}";
+                StatusText = "Private bucket creation failed.";
+            }
         }
         finally
         {
@@ -1122,7 +1154,11 @@ public sealed partial class SetupViewModel : ObservableObject, IDisposable
     private bool CanCreateBucket() =>
         !IsBusy && SelectedOwner?.Owner.Namespace is not null && NewBucketName.Trim().Length != 0;
 
-    partial void OnNewBucketNameChanged(string value) => WizardStateChanged();
+    partial void OnNewBucketNameChanged(string value)
+    {
+        CreationErrorText = null;
+        WizardStateChanged();
+    }
 
     // ── Step 2: inspection ─────────────────────────────────────────────────
 
