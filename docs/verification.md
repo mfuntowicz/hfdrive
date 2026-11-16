@@ -691,3 +691,26 @@ Evidence: `artifacts/acceptance/inline-celebration-sync.json`,
 `inline-celebration-sync.png`, `inline-celebration-history-scrolled.json`,
 `inline-celebration-history-scrolled.png`, and `inline-animation.json`. The
 temporary layout and animation probes were removed after verification.
+
+## Contextual tray issues — 2026-11-16
+
+- **passed** — Debug/x64 desktop solution build with locked restore completed
+  with zero errors; managed protocol/tray/settings tests passed 176/176,
+  including typed connection-wide versus conflict/failed-transfer routing.
+  Evidence: `artifacts/tests/tray-contextual-issues-build.log` and
+  `tray-contextual-issues-tests.log`.
+- **passed** — the bottom Issues section is removed and both cards use the
+  reclaimed height (425px). Service, authorization, storage and connection-wide
+  failures project to a compact conditional top banner; conflicts and failed
+  transfers project into Syncing now. No issue chrome appears in the healthy
+  state, and all six actual history records fit in Recent activity.
+- **passed** — the idle status uses the smaller body-strong style (19px measured
+  text bounds instead of 27px) while Huggy and bounded playback are unchanged.
+- **not_run** — no live service or file fault was injected for screenshots;
+  issue-category routing is covered by deterministic projection tests. No
+  settings, provider sync state, or remote resources were mutated.
+
+Evidence: `artifacts/acceptance/contextual-issues-sync.json`,
+`contextual-issues-sync.png`, `contextual-issues-history.json`, and
+`contextual-issues-history.png`. The temporary UI probe was removed after
+verification.

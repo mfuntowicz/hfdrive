@@ -147,7 +147,7 @@ public sealed class TrayIssueProjectionTests
         IReadOnlyList<TrayIssueRow> rows = Issues(log, new[] { connection });
         TrayIssueRow issue = Assert.Single(rows);
 
-        Assert.Equal("1 issue needs attention.", TrayIssueProjection.IssuesStateText(rows.Count));
+        Assert.Equal(TrayIssueKind.Connection, issue.Kind);
         Assert.Contains("recent changes", issue.Detail);
         Assert.Contains("bucket permissions and storage access keys", issue.Detail);
         Assert.Contains("storage access denied", issue.Detail);
@@ -175,7 +175,7 @@ public sealed class TrayIssueProjectionTests
         IReadOnlyList<TrayIssueRow> rows = Issues(log, new[] { connection });
         TrayIssueRow issue = Assert.Single(rows);
 
-        Assert.NotEqual("No sync issues.", TrayIssueProjection.IssuesStateText(rows.Count));
+        Assert.Equal(TrayIssueKind.Connection, issue.Kind);
         Assert.Contains("storage backend rejected the request", issue.Detail);
         Assert.Contains("The provider recorded an error", issue.Detail);
         Assert.Equal("connections", issue.SectionTag);
@@ -213,7 +213,6 @@ public sealed class TrayIssueProjectionTests
         // A fresh status without the recorded error finally reports no issues.
         rows = Issues(log, new[] { Drive(DriveA) });
         Assert.Empty(rows);
-        Assert.Equal("No sync issues.", TrayIssueProjection.IssuesStateText(0));
     }
 
     [Fact]
@@ -322,7 +321,6 @@ public sealed class TrayIssueProjectionTests
         log.RecordFailure(older, Error(null, "late failure"));
 
         Assert.Empty(Issues(log, new[] { connection }));
-        Assert.Equal("No sync issues.", TrayIssueProjection.IssuesStateText(0));
     }
 
     [Fact]
@@ -436,6 +434,7 @@ public sealed class TrayIssueProjectionTests
             activities: new[] { FailedTransfer(DriveA, "big.bin") });
 
         TrayIssueRow conflictRow = Assert.Single(rows, row => row.ConflictId.HasValue);
+        Assert.Equal(TrayIssueKind.File, conflictRow.Kind);
         Assert.Equal(ConflictId, conflictRow.ConflictId);
         Assert.Equal("operations", conflictRow.SectionTag);
 
@@ -448,7 +447,8 @@ public sealed class TrayIssueProjectionTests
         // Connection problems land on Connections; listing/transfer problems
         // land on the Operations surface.
         Assert.Contains(rows, row => row.SectionTag == "connections");
-        Assert.Contains(rows, row => row.Title.StartsWith("Couldn't sync \"big.bin\"", StringComparison.Ordinal));
+        TrayIssueRow transferRow = Assert.Single(rows, row => row.Title.StartsWith("Couldn't sync \"big.bin\"", StringComparison.Ordinal));
+        Assert.Equal(TrayIssueKind.File, transferRow.Kind);
         Assert.Contains(rows, row => row.SectionTag == "operations" && row.Detail.Contains("listing failed"));
 
         // A storage-access problem of a configured drive must never route into
@@ -482,6 +482,21 @@ public sealed class TrayIssueProjectionTests
         Assert.Null(storageError.ConflictId);
     }
 
+    [Fact]
+    public void IssueKindsSeparateConnectionWideAndFileFailures()
+    {
+        IReadOnlyList<TrayIssueRow> rows = Issues(new TrayRequestErrorLog(), new[]
+        {
+            Drive(DriveA, state: ConnectionState.Conflict),
+            Drive(DriveB, state: ConnectionState.Offline),
+        });
+
+        TrayIssueRow conflictSummary = Assert.Single(rows, row => row.ConnectionId == DriveA);
+        Assert.Equal(TrayIssueKind.File, conflictSummary.Kind);
+        TrayIssueRow offline = Assert.Single(rows, row => row.ConnectionId == DriveB);
+        Assert.Equal(TrayIssueKind.Connection, offline.Kind);
+    }
+
     // ── Healthy baseline is unchanged ──────────────────────────────────────
 
     [Fact]
@@ -491,6 +506,5 @@ public sealed class TrayIssueProjectionTests
             conflicts: new[] { Conflict("notes.txt", ConflictResolution.KeepLocal) });
 
         Assert.Empty(rows);
-        Assert.Equal("No sync issues.", TrayIssueProjection.IssuesStateText(0));
     }
 }

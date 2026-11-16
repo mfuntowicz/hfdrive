@@ -338,12 +338,18 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     [NotifyCanExecuteChangedFor(nameof(LoadMoreHistoryCommand))]
     public partial bool HasMoreHistory { get; set; }
 
-    // ── Issues (conflicts and failures) ──────────────────────────────────
+    // ── Issues (top service banner + file issues in Syncing now) ─────────
 
-    public ObservableCollection<TrayIssueRow> IssueItems { get; } = new();
+    public ObservableCollection<TrayIssueRow> FileIssueItems { get; } = new();
 
     [ObservableProperty]
-    public partial string IssuesStateText { get; set; } = "No issues reported.";
+    [NotifyPropertyChangedFor(nameof(HasConnectionIssue))]
+    public partial TrayIssueRow? ConnectionIssue { get; set; }
+
+    [ObservableProperty]
+    public partial string ConnectionIssueTitle { get; set; } = string.Empty;
+
+    public bool HasConnectionIssue => ConnectionIssue is not null;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(LoadMoreIssuesCommand))]
@@ -920,11 +926,27 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
             ActivityItems.Select(row => row.Record).ToList(),
             SelectedConnection?.Status.ConnectionId);
 
-        IssueItems.Clear();
+        FileIssueItems.Clear();
+        TrayIssueRow? connectionIssue = null;
+        int connectionIssueCount = 0;
         foreach (TrayIssueRow row in rows)
-            IssueItems.Add(row);
+        {
+            if (row.Kind == TrayIssueKind.File)
+            {
+                FileIssueItems.Add(row);
+                continue;
+            }
+            connectionIssue ??= row;
+            connectionIssueCount++;
+        }
 
-        IssuesStateText = TrayIssueProjection.IssuesStateText(IssueItems.Count);
+        ConnectionIssue = connectionIssue;
+        ConnectionIssueTitle = connectionIssueCount switch
+        {
+            0 => string.Empty,
+            1 => connectionIssue!.Title,
+            _ => $"{connectionIssue!.Title} (+{connectionIssueCount - 1} more)",
+        };
         UpdateActivityStateText();
         UpdateHistoryStateText();
     }

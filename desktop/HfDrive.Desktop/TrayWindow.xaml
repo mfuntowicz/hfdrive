@@ -15,8 +15,8 @@
       is genuinely up to date (TrayViewModel.IsAllSynced).
     -->
     <!-- The popup fills its native client area. PlacePanel clamps the preferred
-         400x620-DIP viewport to the monitor work area; full-height tab cards and
-         Issues scroll independently without clipping the header or footer. -->
+         400x620-DIP viewport to the monitor work area; full-height tab cards
+         scroll independently without clipping the header or footer. -->
     <Grid x:Name="RootPanel"
           AutomationProperties.AutomationId="HfDriveTrayPanel"
           AutomationProperties.Name="HF Drive tray panel"
@@ -41,7 +41,6 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
@@ -171,11 +170,47 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
-                    <TextBlock Grid.Row="0"
+                    <!-- Connection/service problems stay compact and above the tabs. -->
+                    <Border Grid.Row="0"
+                            Margin="0,0,0,8"
+                            Padding="10,8"
+                            CornerRadius="6"
+                            Background="{ThemeResource HfCardBackgroundBrush}"
+                            BorderBrush="{ThemeResource SystemFillColorCautionBrush}"
+                            BorderThickness="1"
+                            Visibility="{Binding HasConnectionIssue, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                            AutomationProperties.AutomationId="TrayConnectionIssue"
+                            AutomationProperties.Name="Connection issue">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="2">
+                                <TextBlock Text="{x:Bind ViewModel.ConnectionIssueTitle, Mode=OneWay}"
+                                           FontSize="12"
+                                           FontWeight="SemiBold"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Text="{x:Bind ViewModel.ConnectionIssue.Detail, Mode=OneWay}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Opacity="0.8"
+                                           TextWrapping="Wrap" />
+                            </StackPanel>
+                            <Button Grid.Column="1"
+                                    Margin="8,0,0,0"
+                                    VerticalAlignment="Center"
+                                    Content="{x:Bind ViewModel.ConnectionIssue.ActionText, Mode=OneWay}"
+                                    DataContext="{x:Bind ViewModel.ConnectionIssue, Mode=OneWay}"
+                                    Click="OnIssueActionClick" />
+                        </Grid>
+                    </Border>
+
+                    <TextBlock Grid.Row="1"
                                Text="{x:Bind ViewModel.WarningText, Mode=OneWay}"
                                TextWrapping="Wrap"
                                Margin="0,16"
@@ -183,7 +218,7 @@
                                Visibility="{Binding HasWarningText, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
 
                     <!-- Folder selector when more than one connection exists. -->
-                    <StackPanel Grid.Row="1"
+                    <StackPanel Grid.Row="2"
                                 Spacing="4"
                                 Margin="0,16"
                                 AutomationProperties.AutomationId="TrayConnections"
@@ -197,7 +232,7 @@
                     </StackPanel>
 
                     <!-- Activity and committed history share an explicit tab grid. -->
-                    <Grid Grid.Row="2"
+                    <Grid Grid.Row="3"
                           HorizontalAlignment="Stretch"
                           VerticalAlignment="Stretch"
                           Margin="0">
@@ -266,6 +301,37 @@
                                                Opacity="0.8"
                                                TextWrapping="Wrap"
                                                Visibility="{Binding IsActivityStatusVisible, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                    <ItemsControl ItemsSource="{x:Bind ViewModel.FileIssueItems, Mode=OneWay}"
+                                                  AutomationProperties.AutomationId="TrayFileIssues"
+                                                  AutomationProperties.Name="File issues">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:TrayIssueRow">
+                                                <Border Margin="0,4,0,0"
+                                                        Padding="8,6"
+                                                        Background="{ThemeResource HfCardBackgroundBrush}"
+                                                        BorderBrush="{ThemeResource HfCardBorderBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="6">
+                                                    <StackPanel Spacing="4">
+                                                        <TextBlock Text="{x:Bind Title, Mode=OneTime}"
+                                                                   TextWrapping="Wrap"
+                                                                   FontWeight="SemiBold" />
+                                                        <TextBlock Text="{x:Bind Detail, Mode=OneTime}"
+                                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                                   Opacity="0.8"
+                                                                   TextWrapping="Wrap" />
+                                                        <Button Content="{x:Bind ActionText, Mode=OneTime}"
+                                                                HorizontalAlignment="Left"
+                                                                Click="OnIssueActionClick" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <Button Content="Show more issues"
+                                            HorizontalAlignment="Left"
+                                            Command="{x:Bind ViewModel.LoadMoreIssuesCommand}"
+                                            Visibility="{Binding HasMoreIssues, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
                                     <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityItems, Mode=OneWay}">
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate x:DataType="vm:TrayActivityRow">
@@ -316,7 +382,7 @@
                                                 </Image.Source>
                                             </Image>
                                             <TextBlock Text="{x:Bind ViewModel.AllSyncedText, Mode=OneWay}"
-                                                       Style="{StaticResource SubtitleTextBlockStyle}"
+                                                       Style="{StaticResource TraySectionHeaderStyle}"
                                                        Foreground="{ThemeResource SystemFillColorSuccessBrush}"
                                                        HorizontalAlignment="Center"
                                                        TextAlignment="Center"
@@ -375,7 +441,7 @@
                     </Grid>
 
                     <!-- Provider capability gap for live activity (old provider). -->
-                    <StackPanel Grid.Row="3"
+                    <StackPanel Grid.Row="4"
                                 Spacing="8"
                                 Visibility="{Binding IsFeatureUnavailable, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
                         <TextBlock Style="{StaticResource TraySectionHeaderStyle}"
@@ -388,55 +454,8 @@
                 </Grid>
         </Grid>
 
-        <!-- ── Sticky issues: always above the footer, never lost in history ── -->
-        <Border Grid.Row="2"
-                Padding="16,8"
-                Background="{ThemeResource HfPageBackgroundBrush}"
-                BorderBrush="{ThemeResource HfCardBorderBrush}"
-                BorderThickness="0,1,0,0">
-            <StackPanel Spacing="8"
-                        AutomationProperties.AutomationId="TrayIssues"
-                        AutomationProperties.Name="Issues">
-                <TextBlock Style="{StaticResource TraySectionHeaderStyle}" Text="Issues" />
-                <TextBlock Text="{x:Bind ViewModel.IssuesStateText, Mode=OneWay}"
-                           Style="{StaticResource CaptionTextBlockStyle}"
-                           Opacity="0.8"
-                           TextWrapping="Wrap" />
-                <ScrollViewer MaxHeight="160"
-                              VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollMode="Disabled">
-                    <StackPanel Spacing="8">
-                        <ItemsControl ItemsSource="{x:Bind ViewModel.IssueItems, Mode=OneWay}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate x:DataType="vm:TrayIssueRow">
-                                    <Border Margin="0,4,0,0" Style="{StaticResource TrayCardBorderStyle}">
-                                        <StackPanel Spacing="6">
-                                            <TextBlock Text="{x:Bind Title, Mode=OneTime}"
-                                                       TextWrapping="Wrap"
-                                                       FontWeight="SemiBold" />
-                                            <TextBlock Text="{x:Bind Detail, Mode=OneTime}"
-                                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                                       Opacity="0.8"
-                                                       TextWrapping="Wrap" />
-                                            <Button Content="{x:Bind ActionText, Mode=OneTime}"
-                                                    HorizontalAlignment="Left"
-                                                    Click="OnIssueActionClick" />
-                                        </StackPanel>
-                                    </Border>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
-                        <Button Content="Show more issues"
-                                HorizontalAlignment="Left"
-                                Command="{x:Bind ViewModel.LoadMoreIssuesCommand}"
-                                Visibility="{Binding HasMoreIssues, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                    </StackPanel>
-                </ScrollViewer>
-            </StackPanel>
-        </Border>
-
         <!-- ── Footer: equal three-column actions + spanning status row ─── -->
-        <Grid Grid.Row="3"
+        <Grid Grid.Row="2"
               Padding="16,12"
               BorderBrush="{ThemeResource HfCardBorderBrush}"
               BorderThickness="0,1,0,0">

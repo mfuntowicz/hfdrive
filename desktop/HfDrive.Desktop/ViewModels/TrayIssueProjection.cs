@@ -175,9 +175,20 @@ public sealed class TrayRequestErrorLog
     }
 }
 
+/// <summary>Destination for an actionable issue in the tray.</summary>
+public enum TrayIssueKind
+{
+    /// <summary>Service, authorization, storage or connection-wide failure; shown in the top banner.</summary>
+    Connection,
+    /// <summary>Conflict or failed file/folder transfer; shown inside Syncing now.</summary>
+    File,
+}
+
 /// <summary>One friendly, actionable issue row (conflict, connection problem or failed transfer).</summary>
 public sealed class TrayIssueRow
 {
+    public required TrayIssueKind Kind { get; init; }
+
     public required string Title { get; init; }
 
     public required string Detail { get; init; }
@@ -284,6 +295,7 @@ public static class TrayIssueProjection
             {
                 (rows ??= new()).Add(new TrayIssueRow
                 {
+                    Kind = status.State == ConnectionState.Conflict ? TrayIssueKind.File : TrayIssueKind.Connection,
                     Title = $"{title}: {StatusDisplayText.Get(status.State)}",
                     Detail = IssueTextFor(status),
                     // A configured drive never routes into the setup (Add
@@ -309,6 +321,7 @@ public static class TrayIssueProjection
             {
                 (rows ??= new()).Add(new TrayIssueRow
                 {
+                    Kind = TrayIssueKind.Connection,
                     Title = $"{title}: {ErrorTitle(error.Code)}",
                     Detail = ErrorDetail(error, fromConnection, kinds),
                     ActionText = error.Code switch
@@ -340,6 +353,7 @@ public static class TrayIssueProjection
             string name = conflict.OriginalNames.FirstOrDefault() ?? conflict.ItemId.ToString();
             (rows ??= new()).Add(new TrayIssueRow
             {
+                Kind = TrayIssueKind.File,
                 Title = $"Conflict: \"{name}\"",
                 Detail = ConflictText(conflict, name),
                 ActionText = "Resolve",
@@ -362,6 +376,7 @@ public static class TrayIssueProjection
             if (!(seenTransfers ??= new()).Add((activity.ConnectionId, activity.ItemName, detail))) continue;
             (rows ??= new()).Add(new TrayIssueRow
             {
+                Kind = TrayIssueKind.File,
                 Title = $"Couldn't sync \"{activity.ItemName}\"",
                 Detail = detail,
                 ActionText = "Manage",
@@ -373,14 +388,6 @@ public static class TrayIssueProjection
         if (rows is null) return Array.Empty<TrayIssueRow>();
         return rows;
     }
-
-    /// <summary>Issue-count summary shown above the rows.</summary>
-    public static string IssuesStateText(int issueCount) => issueCount switch
-    {
-        0 => "No sync issues.",
-        1 => "1 issue needs attention.",
-        _ => $"{issueCount} issues need attention.",
-    };
 
     /// <summary>
     /// True when the selected connection cannot sync right now: its state is
@@ -423,18 +430,18 @@ public static class TrayIssueProjection
         bool syncBlocked)
     {
         if (!featureAvailable) return "Live activity is unavailable from this provider.";
-        if (requestFailed) return "Couldn't load current sync activity — see Issues below.";
+        if (requestFailed) return "Couldn't load current sync activity — see the banner above.";
         if (!responseAccepted) return "Loading current work…";
         if (activityCount == 0)
         {
             return syncBlocked
-                ? "Nothing is transferring right now because syncing is blocked. See Issues below."
+                ? "Nothing is transferring right now because syncing is blocked."
                 : "Nothing is syncing right now.";
         }
         if (activeCount == 0)
         {
             return syncBlocked
-                ? "No files or folders are transferring because syncing is blocked. See Issues below."
+                ? "No files or folders are transferring because syncing is blocked."
                 : "No files or folders are transferring.";
         }
         return activeCount == 1 ? "1 file or folder is transferring." : $"{activeCount} files and folders are transferring.";
@@ -443,7 +450,7 @@ public static class TrayIssueProjection
     /// <summary>Truthful committed-history section text for the current selection.</summary>
     public static string HistoryStateText(int historyCount, bool responseAccepted, bool requestFailed)
     {
-        if (requestFailed) return "Couldn't load recent activity — see Issues below.";
+        if (requestFailed) return "Couldn't load recent activity — see the banner above.";
         if (!responseAccepted) return "Loading committed history…";
         return historyCount == 0
             ? "No committed changes yet."
