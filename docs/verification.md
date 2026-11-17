@@ -1013,3 +1013,27 @@ verification.
   folder or volume is unavailable; restore it to resume synchronization.”
   Evidence: `artifacts/acceptance/missing-root-status.json`. No root was
   recreated, moved, registered, or deleted during verification.
+
+## Missing-root connection removal — 2026-11-18
+
+- **passed** — each Connections card now has a **Remove connection** action
+  that opens Advanced with the exact connection UUID prefilled. The isolated
+  Debug desktop build compiled and the action was exercised through native UI
+  Automation. Release builds still refuse unpackaged IPC; no policy was
+  weakened.
+- **passed** — offline unlink uses durable connection records instead of
+  requiring a runtime. Dirty files, unresolved conflicts and pending local
+  work still block removal. Retained snapshots are copied to the recovery
+  area with coherent hash verification before unregistration; they are not
+  silently discarded. `ERROR_ELEMENT_NOT_FOUND` (1168) is treated as an
+  already-absent registration, and the offline path does not query a deleted
+  registration again after `Unregister`.
+- **passed** — the actual connection was removed through the provider:
+  `unregistered=true`, `retained-for-recovery=false`, and zero connections
+  remain. Four verified recovery copies totaling 9,473,775 bytes were
+  preserved. Evidence: `artifacts/acceptance/remove-connection-ui.json`.
+- **passed** — final suites: 255 provider unit, 6 session, 16 durability,
+  122 Windows unit plus all Windows integration suites, and 183 managed
+  protocol/view-model tests. Evidence:
+  `artifacts/tests/missing-root-final-suites.log` and
+  `artifacts/tests/remove-connection-managed.log`.

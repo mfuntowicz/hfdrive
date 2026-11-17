@@ -168,10 +168,25 @@ pub fn unregister_sync_root(user_sid: &str, connection: ConnectionId) -> CfResul
     let id = sync_root_id(user_sid, connection)?;
     match crate::ffi::syncroot::unregister(&id) {
         Ok(()) => Ok(()),
-        // 2 = ERROR_FILE_NOT_FOUND: already unregistered.
-        Err(2) => Ok(()),
+        // 2 = ERROR_FILE_NOT_FOUND; 1168 = ERROR_ELEMENT_NOT_FOUND.
+        // Both prove the registration is already absent during teardown.
+        Err(2) | Err(1168) => Ok(()),
         Err(code) => Err(CfError::Win32 {
             operation: "StorageProviderSyncRootManager.Unregister",
+            code,
+        }),
+    }
+}
+
+/// Checks one registration by stable ID without resolving its folder object.
+/// A deleted folder therefore cannot crash or block teardown verification.
+pub fn sync_root_registered(user_sid: &str, connection: ConnectionId) -> CfResult<bool> {
+    let id = sync_root_id(user_sid, connection)?;
+    match crate::ffi::syncroot::sync_root_info_for_id(&id) {
+        Ok(_) => Ok(true),
+        Err(2) | Err(1168) => Ok(false),
+        Err(code) => Err(CfError::Win32 {
+            operation: "StorageProviderSyncRootManager.GetSyncRootInformationForId",
             code,
         }),
     }

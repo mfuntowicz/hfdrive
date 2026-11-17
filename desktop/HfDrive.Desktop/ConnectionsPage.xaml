@@ -93,6 +93,11 @@
                                                Style="{StaticResource HfSettingsDescriptionStyle}"
                                                FontSize="12"
                                                TextWrapping="Wrap" />
+
+                                    <Button Content="Remove connection"
+                                            Click="OnRemoveConnectionClick"
+                                            HorizontalAlignment="Left"
+                                            AutomationProperties.Name="Remove connection" />
                                 </StackPanel>
                             </Border>
                         </DataTemplate>

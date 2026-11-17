@@ -16,7 +16,9 @@
 //! * **unlink** hydrates or durably exports every required placeholder and
 //!   dirty snapshot, converts and unregisters only after preservation is
 //!   proven, blocks unsafe removal, and offers the explicit
-//!   disconnect-keep-registration alternative.
+//!   disconnect-keep-registration alternative. A confirmed missing root needs
+//!   no runtime: only a connection without durable work may be unregistered;
+//!   otherwise its binding and recovery references remain intact.
 //!
 //! Startup recovery boundary: every connect classifies interrupted journaled
 //! local actions **before** the connection runs. A recovery error is never
@@ -1128,16 +1130,57 @@ impl<R: RemoteOps> SyncEngine<R> {
     /// for the same connection state; only [`UnlinkMode::RemoveUnavailable`]
     /// ever deletes them, and then only entries that are still clean,
     /// zero-residency and conflict-free at execution time.
+    /// A persisted connection without a runtime is eligible only when its
+    /// root is confirmed absent (`NotFound`). Its preview uses durable work
+    /// evidence, not a fabricated local scan or placeholder identity set.
     pub async fn prepare_unlink(
         &self,
         connection_id: ConnectionId,
         mode: UnlinkMode,
     ) -> Result<UnlinkPlan, EngineError> {
         let running = self.running.lock().await;
-        let entry = running.get(&connection_id).ok_or(EngineError::UnknownConnection)?;
-        let account = self.state.open_account(entry.runtime.account_key()).await?;
-        let workspace = entry.runtime.workspace_id();
-        let root = entry.runtime.root().to_path_buf();
+        let (plan, _) = self
+            .prepare_unlink_locked(connection_id, mode, running.get(&connection_id))
+            .await?;
+        Ok(plan)
+    }
+
+    /// The registry lock keeps a runtime from being attached between the
+    /// missing-root preview and removal. The optional record identifies the
+    /// offline path without constructing a runtime or changing the root.
+    async fn prepare_unlink_locked(
+        &self,
+        connection_id: ConnectionId,
+        mode: UnlinkMode,
+        entry: Option<&Registered<R>>,
+    ) -> Result<(UnlinkPlan, Option<hfdrive_state::ConnectionRecord>), EngineError> {
+        let offline = if entry.is_none() {
+            Some(self.state.reconcile_connections().await?
+                .into_iter()
+                .find(|record| record.connection_id == connection_id)
+                .ok_or(EngineError::UnknownConnection)?)
+        } else {
+            None
+        };
+        let (account_key, workspace, root) = match entry {
+            Some(entry) => (
+                entry.runtime.account_key(),
+                entry.runtime.workspace_id(),
+                entry.runtime.root(),
+            ),
+            None => {
+                let record = offline.as_ref().expect("the offline connection was resolved");
+                if !matches!(std::fs::symlink_metadata(&record.root_path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(AdmissionError::LocalRoot(
+                        "the root is not confirmed absent; reconnect it before preparing removal".to_owned(),
+                    ).into());
+                }
+                (record.account_key, record.binding.workspace_id, record.root_path.as_path())
+            }
+        };
+        let account = self.state.open_account(account_key).await?;
         let mut plan = UnlinkPlan {
             connection_id,
             mode,
@@ -1153,6 +1196,37 @@ impl<R: RemoteOps> SyncEngine<R> {
             if matches!(snapshot.status, SnapshotStatus::Capturing | SnapshotStatus::Ready) {
                 plan.required_export_bytes += snapshot.size.unwrap_or(0);
             }
+        }
+
+        if let Some(record) = offline.as_ref() {
+            // Absence is not a successful enumeration and proves no file's
+            // residency. Do not invent abandon candidates or export missing
+            // bytes; even a zero-sized/unfinished capture keeps its references.
+            let recovery = hfdrive_state::StatePaths::new(self.config.state_dir.clone())
+                .account(record.account_key)
+                .recovery();
+            if plan.dirty_files > 0 {
+                plan.blockers.push(format!(
+                    "the local root is missing; {} unsynchronized files cannot be preserved to {}",
+                    plan.dirty_files,
+                    recovery.display(),
+                ));
+            }
+            if !account.list_active_outbox(connection_id, 1).await?.is_empty()
+                || !account.pending_local_actions(connection_id).await?.is_empty()
+            {
+                plan.blockers.push(
+                    "pending local work cannot be preserved while the local root is missing".to_owned(),
+                );
+            }
+            if plan.conflict_files == 0
+                && account.list_conflicts(connection_id).await?.iter().any(|conflict| {
+                    conflict.resolution_state == hfdrive_state::ConflictResolution::Unresolved
+                })
+            {
+                plan.blockers.push("unresolved conflicts must be resolved before removal".to_owned());
+            }
+            return Ok((plan, offline));
         }
 
         // Per-item local facts, collected first: the directory abandonment
@@ -1373,11 +1447,55 @@ impl<R: RemoteOps> SyncEngine<R> {
         plan.all_resident = plan.online_only_files == 0 && plan.partial_files == 0;
         // Known impossibility only: without a writable recovery area no dirty
         // content can be retained.
-        if !entry.runtime.recovery_area_ready() {
+        if !entry.expect("the live path has a runtime").runtime.recovery_area_ready() {
             plan.blockers
                 .push("the recovery area is unavailable; dirty content cannot be preserved".to_owned());
         }
-        Ok(plan)
+        Ok((plan, None))
+    }
+
+    /// Preserves every retained capture before an offline root is removed.
+    /// Copies are coherent and hash-verified against both the source and the
+    /// durable Ready metadata; a missing, changed or unreadable source blocks.
+    async fn preserve_missing_root_snapshots(
+        &self,
+        account: &hfdrive_state::AccountStore,
+        connection_id: ConnectionId,
+        account_key: hfdrive_core::ids::AccountKey,
+    ) -> Result<(), EngineError> {
+        let recovery = hfdrive_state::StatePaths::new(self.config.state_dir.clone())
+            .account(account_key)
+            .recovery();
+        for snapshot in account.list_snapshots(connection_id).await? {
+            if !matches!(snapshot.status, SnapshotStatus::Capturing | SnapshotStatus::Ready) {
+                continue;
+            }
+            let label = snapshot.snapshot_id.to_string();
+            let copy = crate::sync::recovery::preserve_dirty_copy(
+                &snapshot.path,
+                &recovery,
+                &label,
+                &snapshot.path.to_string_lossy(),
+            )
+            .map_err(|error| crate::sync::controller::UnlinkBlocked {
+                reason: "snapshot preservation failed",
+                files: vec![format!("{}: {error}", snapshot.path.to_string_lossy())],
+            })?;
+            if snapshot.status == SnapshotStatus::Ready {
+                let metadata_matches = snapshot.size == Some(copy.source.size)
+                    && snapshot.sha256.as_ref().is_some_and(|digest| {
+                        digest.as_bytes() == copy.source.sha256.as_slice()
+                    });
+                if !metadata_matches {
+                    return Err(crate::sync::controller::UnlinkBlocked {
+                        reason: "snapshot changed after its durable capture was recorded",
+                        files: vec![snapshot.path.to_string_lossy().into_owned()],
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Executes an unlink in one exact mode. The mode drives the safety
@@ -1395,9 +1513,10 @@ impl<R: RemoteOps> SyncEngine<R> {
     ///   stopped, and every deletion passes the HFDR-ownership,
     ///   identity/size/mtime and `resident_bytes == 0` guard.
     ///
-    /// Both removal modes end with a complete live residue scan, then
-    /// unregistration, a verified registration-absence check and
-    /// `remove_connection`. The plan must still be current: any change to
+    /// Both removal modes end with a complete live residue scan (or confirmed
+    /// root absence with no durable work), then unregistration, a verified
+    /// registration-absence check and `remove_connection`. The plan must still
+    /// be current: any change to
     /// counts, blockers or exact identities is [`EngineError::PreviewChanged`]
     /// and nothing is touched.
     pub async fn execute_unlink(
@@ -1406,12 +1525,45 @@ impl<R: RemoteOps> SyncEngine<R> {
         plan: &UnlinkPlan,
         mode: UnlinkMode,
     ) -> Result<UnlinkOutcome, EngineError> {
-        if mode != plan.mode || &self.prepare_unlink(connection_id, mode).await? != plan {
+        self.execute_unlink_with_registration(
+            connection_id,
+            plan,
+            mode,
+            || registry::unregister_connection(&self.config.user_sid, connection_id),
+            || registry::registration_present(&self.config.user_sid, connection_id),
+        ).await
+    }
+
+    /// Keep the OS registration boundary injectable for deterministic tests;
+    /// every preview, safety gate and durable state transition is shared.
+    async fn execute_unlink_with_registration(
+        &self,
+        connection_id: ConnectionId,
+        plan: &UnlinkPlan,
+        mode: UnlinkMode,
+        unregister: impl FnOnce() -> Result<(), AdmissionError>,
+        registration_present: impl FnOnce() -> Result<bool, AdmissionError>,
+    ) -> Result<UnlinkOutcome, EngineError> {
+        if mode != plan.mode {
             return Err(EngineError::PreviewChanged);
         }
         let mut running = self.running.lock().await;
+        let (current, offline) = self
+            .prepare_unlink_locked(connection_id, mode, running.get(&connection_id))
+            .await
+            .map_err(|error| match error {
+                EngineError::Admission(AdmissionError::LocalRoot(_)) => EngineError::PreviewChanged,
+                other => other,
+            })?;
+        if &current != plan {
+            return Err(EngineError::PreviewChanged);
+        }
         if mode == UnlinkMode::DisconnectKeepRegistration {
-            let entry = running.remove(&connection_id).ok_or(EngineError::UnknownConnection)?;
+            let Some(entry) = running.remove(&connection_id) else {
+                // Already disconnected: the durable binding and registration
+                // are retained exactly as for the live-runtime alternative.
+                return Ok(UnlinkOutcome::DisconnectedKeptRegistration);
+            };
             drop(running);
             // Registration, state and references stay for explicit reconnect.
             // Online-only bytes cannot open while disconnected.
@@ -1458,6 +1610,35 @@ impl<R: RemoteOps> SyncEngine<R> {
                     files: reasons,
                 }));
             }
+        }
+        let mut unregister = Some(unregister);
+        let unregister_checked = || -> Result<(), EngineError> {
+            unregister.take().expect("unregistration runs once")()?;
+            let present = registration_present()?;
+            if present {
+                return Err(EngineError::UnlinkBlocked(crate::sync::controller::UnlinkBlocked::new(
+                    "the Windows registration is still present after unregistration; durable state is retained for recovery",
+                )));
+            }
+            Ok(())
+        };
+        if let Some(record) = offline {
+            let account = self.state.open_account(record.account_key).await?;
+            // No runtime means there are no callbacks or observers to drain.
+            // Reconfirm absence after the durable reads, without creating,
+            // moving, converting or deleting any local entry.
+            if !matches!(std::fs::symlink_metadata(&record.root_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(EngineError::PreviewChanged);
+            }
+            self.preserve_missing_root_snapshots(&account, connection_id, record.account_key).await?;
+            // `Unregister` is itself the authoritative absence transition;
+            // querying the deleted folder's registration again can crash in
+            // Windows, so the offline path never performs a second lookup.
+            unregister.take().expect("unregistration runs once")()?;
+            account.remove_connection(connection_id).await?;
+            return Ok(UnlinkOutcome::Unlinked);
         }
         let runtime = running
             .get(&connection_id)
@@ -1506,22 +1687,9 @@ impl<R: RemoteOps> SyncEngine<R> {
         drop(running);
         match Self::stop_entry(entry).await {
             Ok(entry) => {
-                if let Err(error) = registry::unregister_connection(&self.config.user_sid, connection_id) {
+                if let Err(error) = unregister_checked() {
                     self.running.lock().await.insert(connection_id, entry);
-                    return Err(error.into());
-                }
-                // Registration absence is proven before durable state drops.
-                let expected =
-                    hfdrive_windows::cfapi::registration::sync_root_id(&self.config.user_sid, connection_id)
-                        .map_err(|_| registry::AdmissionError::Registration)?;
-                let still_registered = registry::registered_roots()?
-                    .iter()
-                    .any(|root| root.id == expected);
-                if still_registered {
-                    self.running.lock().await.insert(connection_id, entry);
-                    return Err(EngineError::UnlinkBlocked(crate::sync::controller::UnlinkBlocked::new(
-                        "the Windows registration is still present after unregistration; durable state is retained for recovery",
-                    )));
+                    return Err(error);
                 }
                 let account = self.state.open_account(entry.runtime.account_key()).await?;
                 account.remove_connection(connection_id).await?;
@@ -1894,6 +2062,313 @@ mod tests {
             .expect("test preview");
         state.finalize_setup(setup.setup_id).await.expect("test registration");
         setup.connection_id
+    }
+
+    // ---- missing-root unlink over real durable state --------------------
+
+    struct MissingRootFixture {
+        directory: tempfile::TempDir,
+        root: PathBuf,
+        account: AccountStore,
+        engine: SyncEngine<crate::sync::test_support::HeadOnlyRemote>,
+        connection: ConnectionId,
+        root_item: ItemId,
+    }
+
+    impl MissingRootFixture {
+        async fn open() -> Self {
+            let crate::sync::test_support::TestConnection {
+                directory, root, state, account, connection, root_item, ..
+            } = crate::sync::test_support::connection_fixture().await;
+            // Only fixture setup removes this empty directory. Neither the
+            // preview nor execution may recreate or otherwise touch the root.
+            std::fs::remove_dir(&root).unwrap();
+            let engine = SyncEngine::new(
+                EngineConfig {
+                    state_dir: directory.path().join("state"),
+                    user_sid: "S-1-5-21-missing-root-fixture".to_owned(),
+                    device_id: DeviceId::new(),
+                    version: "test".to_owned(),
+                },
+                Arc::new(state),
+                Arc::new(Scheduler::new(Default::default())),
+                CancellationToken::new(),
+            );
+            Self { directory, root, account, engine, connection, root_item }
+        }
+
+        async fn file(&self) -> ItemId {
+            let item = ItemId::new();
+            self.account.upsert_item(hfdrive_state::ItemRecord {
+                connection_id: self.connection,
+                item_id: item,
+                parent_id: Some(self.root_item),
+                name: "missing.bin".to_owned(),
+                name_key: "missing.bin".to_owned(),
+                kind: hfdrive_state::ItemKind::File,
+                revision: OperationId::new(),
+                content_version_id: Some(hfdrive_core::ids::VersionId::new()),
+                deleted: false,
+                metadata_json: serde_json::json!({}),
+            }).await.unwrap();
+            item
+        }
+
+        async fn snapshot(&self, ready: bool, bytes: &[u8]) -> hfdrive_state::SnapshotRecord {
+            let snapshot_id = hfdrive_core::ids::SnapshotId::new();
+            let path = self.directory.path().join("pending.snapshot");
+            std::fs::write(&path, bytes).unwrap();
+            let snapshot = self.account.begin_snapshot(self.connection, snapshot_id, path).await.unwrap();
+            if ready {
+                self.account.complete_snapshot(
+                    self.connection,
+                    snapshot_id,
+                    bytes.len() as u64,
+                    hfdrive_core::storage::Sha256Digest::of(bytes),
+                ).await.unwrap()
+            } else {
+                snapshot
+            }
+        }
+
+        async fn assert_retained(&self) {
+            assert!(self.account.get_connection(self.connection).await.unwrap().is_some());
+            assert!(self.engine.state.reconcile_connections().await.unwrap().iter()
+                .any(|record| record.connection_id == self.connection));
+            assert!(self.engine.running.lock().await.is_empty(), "no runtime is fabricated");
+            assert_eq!(
+                std::fs::symlink_metadata(&self.root).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound,
+                "the missing root stays untouched",
+            );
+        }
+
+        async fn close(self) {
+            Arc::try_unwrap(self.engine.state).ok().expect("only the engine owns state")
+                .close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_root_safe_remove_unlinks_clean_connection() {
+        let fixture = MissingRootFixture::open().await;
+        fixture.file().await;
+        let recovery = StatePaths::new(fixture.engine.config.state_dir.clone())
+            .account(fixture.account.account_key()).recovery();
+        std::fs::create_dir_all(&recovery).unwrap();
+        let recovered = recovery.join("retained.recovered");
+        std::fs::write(&recovered, b"already recovered").unwrap();
+        let scan = fixture.account.scan_state(fixture.connection).await.unwrap();
+        let plan = fixture.engine.prepare_unlink(fixture.connection, UnlinkMode::SafeRemove).await.unwrap();
+        assert!(plan.blockers.is_empty());
+        assert!(plan.abandon.is_empty(), "missing catalog entries are not abandonment candidates");
+        assert!(!plan.all_resident, "absence does not prove residency or a complete scan");
+        assert_eq!((plan.online_only_files, plan.partial_files, plan.dirty_files, plan.conflict_files), (0, 0, 0, 0));
+        assert_eq!(plan.required_export_bytes, 0);
+        assert_eq!(fixture.account.scan_state(fixture.connection).await.unwrap(), scan);
+
+        let registered = std::cell::Cell::new(true);
+        let phases = std::cell::RefCell::new(Vec::new());
+        let outcome = fixture.engine.execute_unlink_with_registration(
+            fixture.connection, &plan, UnlinkMode::SafeRemove,
+            || {
+                phases.borrow_mut().push("unregister");
+                registered.set(false);
+                Ok(())
+            },
+            || panic!("offline removal must not query the deleted registration again"),
+        ).await.unwrap();
+        assert_eq!(outcome, UnlinkOutcome::Unlinked);
+        assert_eq!(*phases.borrow(), ["unregister"]);
+        assert!(!registered.get());
+        assert!(fixture.account.get_connection(fixture.connection).await.unwrap().is_none());
+        assert!(!fixture.engine.state.reconcile_connections().await.unwrap().iter()
+            .any(|record| record.connection_id == fixture.connection), "reconciliation never resurrects the row");
+        assert!(fixture.engine.running.lock().await.is_empty());
+        assert_eq!(std::fs::symlink_metadata(&fixture.root).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&recovered).unwrap(), b"already recovered");
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_root_removal_blocks_dirty_files() {
+        let fixture = MissingRootFixture::open().await;
+        let item = fixture.file().await;
+        fixture.account.bump_observation(fixture.connection, item, None).await.unwrap();
+        let recovery = StatePaths::new(fixture.engine.config.state_dir.clone())
+            .account(fixture.account.account_key()).recovery();
+        for mode in [UnlinkMode::SafeRemove, UnlinkMode::RemoveUnavailable] {
+            let plan = fixture.engine.prepare_unlink(fixture.connection, mode).await.unwrap();
+            assert_eq!(plan.dirty_files, 1);
+            assert!(plan.abandon.is_empty());
+            assert!(!plan.all_resident);
+            assert!(plan.blockers.iter().any(|reason| reason.contains(&recovery.display().to_string())));
+            let result = fixture.engine.execute_unlink_with_registration(
+                fixture.connection, &plan, mode,
+                || panic!("dirty work must block before unregistration"),
+                || panic!("dirty work must block before registration lookup"),
+            ).await;
+            assert!(matches!(result, Err(EngineError::UnlinkBlocked(_))));
+            assert!(fixture.account.observation(fixture.connection, item).await.unwrap().unwrap().dirty);
+            fixture.assert_retained().await;
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_root_preserves_pending_snapshots_before_removal() {
+        for (ready, bytes) in [
+            (false, b"unfinished capture".as_slice()),
+            (true, b"durable snapshot".as_slice()),
+            (true, b"".as_slice()),
+        ] {
+            for mode in [UnlinkMode::SafeRemove, UnlinkMode::RemoveUnavailable] {
+                let fixture = MissingRootFixture::open().await;
+                let snapshot = fixture.snapshot(ready, bytes).await;
+                let plan = fixture.engine.prepare_unlink(fixture.connection, mode).await.unwrap();
+                assert_eq!(plan.dirty_files, 0);
+                assert_eq!(plan.required_export_bytes, snapshot.size.unwrap_or(0));
+                assert!(plan.blockers.is_empty());
+                assert!(plan.abandon.is_empty());
+                let outcome = fixture.engine.execute_unlink_with_registration(
+                    fixture.connection, &plan, mode, || Ok(()), || Ok(false),
+                ).await.unwrap();
+                assert_eq!(outcome, UnlinkOutcome::Unlinked);
+                assert_eq!(std::fs::read(&snapshot.path).unwrap(), bytes);
+                let recovery = StatePaths::new(fixture.engine.config.state_dir.clone())
+                    .account(fixture.account.account_key()).recovery();
+                let copies = std::fs::read_dir(&recovery).unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "recovered"))
+                    .collect::<Vec<_>>();
+                assert_eq!(copies.len(), 1);
+                assert_eq!(std::fs::read(&copies[0]).unwrap(), bytes);
+                let sidecar = std::fs::read_dir(&recovery).unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+                    .collect::<Vec<_>>();
+                assert_eq!(sidecar.len(), 1);
+                let record: crate::sync::recovery::RecoverySource =
+                    serde_json::from_slice(&std::fs::read(&sidecar[0]).unwrap()).unwrap();
+                assert_eq!(record.size, bytes.len() as u64);
+                let expected: [u8; 32] = sha2::Sha256::digest(bytes).into();
+                assert_eq!(record.sha256, expected);
+                fixture.close().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_root_removal_blocks_unresolved_conflicts() {
+        let fixture = MissingRootFixture::open().await;
+        let item = fixture.file().await;
+        let conflict = fixture.account.record_conflict(hfdrive_state::ConflictRecord {
+            connection_id: fixture.connection,
+            conflict_id: hfdrive_core::ids::ConflictId::new(),
+            item_id: item,
+            competing_ops: vec![OperationId::new(), OperationId::new()],
+            revisions_json: serde_json::json!({}),
+            original_names: vec!["missing.bin".to_owned()],
+            resolution_state: hfdrive_state::ConflictResolution::Unresolved,
+            detected_at_ms: None,
+        }).await.unwrap();
+        for mode in [UnlinkMode::SafeRemove, UnlinkMode::RemoveUnavailable] {
+            let plan = fixture.engine.prepare_unlink(fixture.connection, mode).await.unwrap();
+            assert_eq!(plan.conflict_files, 1);
+            assert!(!plan.blockers.is_empty());
+            let result = fixture.engine.execute_unlink_with_registration(
+                fixture.connection, &plan, mode,
+                || panic!("conflicts must retain registration"),
+                || panic!("blocked removal must not inspect registration"),
+            ).await;
+            assert!(matches!(result, Err(EngineError::UnlinkBlocked(_))));
+            assert_eq!(fixture.account.conflict(fixture.connection, conflict.conflict_id).await.unwrap(), Some(conflict.clone()));
+            fixture.assert_retained().await;
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_root_disconnect_keeps_registration_and_durable_work() {
+        let fixture = MissingRootFixture::open().await;
+        let item = fixture.file().await;
+        fixture.account.bump_observation(fixture.connection, item, None).await.unwrap();
+        let snapshot = fixture.snapshot(true, b"unsynchronized bytes").await;
+        let plan = fixture.engine.prepare_unlink(
+            fixture.connection, UnlinkMode::DisconnectKeepRegistration,
+        ).await.unwrap();
+        assert!(!plan.blockers.is_empty(), "disconnect is allowed even when removal is blocked");
+        let outcome = fixture.engine.execute_unlink_with_registration(
+            fixture.connection, &plan, UnlinkMode::DisconnectKeepRegistration,
+            || panic!("disconnect never unregisters"),
+            || panic!("disconnect needs no registration lookup"),
+        ).await.unwrap();
+        assert_eq!(outcome, UnlinkOutcome::DisconnectedKeptRegistration);
+        fixture.assert_retained().await;
+        assert!(fixture.account.observation(fixture.connection, item).await.unwrap().unwrap().dirty);
+        assert_eq!(fixture.account.snapshot(fixture.connection, snapshot.snapshot_id).await.unwrap(), Some(snapshot.clone()));
+        assert_eq!(std::fs::read(&snapshot.path).unwrap(), b"unsynchronized bytes");
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_root_unlink_retains_state_when_unregistration_fails() {
+        for unregister_fails in [true, false] {
+            let fixture = MissingRootFixture::open().await;
+            let plan = fixture.engine.prepare_unlink(fixture.connection, UnlinkMode::SafeRemove).await.unwrap();
+            let result = fixture.engine.execute_unlink_with_registration(
+                fixture.connection, &plan, UnlinkMode::SafeRemove,
+                || {
+                    if unregister_fails { Err(AdmissionError::Registration) } else { Ok(()) }
+                },
+                || panic!("offline removal must not query the deleted registration again"),
+            ).await;
+            if unregister_fails {
+                assert!(matches!(result, Err(EngineError::Admission(AdmissionError::Registration))));
+                fixture.assert_retained().await;
+            } else {
+                assert_eq!(result.unwrap(), UnlinkOutcome::Unlinked);
+                assert!(fixture.account.get_connection(fixture.connection).await.unwrap().is_none());
+            }
+            fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_root_unlink_rejects_changed_preview() {
+        let fixture = MissingRootFixture::open().await;
+        let plan = fixture.engine.prepare_unlink(fixture.connection, UnlinkMode::SafeRemove).await.unwrap();
+        let item = fixture.file().await;
+        fixture.account.bump_observation(fixture.connection, item, None).await.unwrap();
+        for mode in [UnlinkMode::SafeRemove, UnlinkMode::DisconnectKeepRegistration] {
+            let result = fixture.engine.execute_unlink_with_registration(
+                fixture.connection, &plan, mode,
+                || panic!("changed previews must not unregister"),
+                || panic!("changed previews must not inspect registration"),
+            ).await;
+            assert!(matches!(result, Err(EngineError::PreviewChanged)));
+            fixture.assert_retained().await;
+        }
+        // A root reappearing after review must not take the offline path.
+        std::fs::create_dir(&fixture.root).unwrap();
+        let local = fixture.root.join("returned.txt");
+        std::fs::write(&local, b"retain returned bytes").unwrap();
+        assert!(matches!(
+            fixture.engine.prepare_unlink(fixture.connection, UnlinkMode::SafeRemove).await,
+            Err(EngineError::Admission(AdmissionError::LocalRoot(_))),
+        ));
+        let result = fixture.engine.execute_unlink_with_registration(
+            fixture.connection, &plan, UnlinkMode::SafeRemove,
+            || panic!("a reappeared root requires a fresh preview"),
+            || panic!("a reappeared root must not inspect registration"),
+        ).await;
+        assert!(matches!(result, Err(EngineError::PreviewChanged)));
+        assert_eq!(std::fs::read(&local).unwrap(), b"retain returned bytes");
+        assert!(fixture.account.get_connection(fixture.connection).await.unwrap().is_some());
+        assert!(fixture.engine.running.lock().await.is_empty());
+        fixture.close().await;
     }
 
     /// A failed durable recording of one invalidation is reported truthfully

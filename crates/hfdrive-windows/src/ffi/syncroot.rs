@@ -274,6 +274,13 @@ pub(crate) fn current_roots() -> Result<Vec<RegisteredRoot>, u32> {
     Ok(out)
 }
 
+/// Queries one registration by stable ID without touching its folder object.
+pub(crate) fn sync_root_info_for_id(id: &str) -> Result<StorageProviderSyncRootInfo, u32> {
+    let _mta = MtaGuard::enter()?;
+    StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id))
+        .map_err(|e| super::error_code(&e))
+}
+
 fn info_path(info: &StorageProviderSyncRootInfo) -> Result<PathBuf, u32> {
     let folder = info.Path().map_err(|e| super::error_code(&e))?;
     let item: windows::Storage::IStorageItem = folder.cast().map_err(|e| super::error_code(&e))?;

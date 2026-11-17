@@ -1,4 +1,5 @@
 using HfDrive.Desktop.ViewModels;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Navigation;
 
@@ -15,6 +16,14 @@ public sealed partial class ConnectionsPage : Page
     }
 
     public MainViewModel ViewModel { get; private set; } = null!;
+
+    private void OnRemoveConnectionClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { DataContext: ConnectionViewModel connection })
+        {
+            ((App)Application.Current).OpenMainSection("operations", connection.Status.ConnectionId, null);
+        }
+    }
 
     protected override void OnNavigatedTo(NavigationEventArgs e)
     {

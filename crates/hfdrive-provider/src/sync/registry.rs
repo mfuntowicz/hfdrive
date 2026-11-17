@@ -170,6 +170,12 @@ pub fn unregister_connection(user_sid: &str, connection: ConnectionId) -> Result
         .map_err(|_| AdmissionError::Registration)
 }
 
+/// Checks one registration by stable ID without resolving a deleted folder.
+pub fn registration_present(user_sid: &str, connection: ConnectionId) -> Result<bool, AdmissionError> {
+    registration::sync_root_registered(user_sid, connection)
+        .map_err(|_| AdmissionError::Registration)
+}
+
 /// Every HF Drive root registered with Windows (any provider), used for
 /// overlap checks and restore reconciliation.
 pub fn registered_roots() -> Result<Vec<RegisteredRoot>, AdmissionError> {
