@@ -3,8 +3,19 @@
 //! Registration goes **only** through `StorageProviderSyncRootManager`;
 //! `CfRegisterSyncRoot` is never called by HF Drive. The WinRT/COM apartment
 //! is initialized per calling thread around each call (`CoInitializeEx` in
-//! MTA mode); the guard balances `CoUninitialize` and no apartment state
-//! leaks across calls.
+//! MTA mode). The apartment accounting is exact (K18):
+//!
+//! * `CoInitializeEx` is reference-counted: both `S_OK` and `S_FALSE` are
+//!   successful calls that increment the thread's COM reference count, so
+//!   **each** of them requires exactly one matching `CoUninitialize` when the
+//!   guard drops. Failed HRESULTs initialize nothing and never schedule
+//!   teardown.
+//! * Initialization errors (`RPC_E_CHANGED_MODE` and every other failure)
+//!   are **returned** and the call that needed COM does not proceed. WinRT
+//!   calls never run on an uninitialized or incompatible apartment here.
+//! * The result mapping is modeled as pure data ([`ComInit`]) so the
+//!   `S_OK`/`S_FALSE`/`RPC_E_CHANGED_MODE` contract is unit-testable
+//!   without touching COM.
 
 use std::path::{Path, PathBuf};
 
@@ -20,25 +31,121 @@ use windows::Storage::StorageFolder;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows_future::AsyncStatus;
 
-/// Process/MTA guard: balances `CoInitializeEx` with `CoUninitialize` on the
-/// calling thread.
-pub(crate) struct MtaGuard(bool);
+/// The COM apartment states one `CoInitializeEx(COINIT_MULTITHREADED)` call
+/// can produce. Pure data: the mapping from the raw HRESULT lives in
+/// [`ComInit::from_hresult`] and the guard's teardown scheduling in
+/// [`MtaGuard::from_state`], so both can be tested deterministically without
+/// COM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComInit {
+    /// `S_OK`: this call initialized the apartment and incremented the
+    /// thread's COM reference count. One matching `CoUninitialize` runs when
+    /// the guard drops.
+    Owned,
+    /// `S_FALSE`: the thread's apartment was already initialized in this
+    /// mode. Still a successful `CoInitializeEx` call — COM is
+    /// reference-counted, so this call also incremented the thread's
+    /// reference count and one matching `CoUninitialize` runs when the guard
+    /// drops. It is never treated as "not ours to undo".
+    AlreadyInitialized,
+    /// `RPC_E_CHANGED_MODE`: the thread is in a different apartment type.
+    /// Every other failure HRESULT maps here too. The COM-using call must
+    /// not proceed and the error is returned to its caller.
+    Failed { hresult: u32 },
+}
+
+impl ComInit {
+    /// Map one raw `CoInitializeEx` HRESULT (as `u32`) to the apartment
+    /// state. `S_OK` (0) and `S_FALSE` (1) are the successful results, each
+    /// of which schedules the matching `CoUninitialize`; every other HRESULT
+    /// is a failure that schedules nothing.
+    pub(crate) fn from_hresult(hresult: u32) -> Self {
+        match hresult {
+            0x0000_0000 => ComInit::Owned,               // S_OK
+            0x0000_0001 => ComInit::AlreadyInitialized,  // S_FALSE
+            code => ComInit::Failed { hresult: code },   // incl. RPC_E_CHANGED_MODE
+        }
+    }
+
+    /// True exactly for the successful results (`S_OK` and `S_FALSE`): both
+    /// increment the thread's COM reference count and each requires exactly
+    /// one `CoUninitialize` when the guard drops.
+    pub(crate) fn owns_uninitialize(self) -> bool {
+        matches!(self, ComInit::Owned | ComInit::AlreadyInitialized)
+    }
+
+    /// The error HRESULT to return, if any. `S_OK`/`S_FALSE` are successes.
+    pub(crate) fn error(self) -> Option<u32> {
+        match self {
+            ComInit::Failed { hresult } => Some(hresult),
+            _ => None,
+        }
+    }
+}
+
+/// Per-call apartment guard: when the call's `CoInitializeEx` returned
+/// `S_OK` **or** `S_FALSE`, the matching `CoUninitialize` runs on drop — both
+/// results increment the thread's COM reference count. A failed result never
+/// constructs a guard, so no teardown runs for a call that initialized
+/// nothing.
+#[derive(Debug)]
+pub(crate) struct MtaGuard {
+    /// Always `true` for a guard created from a successful (`S_OK` or
+    /// `S_FALSE`) `CoInitializeEx` call: exactly one `CoUninitialize` is
+    /// pending until the guard drops.
+    teardown: bool,
+}
 
 impl MtaGuard {
-    pub(crate) fn enter() -> Self {
-        // SAFETY: thread-local COM init/uninit are balanced by the guard.
-        let already = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
-        MtaGuard(!already)
+    /// Initialize MTA mode on this thread and map the result. Errors are
+    /// returned instead of being swallowed: a call that needs COM must not
+    /// proceed on an uninitialized/incompatible apartment (`RPC_E_CHANGED_MODE`
+    /// included).
+    pub(crate) fn enter() -> Result<Self, u32> {
+        Self::from_state(map_init_result(unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+        }))
+    }
+
+    /// Pure half of [`MtaGuard::enter`], testable without COM: a failed
+    /// HRESULT is returned unchanged, no guard exists and no teardown is ever
+    /// scheduled; both `S_OK` and `S_FALSE` build a guard that schedules
+    /// exactly one `CoUninitialize`.
+    fn from_state(state: ComInit) -> Result<Self, u32> {
+        match state.error() {
+            Some(code) => Err(code),
+            None => Ok(Self {
+                teardown: state.owns_uninitialize(),
+            }),
+        }
+    }
+
+    /// Consume this guard's pending teardown. Returns `true` exactly once for
+    /// a guard built from `S_OK`/`S_FALSE`; `Drop` uses this one-shot so tests
+    /// can drive the exact drop predicate without issuing a real COM call.
+    fn take_teardown(&mut self) -> bool {
+        std::mem::replace(&mut self.teardown, false)
     }
 }
 
 impl Drop for MtaGuard {
     fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: exactly one successful `CoInitializeEx` is undone.
+        if self.take_teardown() {
+            // SAFETY: exactly one successful (`S_OK` or `S_FALSE`)
+            // `CoInitializeEx` is undone here — each of those calls added one
+            // reference to the thread's COM count and this removes exactly
+            // that one. Failed results never construct a guard and so never
+            // reach this branch.
             unsafe { CoUninitialize() };
         }
     }
+}
+
+/// Map the raw COM initialization result into the modeled [`ComInit`]. The
+/// three documented outcomes are distinguished explicitly; every other
+/// failure stays an error and is returned, never interpreted as success.
+pub(crate) fn map_init_result(result: windows::core::HRESULT) -> ComInit {
+    ComInit::from_hresult(result.0 as u32)
 }
 
 /// Explorer display/icon resources for HF Drive sync roots.
@@ -103,7 +210,8 @@ fn map_policies(
 
 /// Register (or idempotently re-register) one sync root.
 pub(crate) fn register(request: &RegistrationRequest) -> Result<(), u32> {
-    let _mta = MtaGuard::enter();
+    // COM initialization failure is returned before any WinRT call runs.
+    let _mta = MtaGuard::enter()?;
     let (hydration, modifier, population, in_sync, hardlink) = map_policies(&request.policy);
     let info = StorageProviderSyncRootInfo::new().map_err(|e| super::error_code(&e))?;
     info.SetId(&HSTRING::from(request.id.as_str()))
@@ -137,7 +245,7 @@ pub(crate) fn register(request: &RegistrationRequest) -> Result<(), u32> {
 /// Unregister the sync root with `id`. Callers treat "not found" as an
 /// already-unregistered success.
 pub(crate) fn unregister(id: &str) -> Result<(), u32> {
-    let _mta = MtaGuard::enter();
+    let _mta = MtaGuard::enter()?;
     StorageProviderSyncRootManager::Unregister(&HSTRING::from(id))
         .map_err(|e| super::error_code(&e))
 }
@@ -150,7 +258,7 @@ pub(crate) struct RegisteredRoot {
 
 /// All sync roots registered with Windows (any provider).
 pub(crate) fn current_roots() -> Result<Vec<RegisteredRoot>, u32> {
-    let _mta = MtaGuard::enter();
+    let _mta = MtaGuard::enter()?;
     let roots =
         StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(|e| super::error_code(&e))?;
     let size = roots.Size().map_err(|e| super::error_code(&e))?;
@@ -203,5 +311,170 @@ fn resolve_folder(path: &Path) -> Result<StorageFolder, u32> {
             return Err(0x8007_05B4);
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `S_OK` maps to the first successful initialization: the call
+    /// incremented the thread's COM reference count, so one matching
+    /// `CoUninitialize` is scheduled for exactly this guard.
+    #[test]
+    fn s_ok_schedules_the_matching_uninitialize() {
+        let state = ComInit::from_hresult(0x0000_0000);
+        assert_eq!(state, ComInit::Owned);
+        assert!(
+            state.owns_uninitialize(),
+            "S_OK increments the COM refcount and schedules CoUninitialize"
+        );
+        assert_eq!(state.error(), None, "S_OK is not an error to return");
+    }
+
+    /// `S_FALSE` is still a successful, reference-counted `CoInitializeEx`
+    /// call (the apartment was already initialized in this mode): it also
+    /// incremented the thread's COM reference count and therefore schedules
+    /// the matching `CoUninitialize` — it is **not** "someone else's"
+    /// initialization to leave alone.
+    #[test]
+    fn s_false_schedules_the_matching_uninitialize() {
+        let state = ComInit::from_hresult(0x0000_0001);
+        assert_eq!(state, ComInit::AlreadyInitialized);
+        assert!(
+            state.owns_uninitialize(),
+            "S_FALSE is a successful refcounted CoInitializeEx and requires the matching CoUninitialize"
+        );
+        assert_eq!(state.error(), None, "S_FALSE is not an error to return");
+    }
+
+    /// `RPC_E_CHANGED_MODE` and every other failure HRESULT are returned as
+    /// errors and the COM-using call never proceeds on them.
+    #[test]
+    fn rpc_e_changed_mode_is_an_error_never_a_success() {
+        let rpc_e_changed_mode = 0x8001_0106;
+        let state = ComInit::from_hresult(rpc_e_changed_mode);
+        assert_eq!(
+            state,
+            ComInit::Failed {
+                hresult: rpc_e_changed_mode
+            }
+        );
+        assert!(!state.owns_uninitialize());
+        assert_eq!(state.error(), Some(rpc_e_changed_mode));
+
+        // Any other failure (e.g. E_OUTOFMEMORY) is likewise an error and
+        // never schedules teardown of an apartment the failed call never
+        // initialized.
+        let other = 0x8007_000E;
+        let state = ComInit::from_hresult(other);
+        assert_eq!(
+            state,
+            ComInit::Failed { hresult: other },
+            "no failure is ever interpreted as S_OK/S_FALSE"
+        );
+        assert!(!state.owns_uninitialize());
+        assert_eq!(state.error(), Some(other));
+    }
+
+    /// Exactly the two successful HRESULTs schedule `CoUninitialize` (`S_OK`
+    /// and `S_FALSE`); the success codes are distinct from the error codes in
+    /// the mapping, exhaustively over the three documented outcomes.
+    #[test]
+    fn only_success_codes_schedule_teardown() {
+        for hresult in [0x0000_0000u32, 0x0000_0001, 0x8001_0106, 0x8000_4005, 0x8007_000E] {
+            let state = ComInit::from_hresult(hresult);
+            let should_uninit = hresult == 0x0000_0000 || hresult == 0x0000_0001;
+            assert_eq!(
+                state.owns_uninitialize(),
+                should_uninit,
+                "both S_OK (0) and S_FALSE (1) schedule one CoUninitialize (hresult={hresult:#010x})"
+            );
+            let should_error = !should_uninit;
+            assert_eq!(
+                state.error().is_some(),
+                should_error,
+                "only S_OK/S_FALSE are successes (hresult={hresult:#010x})"
+            );
+        }
+    }
+
+    /// `map_init_result` preserves the HRESULT bits for errors (so callers
+    /// return the exact code, e.g. `RPC_E_CHANGED_MODE`), and models the two
+    /// success codes by value.
+    #[test]
+    fn mapping_preserves_exact_hresult_bits() {
+        let raw = windows::core::HRESULT(0x8001_0106u32 as i32);
+        assert_eq!(
+            map_init_result(raw),
+            ComInit::Failed {
+                hresult: 0x8001_0106
+            }
+        );
+        assert_eq!(
+            map_init_result(windows::core::HRESULT(0)),
+            ComInit::Owned
+        );
+        assert_eq!(
+            map_init_result(windows::core::HRESULT(1)),
+            ComInit::AlreadyInitialized
+        );
+    }
+
+    /// Every teardown path of the guard for successful results, driven
+    /// through the pure `from_state`/`take_teardown` seam without issuing a
+    /// COM call: `S_OK` and `S_FALSE` each build a guard whose scheduled
+    /// `CoUninitialize` fires exactly once — never twice, never zero times.
+    #[test]
+    fn guard_teardown_paths_success_is_one_shot_per_call() {
+        for hresult in [0x0000_0000u32, 0x0000_0001] {
+            let state = ComInit::from_hresult(hresult);
+            let mut guard = MtaGuard::from_state(state).unwrap_or_else(|code| {
+                panic!("success {hresult:#010x} must build a guard, got error {code:#010x}")
+            });
+            assert!(
+                guard.take_teardown(),
+                "successful {hresult:#010x} schedules exactly one teardown"
+            );
+            assert!(
+                !guard.take_teardown(),
+                "the scheduled teardown is one-shot for {hresult:#010x}"
+            );
+            // Dropping after the one-shot was consumed performs no second
+            // teardown: Drop's only COM call is gated by `take_teardown`.
+            drop(guard);
+        }
+    }
+
+    /// The failed-HRESULT teardown path: `RPC_E_CHANGED_MODE` and every other
+    /// failure return the exact HRESULT and build no guard at all, so no
+    /// teardown can ever be scheduled or run.
+    #[test]
+    fn guard_teardown_paths_failures_schedule_nothing() {
+        for hresult in [0x8001_0106u32, 0x8000_4005, 0x8007_000E] {
+            let state = ComInit::from_hresult(hresult);
+            match MtaGuard::from_state(state) {
+                Ok(_) => panic!(
+                    "failed HRESULT {hresult:#010x} must not build a guard (no teardown may be scheduled)"
+                ),
+                Err(code) => assert_eq!(code, hresult, "the exact HRESULT is returned unchanged"),
+            }
+        }
+    }
+
+    /// The full raw-HRESULT-to-guard pipeline preserves the exact HRESULT
+    /// bits end-to-end (`map_init_result` -> `MtaGuard::from_state`), and
+    /// `RPC_E_CHANGED_MODE` stops before any COM-using call.
+    #[test]
+    fn enter_pipeline_preserves_exact_hresult_bits() {
+        let raw = windows::core::HRESULT(0x8001_0106u32 as i32);
+        let err = MtaGuard::from_state(map_init_result(raw))
+            .expect_err("RPC_E_CHANGED_MODE must stop before any COM call");
+        assert_eq!(err, 0x8001_0106, "the raw HRESULT bits are preserved exactly");
+
+        let raw = windows::core::HRESULT(0x8007_000Eu32 as i32);
+        let err = MtaGuard::from_state(map_init_result(raw))
+            .expect_err("a failed HRESULT must stop before any COM call");
+        assert_eq!(err, 0x8007_000E, "the raw HRESULT bits are preserved exactly");
     }
 }
