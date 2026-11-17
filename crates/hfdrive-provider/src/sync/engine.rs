@@ -1062,7 +1062,23 @@ impl<R: RemoteOps> SyncEngine<R> {
                 object,
                 modified_at: record.display.modified_at,
             }
+        } else if matches!(item.kind, hfdrive_state::ItemKind::Directory) && !item.deleted {
+            // The selected side claims a live directory and carries no content
+            // binding (directories never do): the resolution re-binds the
+            // directory to that side's parent/name. Its subtree moves with it
+            // by stable item identity, so no delete tombstone is ever emitted
+            // for a directory the user chose to keep.
+            let parent_id = side.parent_id.ok_or(EngineError::InvalidResolution)?;
+            hfdrive_core::names::validate_name(&side.name)
+                .map_err(|_| EngineError::InvalidResolution)?;
+            crate::sync::outbox::SyncIntent::Move {
+                item_id: *conflict.item_id.as_uuid(),
+                parent_id: *parent_id.as_uuid(),
+                name: side.name,
+            }
         } else {
+            // A deleted side (or a content-less non-directory claim) resolves
+            // to the item's removal.
             crate::sync::outbox::SyncIntent::Delete { item_id: *conflict.item_id.as_uuid() }
         };
         let observation = account.bump_observation(connection_id, conflict.item_id, None).await?;
@@ -2372,5 +2388,402 @@ mod tests {
                 "the entry vanished and the reviewed plan is no longer current; prepare a fresh preview"
             )
         );
+    }
+
+    // ---- conflict resolution: directory rename conflicts ----------------
+
+    /// One writable connection with a live (paused) runtime registered in a
+    /// real [`SyncEngine`], so `resolve_conflict` runs its production path:
+    /// durable conflict evidence, side selection by durable outbox presence,
+    /// and a durable resolution intent.
+    struct ConflictFixture {
+        directory: tempfile::TempDir,
+        account: AccountStore,
+        engine: SyncEngine<crate::sync::test_support::HeadOnlyRemote>,
+        runtime: Arc<ConnectionRuntime<crate::sync::test_support::HeadOnlyRemote>>,
+        cancel: CancellationToken,
+        connection: ConnectionId,
+        root_item: ItemId,
+    }
+
+    impl ConflictFixture {
+        async fn open() -> Self {
+            let fixture = crate::sync::test_support::connection_fixture().await;
+            let crate::sync::test_support::TestConnection {
+                directory,
+                root,
+                state,
+                account,
+                connection,
+                workspace,
+                root_item,
+            } = fixture;
+            let cancel = CancellationToken::new();
+            let (_notifications, receiver) = tokio::sync::mpsc::channel(1);
+            let runtime = ConnectionRuntime::start(
+                ConnectionConfig {
+                    connection_id: connection,
+                    workspace,
+                    root_item_id: root_item,
+                    device_id: DeviceId::new(),
+                    root: root.clone(),
+                    staging_dir: directory.path().join("snapshots"),
+                    recovery_dir: directory.path().join("recovery"),
+                    mode: hfdrive_state::ConnectionMode::Writable,
+                    start_paused: true,
+                },
+                account.clone(),
+                crate::sync::test_support::HeadOnlyRemote::default(),
+                Arc::new(Scheduler::new(Default::default())),
+                Arc::new(crate::sync::activity::ActivityRegistry::new()),
+                cancel.clone(),
+                receiver,
+            );
+            let engine = SyncEngine::new(
+                EngineConfig {
+                    state_dir: directory.path().join("state-root"),
+                    user_sid: "S-1-5-21-conflict-fixture".to_owned(),
+                    device_id: DeviceId::new(),
+                    version: "test".to_owned(),
+                },
+                Arc::new(state),
+                Arc::new(Scheduler::new(Default::default())),
+                cancel.clone(),
+            );
+            engine.running.lock().await.insert(
+                connection,
+                Registered {
+                    runtime: runtime.clone(),
+                    cancel: cancel.clone(),
+                    watch_task: None,
+                },
+            );
+            Self {
+                directory,
+                account,
+                engine,
+                runtime,
+                cancel,
+                connection,
+                root_item,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.cancel.cancel();
+            self.runtime.disconnect().await.expect("fixture runtime disconnects");
+            drop(self.directory);
+        }
+    }
+
+    /// Seeds a live directory with one live child file: the contested item
+    /// and the descendants that must survive a directory conflict resolution.
+    async fn seed_directory_tree(
+        account: &AccountStore,
+        connection: ConnectionId,
+        parent: ItemId,
+    ) -> (ItemId, ItemId) {
+        let directory = ItemId::new();
+        let child = ItemId::new();
+        account
+            .upsert_item(hfdrive_state::ItemRecord {
+                connection_id: connection,
+                item_id: directory,
+                parent_id: Some(parent),
+                name: "docs".to_owned(),
+                name_key: "docs".to_owned(),
+                kind: hfdrive_state::ItemKind::Directory,
+                revision: OperationId::new(),
+                content_version_id: None,
+                deleted: false,
+                metadata_json: serde_json::json!({}),
+            })
+            .await
+            .expect("directory item");
+        account
+            .upsert_item(hfdrive_state::ItemRecord {
+                connection_id: connection,
+                item_id: child,
+                parent_id: Some(directory),
+                name: "note.txt".to_owned(),
+                name_key: "note.txt".to_owned(),
+                kind: hfdrive_state::ItemKind::File,
+                revision: OperationId::new(),
+                content_version_id: Some(hfdrive_core::ids::VersionId::new()),
+                deleted: false,
+                metadata_json: serde_json::json!({}),
+            })
+            .await
+            .expect("child item");
+        (directory, child)
+    }
+
+    /// A rename-race conflict between one durable local operation (an outbox
+    /// entry exists) and one remote operation (none exists) over a directory:
+    /// both sides claim a location and no content binding.
+    fn directory_rename_conflict(
+        connection: ConnectionId,
+        item_id: ItemId,
+        local_op: OperationId,
+        remote_op: OperationId,
+        parent: ItemId,
+    ) -> hfdrive_state::ConflictRecord {
+        hfdrive_state::ConflictRecord {
+            connection_id: connection,
+            conflict_id: hfdrive_core::ids::ConflictId::new(),
+            item_id,
+            competing_ops: vec![local_op, remote_op],
+            revisions_json: serde_json::json!({
+                "kind": "rename_race",
+                "sides": [
+                    {
+                        "operation_id": local_op.to_string(),
+                        "parent_id": parent.to_string(),
+                        "name": "docs-local",
+                        "content_version_id": null,
+                    },
+                    {
+                        "operation_id": remote_op.to_string(),
+                        "parent_id": parent.to_string(),
+                        "name": "docs-remote",
+                        "content_version_id": null,
+                    },
+                ],
+            }),
+            original_names: vec!["docs-local".to_owned(), "docs-remote".to_owned()],
+            resolution_state: hfdrive_state::ConflictResolution::Unresolved,
+            detected_at_ms: None,
+        }
+    }
+
+    /// Records the local side's own durable work: the local rename that
+    /// participated in the conflict.
+    async fn record_local_rename(
+        account: &AccountStore,
+        connection: ConnectionId,
+        operation: OperationId,
+        item_id: ItemId,
+        parent: ItemId,
+        name: &str,
+    ) {
+        let intent = crate::sync::outbox::SyncIntent::Move {
+            item_id: *item_id.as_uuid(),
+            parent_id: *parent.as_uuid(),
+            name: name.to_owned(),
+        };
+        let entry = crate::sync::outbox::intent_entry(
+            connection,
+            operation,
+            Some(item_id),
+            None,
+            None,
+            0,
+            &intent,
+        )
+        .expect("local rename intent");
+        account.record_outbox(entry).await.expect("local rename work");
+    }
+
+    /// KeepLocal on a directory rename conflict: the selected **live**
+    /// directory resolves to [`SyncIntent::Move`] at its selected parent/name.
+    /// A directory must never resolve to a delete tombstone, and its child
+    /// files survive untouched under it.
+    #[tokio::test]
+    async fn keep_local_directory_rename_moves_the_live_directory_and_keeps_its_children() {
+        let fixture = ConflictFixture::open().await;
+        let (directory, child) =
+            seed_directory_tree(&fixture.account, fixture.connection, fixture.root_item).await;
+        let local_op = OperationId::new();
+        let remote_op = OperationId::new();
+        record_local_rename(
+            &fixture.account,
+            fixture.connection,
+            local_op,
+            directory,
+            fixture.root_item,
+            "docs-local",
+        )
+        .await;
+        let conflict =
+            directory_rename_conflict(fixture.connection, directory, local_op, remote_op, fixture.root_item);
+        let conflict_id = conflict.conflict_id;
+        fixture.account.record_conflict(conflict).await.expect("conflict record");
+
+        let resolution_op = OperationId::new();
+        let resolved = fixture
+            .engine
+            .resolve_conflict(
+                fixture.connection,
+                conflict_id,
+                hfdrive_state::ConflictResolution::KeepLocal,
+                resolution_op,
+            )
+            .await
+            .expect("keep_local resolution");
+        assert_eq!(resolved.resolution_state, hfdrive_state::ConflictResolution::KeepLocal);
+
+        // The resolution intent is a move to the selected side's exact
+        // parent/name — never a delete tombstone.
+        let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.expect("outbox");
+        let resolution = entries
+            .iter()
+            .find(|entry| entry.operation_id == resolution_op)
+            .expect("the resolution operation is durable");
+        match crate::sync::outbox::parse_intent(resolution).expect("parseable intent") {
+            crate::sync::outbox::SyncIntent::Move { item_id, parent_id, name } => {
+                assert_eq!(item_id, *directory.as_uuid());
+                assert_eq!(parent_id, *fixture.root_item.as_uuid());
+                assert_eq!(name, "docs-local");
+            }
+            other => panic!("a kept live directory must resolve to a move, got {other:?}"),
+        }
+        assert!(
+            entries.iter().all(|entry| !matches!(
+                crate::sync::outbox::parse_intent(entry),
+                Ok(crate::sync::outbox::SyncIntent::Delete { .. })
+            )),
+            "no delete tombstone is emitted when a live directory side is kept"
+        );
+
+        // The selected directory and its descendants survive in the registry.
+        let item = fixture.account.item(fixture.connection, directory).await.expect("directory row").expect("live");
+        assert!(!item.deleted);
+        assert_eq!(item.kind, hfdrive_state::ItemKind::Directory);
+        let child_row = fixture.account.item(fixture.connection, child).await.expect("child row").expect("live");
+        assert!(!child_row.deleted);
+        assert_eq!(child_row.parent_id, Some(directory));
+        assert_eq!(child_row.name, "note.txt");
+        fixture.shutdown().await;
+    }
+
+    /// KeepRemote on the same directory rename conflict shape: the selected
+    /// **remote** side is also a live directory, so it resolves to
+    /// [`SyncIntent::Move`] at that side's parent/name with its subtree
+    /// intact — again never a delete tombstone.
+    #[tokio::test]
+    async fn keep_remote_directory_rename_moves_the_live_directory_and_keeps_its_children() {
+        let fixture = ConflictFixture::open().await;
+        let (directory, child) =
+            seed_directory_tree(&fixture.account, fixture.connection, fixture.root_item).await;
+        let local_op = OperationId::new();
+        let remote_op = OperationId::new();
+        record_local_rename(
+            &fixture.account,
+            fixture.connection,
+            local_op,
+            directory,
+            fixture.root_item,
+            "docs-local",
+        )
+        .await;
+        let conflict =
+            directory_rename_conflict(fixture.connection, directory, local_op, remote_op, fixture.root_item);
+        let conflict_id = conflict.conflict_id;
+        fixture.account.record_conflict(conflict).await.expect("conflict record");
+
+        let resolution_op = OperationId::new();
+        let resolved = fixture
+            .engine
+            .resolve_conflict(
+                fixture.connection,
+                conflict_id,
+                hfdrive_state::ConflictResolution::KeepRemote,
+                resolution_op,
+            )
+            .await
+            .expect("keep_remote resolution");
+        assert_eq!(resolved.resolution_state, hfdrive_state::ConflictResolution::KeepRemote);
+
+        let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.expect("outbox");
+        let resolution = entries
+            .iter()
+            .find(|entry| entry.operation_id == resolution_op)
+            .expect("the resolution operation is durable");
+        match crate::sync::outbox::parse_intent(resolution).expect("parseable intent") {
+            crate::sync::outbox::SyncIntent::Move { item_id, parent_id, name } => {
+                assert_eq!(item_id, *directory.as_uuid());
+                assert_eq!(parent_id, *fixture.root_item.as_uuid());
+                assert_eq!(name, "docs-remote");
+            }
+            other => panic!("a kept live directory must resolve to a move, got {other:?}"),
+        }
+        assert!(
+            entries.iter().all(|entry| !matches!(
+                crate::sync::outbox::parse_intent(entry),
+                Ok(crate::sync::outbox::SyncIntent::Delete { .. })
+            )),
+            "no delete tombstone is emitted when a live directory side is kept"
+        );
+
+        let item = fixture.account.item(fixture.connection, directory).await.expect("directory row").expect("live");
+        assert!(!item.deleted);
+        let child_row = fixture.account.item(fixture.connection, child).await.expect("child row").expect("live");
+        assert!(!child_row.deleted);
+        assert_eq!(child_row.parent_id, Some(directory));
+        fixture.shutdown().await;
+    }
+
+    /// A deleted side still resolves to the item's removal: only the
+    /// live-directory claim is exempt from the delete tombstone.
+    #[tokio::test]
+    async fn a_deleted_directory_side_still_resolves_to_delete() {
+        let fixture = ConflictFixture::open().await;
+        let directory = ItemId::new();
+        fixture
+            .account
+            .upsert_item(hfdrive_state::ItemRecord {
+                connection_id: fixture.connection,
+                item_id: directory,
+                parent_id: Some(fixture.root_item),
+                name: "docs".to_owned(),
+                name_key: "docs".to_owned(),
+                kind: hfdrive_state::ItemKind::Directory,
+                revision: OperationId::new(),
+                content_version_id: None,
+                deleted: true,
+                metadata_json: serde_json::json!({}),
+            })
+            .await
+            .expect("deleted directory item");
+        let local_op = OperationId::new();
+        let remote_op = OperationId::new();
+        record_local_rename(
+            &fixture.account,
+            fixture.connection,
+            local_op,
+            directory,
+            fixture.root_item,
+            "docs-local",
+        )
+        .await;
+        let conflict =
+            directory_rename_conflict(fixture.connection, directory, local_op, remote_op, fixture.root_item);
+        let conflict_id = conflict.conflict_id;
+        fixture.account.record_conflict(conflict).await.expect("conflict record");
+
+        let resolution_op = OperationId::new();
+        fixture
+            .engine
+            .resolve_conflict(
+                fixture.connection,
+                conflict_id,
+                hfdrive_state::ConflictResolution::KeepLocal,
+                resolution_op,
+            )
+            .await
+            .expect("keep_local resolution");
+        let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.expect("outbox");
+        let resolution = entries
+            .iter()
+            .find(|entry| entry.operation_id == resolution_op)
+            .expect("the resolution operation is durable");
+        assert!(
+            matches!(
+                crate::sync::outbox::parse_intent(resolution),
+                Ok(crate::sync::outbox::SyncIntent::Delete { item_id }) if item_id == *directory.as_uuid()
+            ),
+            "a deleted side resolves to the item's removal"
+        );
+        fixture.shutdown().await;
     }
 }

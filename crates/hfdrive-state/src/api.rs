@@ -442,6 +442,11 @@ impl AccountStore {
             .await
     }
 
+    /// Completes one operation's local side. The outbox completion, the
+    /// generation-guarded dirty clear (only when the observed generation still
+    /// matches; a newer generation stays dirty and yields
+    /// [`CompletionOutcome::CompletedWithNewerGeneration`]) and the bound
+    /// capture's retirement to `Consumed` commit as one transaction.
     pub async fn complete_outbox(
         &self,
         connection_id: ConnectionId,
@@ -535,6 +540,45 @@ impl AccountStore {
     pub async fn list_snapshots(&self, connection_id: ConnectionId) -> Result<Vec<SnapshotRecord>, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.list_snapshots(account, connection_id)).await
+    }
+
+    /// Staged captures (`Capturing`/`Ready`) that unfinished work for `item_id`
+    /// still references as its payload source. Scope is exactly the requested
+    /// item: unrelated retained captures and captures whose consumer already
+    /// finished never show up here. This is the only dependency notion the
+    /// Free Space gate uses.
+    pub async fn snapshot_dependencies(
+        &self,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+    ) -> Result<Vec<SnapshotRecord>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.snapshot_dependencies(account, connection_id, item_id)).await
+    }
+
+    /// Retires a finished capture to `Consumed`, only after all durable
+    /// consumers of its bytes have finished. Idempotent; the staged bytes are
+    /// **never** deleted here (rows and bytes stay until a proven-gone byte
+    /// reclamation records [`Self::retire_snapshot_released`]).
+    pub async fn retire_snapshot_consumed(
+        &self,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+    ) -> Result<SnapshotRecord, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.retire_snapshot_consumed(account, connection_id, snapshot_id)).await
+    }
+
+    /// Records that a retired capture's staged bytes are physically gone.
+    /// Like [`Self::retire_snapshot_consumed`] this never deletes anything:
+    /// byte reclamation happens outside the state layer and is recorded here.
+    pub async fn retire_snapshot_released(
+        &self,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+    ) -> Result<SnapshotRecord, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.retire_snapshot_released(account, connection_id, snapshot_id)).await
     }
 
     // ---- transfers ----------------------------------------------

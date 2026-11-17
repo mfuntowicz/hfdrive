@@ -229,6 +229,12 @@ pub fn free_space(path: &Path, evidence: &FreeSpaceEvidence) -> Result<GuardOutc
 
 /// Builds the free-space evidence from durable state. Every flag is checked
 /// against real rows; nothing is assumed.
+///
+/// The snapshot-dependency flag considers **only** staged captures that
+/// unfinished work for this exact item still references as its payload
+/// source. Unrelated retained captures (other items' staged or retired
+/// snapshots) and captures whose durable consumers already finished never
+/// block freeing this item's local space.
 pub async fn free_space_evidence(
     state: &AccountStore,
     connection: hfdrive_core::ids::ConnectionId,
@@ -244,16 +250,9 @@ pub async fn free_space_evidence(
         .flatten()
         .is_some_and(|observation| observation.dirty);
     let snapshot_dependency = state
-        .list_snapshots(connection)
+        .snapshot_dependencies(connection, item_id)
         .await
-        .map(|snapshots| {
-            snapshots.iter().any(|snapshot| {
-                matches!(
-                    snapshot.status,
-                    hfdrive_state::SnapshotStatus::Capturing | hfdrive_state::SnapshotStatus::Ready
-                )
-            })
-        })
+        .map(|dependencies| !dependencies.is_empty())
         .unwrap_or(true); // Unknown dependencies block freeing, never allow it.
     FreeSpaceEvidence {
         committed: content_version_id.is_some(),
@@ -521,5 +520,168 @@ mod tests {
         assert!(dirty.verify().is_err());
         let pending = FreeSpaceEvidence { no_snapshot_dependency: false, ..full };
         assert!(pending.verify().is_err());
+    }
+
+    #[tokio::test]
+    async fn free_space_dependency_scopes_to_the_item_and_allows_completed_work() {
+        use hfdrive_core::ids::{OperationId, SnapshotId, UploadId};
+        use hfdrive_core::storage::{ObjectRef, PayloadKey, XetFileId};
+        use hfdrive_state::{
+            ItemKind, ItemRecord, OutboxEntry, OutboxTransition, SnapshotStatus,
+        };
+
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let state = &fixture.account;
+        let connection = fixture.connection;
+        let staging = fixture.directory.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let item = ItemId::new();
+        let other = ItemId::new();
+        let version = VersionId::new();
+        for (id, name) in [(item, "a.txt"), (other, "b.txt")] {
+            state
+                .upsert_item(ItemRecord {
+                    connection_id: connection,
+                    item_id: id,
+                    parent_id: Some(fixture.root_item),
+                    name: name.to_owned(),
+                    name_key: name.to_owned(),
+                    kind: ItemKind::File,
+                    revision: OperationId::new(),
+                    content_version_id: Some(VersionId::new()),
+                    deleted: false,
+                    metadata_json: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            state.bump_observation(connection, id, None).await.unwrap();
+        }
+
+        // Staged captures: one per item plus one nobody references at all.
+        let mut snapshots = Vec::new();
+        for name in ["a", "b", "orphan"] {
+            let snapshot_id = SnapshotId::new();
+            let path = staging.join(format!("{name}.snap"));
+            std::fs::write(&path, b"payload").unwrap();
+            state.begin_snapshot(connection, snapshot_id, path).await.unwrap();
+            state
+                .complete_snapshot(connection, snapshot_id, 7, hfdrive_core::storage::Sha256Digest::of(b"payload"))
+                .await
+                .unwrap();
+            snapshots.push(snapshot_id);
+        }
+        let (own_snapshot, other_snapshot, orphan_snapshot) =
+            (snapshots[0], snapshots[1], snapshots[2]);
+
+        let intent = |item_id: ItemId| serde_json::json!({"kind": "content", "item_id": item_id.to_string()});
+        let own_operation = OperationId::new();
+        state
+            .record_outbox(OutboxEntry::observed(connection, own_operation, Some(item), 1, intent(item)))
+            .await
+            .unwrap();
+        state
+            .transition_outbox(connection, own_operation, OutboxTransition::SnapshotReady { snapshot_id: own_snapshot })
+            .await
+            .unwrap();
+        let other_operation = OperationId::new();
+        state
+            .record_outbox(OutboxEntry::observed(connection, other_operation, Some(other), 1, intent(other)))
+            .await
+            .unwrap();
+        state
+            .transition_outbox(connection, other_operation, OutboxTransition::SnapshotReady { snapshot_id: other_snapshot })
+            .await
+            .unwrap();
+
+        // The item's own unfinished staged capture blocks freeing it.
+        let evidence = free_space_evidence(state, connection, item, Some(version), false, false).await;
+        assert!(
+            !evidence.no_snapshot_dependency,
+            "the item's own staged capture with unfinished work must block"
+        );
+        // The unrelated retained capture never shows up as this item's
+        // dependency, and an unreferenced capture blocks nobody.
+        assert_eq!(
+            state.snapshot_dependencies(connection, item).await.unwrap().len(),
+            1,
+            "only this item's own staged capture counts"
+        );
+        let other_dependencies = state.snapshot_dependencies(connection, other).await.unwrap();
+        assert_eq!(other_dependencies.len(), 1);
+        assert_eq!(other_dependencies[0].snapshot_id, other_snapshot);
+        for id in [item, other] {
+            assert!(
+                !state
+                    .snapshot_dependencies(connection, id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|snapshot| snapshot.snapshot_id == orphan_snapshot),
+                "an unreferenced retained capture must never block free space"
+            );
+        }
+
+        // Freeing the *other* item (not requested here) is unaffected by this
+        // item's work: its only dependency is its own, still unfinished.
+        let other_evidence = free_space_evidence(state, connection, other, Some(version), false, false).await;
+        assert!(!other_evidence.no_snapshot_dependency);
+
+        // Once the item's work completes, only *its* dependency is gone: the
+        // completed item passes Free Space evidence end to end while the
+        // other item stays blocked by its own unfinished work.
+        state
+            .transition_outbox(
+                connection,
+                own_operation,
+                OutboxTransition::PayloadReady {
+                    object_ref: ObjectRef {
+                        key: PayloadKey::new(UploadId::new()),
+                        sha256: hfdrive_core::storage::Sha256Digest::of(b"payload"),
+                        size: 7,
+                        xet_file_id: XetFileId::new("ab".repeat(32)).unwrap(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .transition_outbox(
+                connection,
+                own_operation,
+                OutboxTransition::MetadataReady {
+                    candidate_commit: hfdrive_core::ids::CommitId::new(),
+                    candidate_head_json: serde_json::json!({}),
+                    expected_etag: "e".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        state.transition_outbox(connection, own_operation, OutboxTransition::Published).await.unwrap();
+        state
+            .transition_outbox(connection, own_operation, OutboxTransition::LocalApplyPending)
+            .await
+            .unwrap();
+        let outcome = state.complete_outbox(connection, own_operation).await.unwrap();
+        assert!(
+            matches!(outcome, hfdrive_state::CompletionOutcome::Completed { generation: 1 }),
+            "found {outcome:?}"
+        );
+        assert_eq!(
+            state.snapshot(connection, own_snapshot).await.unwrap().unwrap().status,
+            SnapshotStatus::Consumed,
+            "the finished consumer's capture retires"
+        );
+
+        let evidence = free_space_evidence(state, connection, item, Some(version), false, false).await;
+        assert!(
+            evidence.verify().is_ok(),
+            "a completed item frees local space: {evidence:?}"
+        );
+        let other_evidence = free_space_evidence(state, connection, other, Some(version), false, false).await;
+        assert!(
+            !other_evidence.no_snapshot_dependency,
+            "the unrelated item's own unfinished work still blocks only it"
+        );
     }
 }

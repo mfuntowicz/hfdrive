@@ -1725,7 +1725,11 @@ impl Db {
 
     /// Completes the local side of an operation. The item's dirty flag is
     /// cleared only when the observed generation still matches; a newer local
-    /// generation stays dirty for its own operation.
+    /// generation stays dirty for its own operation and the outcome is
+    /// [`CompletionOutcome::CompletedWithNewerGeneration`].
+    ///
+    /// The outbox completion, the generation-guarded dirty clear and the bound
+    /// capture's retirement to `Consumed` commit in one transaction.
     pub(crate) fn complete_outbox(
         &mut self,
         account: AccountKey,
@@ -1781,36 +1785,97 @@ impl Db {
             });
         }
         let now = schema::checked_i64(schema::now_ms())?;
-        {
+        // The outbox completion, the generation-guarded dirty clearing and the
+        // bound capture's retirement are **one** transaction: the row update is
+        // conditioned inside the transaction on the observed generation so a
+        // generation observed between any two statements can never race the
+        // dirty clear, and a crash can never leave a completed entry with its
+        // item still dirty (or a retired capture while the entry is unfinished).
+        // The bound capture reaches `Consumed` here, after its consumer's
+        // durable completion; `Released` is only ever set later, when a finished
+        // capture's bytes are physically gone. Neither state deletes bytes.
+        let completion = {
             let conn = self.account_conn(account)?;
-            // The completion and its error clearing are one durable step.
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "UPDATE outbox SET state = 'complete', updated_at_ms = ?3 WHERE connection_id = ?1 AND operation_id = ?2",
                 params![connection_id.as_bytes().as_slice(), operation_id.as_bytes().as_slice(), now],
             )?;
             clear_work_error_conn(&tx, connection_id, WorkErrorKind::Outbox, *operation_id.as_uuid())?;
+            let completion = match entry.item_id {
+                Some(item_id) => {
+                    // Guarded inside the transaction: the row is read and
+                    // cleared only when its persisted generation still matches
+                    // the completed operation's captured generation, so a
+                    // generation observed between any two statements can never
+                    // race the clear.
+                    let current_generation: Result<i64, rusqlite::Error> = tx.query_row(
+                        "SELECT generation FROM local_observations
+                         WHERE connection_id = ?1 AND item_id = ?2",
+                        params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+                        |row| row.get(0),
+                    );
+                    match current_generation {
+                        Ok(current_generation) if current_generation >= 0
+                            && current_generation as u64 == entry.observed_generation =>
+                        {
+                            tx.execute(
+                                "UPDATE local_observations SET dirty = 0
+                                  WHERE connection_id = ?1 AND item_id = ?2 AND generation = ?3",
+                                params![
+                                    connection_id.as_bytes().as_slice(),
+                                    item_id.as_bytes().as_slice(),
+                                    current_generation,
+                                ],
+                            )?;
+                            CompletionOutcome::Completed { generation: entry.observed_generation }
+                        }
+                        Ok(current_generation) => {
+                            let current_generation = u64::try_from(current_generation).map_err(|_| {
+                                StateError::invalid_state("local_observations", item_id, "negative generation")
+                            })?;
+                            // Preserved outcome: the entry is complete, the
+                            // newer local generation stays dirty for its own
+                            // operation.
+                            CompletionOutcome::CompletedWithNewerGeneration {
+                                operation_generation: entry.observed_generation,
+                                current_generation,
+                            }
+                        }
+                        // No observation row: nothing local stays dirty.
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            CompletionOutcome::Completed { generation: entry.observed_generation }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                None => CompletionOutcome::Completed { generation: entry.observed_generation },
+            };
+            // The bound capture (by snapshot id or operation binding) retires
+            // to `Consumed` only when no *other* unfinished work still
+            // references it (this entry's row is already `complete` in this
+            // transaction). Rows stay; bytes stay.
+            tx.execute(
+                "UPDATE snapshots SET status = 'consumed', updated_at_ms = ?3
+                  WHERE connection_id = ?1 AND status = 'ready'
+                    AND (snapshot_id = ?2 OR operation_id = ?4)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM outbox o
+                         WHERE o.connection_id = snapshots.connection_id
+                           AND (o.snapshot_id = snapshots.snapshot_id OR o.operation_id = snapshots.operation_id)
+                           AND o.state != 'complete'
+                    )",
+                params![
+                    connection_id.as_bytes().as_slice(),
+                    entry.snapshot_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
+                    now,
+                    operation_id.as_bytes().as_slice(),
+                ],
+            )?;
             tx.commit()?;
-        }
-        let Some(item_id) = entry.item_id else {
-            return Ok(CompletionOutcome::Completed { generation: entry.observed_generation });
+            completion
         };
-        let observation = self.observation(account, connection_id, item_id)?;
-        match observation {
-            Some(obs) if obs.generation == entry.observed_generation => {
-                let conn = self.account_conn(account)?;
-                conn.execute(
-                    "UPDATE local_observations SET dirty = 0 WHERE connection_id = ?1 AND item_id = ?2",
-                    params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
-                )?;
-                Ok(CompletionOutcome::Completed { generation: obs.generation })
-            }
-            Some(obs) => Ok(CompletionOutcome::CompletedWithNewerGeneration {
-                operation_generation: entry.observed_generation,
-                current_generation: obs.generation,
-            }),
-            None => Ok(CompletionOutcome::Completed { generation: entry.observed_generation }),
-        }
+        Ok(completion)
     }
 
     // ---------------------------------------------------------------
@@ -1912,6 +1977,11 @@ impl Db {
             .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))
     }
 
+    /// Capture-lifecycle status set. Retirement targets (`Consumed`,
+    /// `Released`) always go through the guarded `retire_snapshot` — unfinished
+    /// consumers block them and rows are never deleted — so no caller can
+    /// bypass those rules here. A retired capture never returns to a live
+    /// state.
     pub(crate) fn set_snapshot_status(
         &mut self,
         account: AccountKey,
@@ -1919,22 +1989,39 @@ impl Db {
         snapshot_id: SnapshotId,
         status: SnapshotStatus,
     ) -> SResult<SnapshotRecord> {
-        let now = schema::checked_i64(schema::now_ms())?;
-        let conn = self.account_conn(account)?;
-        let changed = conn.execute(
-            "UPDATE snapshots SET status = ?3, updated_at_ms = ?4 WHERE connection_id = ?1 AND snapshot_id = ?2",
-            params![
-                connection_id.as_bytes().as_slice(),
-                snapshot_id.as_bytes().as_slice(),
-                s::snapshot_status_text(status),
-                now
-            ],
-        )?;
-        if changed == 0 {
-            return Err(StateError::not_found("snapshot", snapshot_id));
+        match status {
+            SnapshotStatus::Consumed | SnapshotStatus::Released => {
+                self.retire_snapshot(account, connection_id, snapshot_id, status)
+            }
+            SnapshotStatus::Capturing | SnapshotStatus::Ready => {
+                let snapshot = self
+                    .snapshot(account, connection_id, snapshot_id)?
+                    .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))?;
+                if matches!(snapshot.status, SnapshotStatus::Consumed | SnapshotStatus::Released) {
+                    return Err(StateError::invalid_state(
+                        "snapshot",
+                        snapshot_id,
+                        "a retired capture never returns to a live state",
+                    ));
+                }
+                let now = schema::checked_i64(schema::now_ms())?;
+                let conn = self.account_conn(account)?;
+                let changed = conn.execute(
+                    "UPDATE snapshots SET status = ?3, updated_at_ms = ?4 WHERE connection_id = ?1 AND snapshot_id = ?2",
+                    params![
+                        connection_id.as_bytes().as_slice(),
+                        snapshot_id.as_bytes().as_slice(),
+                        s::snapshot_status_text(status),
+                        now
+                    ],
+                )?;
+                if changed == 0 {
+                    return Err(StateError::not_found("snapshot", snapshot_id));
+                }
+                self.snapshot(account, connection_id, snapshot_id)?
+                    .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))
+            }
         }
-        self.snapshot(account, connection_id, snapshot_id)?
-            .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))
     }
 
     pub(crate) fn snapshot(
@@ -1966,6 +2053,138 @@ impl Db {
             params![connection_id.as_bytes().as_slice()],
             s::read_snapshot,
         )
+    }
+
+    /// Staged captures (`Capturing`/`Ready`) that **unfinished** work for
+    /// `item_id` still references as its payload source (via the outbox
+    /// entry's snapshot binding or the capture's operation binding).
+    ///
+    /// Scope is exactly the requested item: unrelated retained captures and
+    /// captures whose consumer already finished never block anything here,
+    /// and an empty result means the item has no staged-snapshot dependency.
+    pub(crate) fn snapshot_dependencies(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+    ) -> SResult<Vec<SnapshotRecord>> {
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            "SELECT s.connection_id, s.snapshot_id, s.path, s.size, s.sha256, s.status, s.operation_id
+               FROM snapshots s
+              WHERE s.connection_id = ?1
+                AND s.status IN ('capturing', 'ready')
+                AND EXISTS (
+                    SELECT 1 FROM outbox o
+                     WHERE o.connection_id = s.connection_id
+                       AND o.item_id = ?2
+                       AND o.state != 'complete'
+                       AND (o.snapshot_id = s.snapshot_id OR o.operation_id = s.operation_id)
+                )
+              ORDER BY s.created_at_ms",
+            params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+            s::read_snapshot,
+        )
+    }
+
+    /// True when unfinished outbox work still references this capture as its
+    /// payload source. Retirement is refused while this holds: a capture is
+    /// only retired **after** every durable consumer has finished.
+    fn snapshot_has_unfinished_consumers(
+        conn: &Connection,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+    ) -> SResult<bool> {
+        let unfinished: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots s JOIN outbox o
+               ON o.connection_id = s.connection_id
+              AND (o.snapshot_id = s.snapshot_id OR o.operation_id = s.operation_id)
+             WHERE s.connection_id = ?1 AND s.snapshot_id = ?2 AND o.state != 'complete'",
+            params![connection_id.as_bytes().as_slice(), snapshot_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(unfinished > 0)
+    }
+
+    /// Retires a finished capture to `Consumed`. Allowed only once no
+    /// unfinished work references it (the durable consumer must have
+    /// finished) and only from `Ready`; the transition is idempotent for a
+    /// capture that is already retired. **The staged bytes are never deleted
+    /// here**: the state layer records retirement only.
+    pub(crate) fn retire_snapshot_consumed(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+    ) -> SResult<SnapshotRecord> {
+        self.retire_snapshot(account, connection_id, snapshot_id, SnapshotStatus::Consumed)
+    }
+
+    /// Records that a retired capture's staged bytes are physically gone.
+    /// `Released` is reached from `Consumed` (or from `Ready` for a capture
+    /// that was never consumed), never backwards, and — like [`Self::retire_snapshot_consumed`]
+    /// — never deletes anything itself.
+    pub(crate) fn retire_snapshot_released(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+    ) -> SResult<SnapshotRecord> {
+        self.retire_snapshot(account, connection_id, snapshot_id, SnapshotStatus::Released)
+    }
+
+    fn retire_snapshot(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        snapshot_id: SnapshotId,
+        target: SnapshotStatus,
+    ) -> SResult<SnapshotRecord> {
+        let snapshot = self
+            .snapshot(account, connection_id, snapshot_id)?
+            .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))?;
+        match snapshot.status {
+            // Idempotent: a finished retirement never changes again, and the
+            // ladder is monotonic (`released` never goes back).
+            current if current == target => return Ok(snapshot),
+            SnapshotStatus::Released => return Ok(snapshot),
+            SnapshotStatus::Capturing => {
+                return Err(StateError::invalid_state(
+                    "snapshot",
+                    snapshot_id,
+                    "capture is still in flight",
+                ));
+            }
+            SnapshotStatus::Ready | SnapshotStatus::Consumed => {}
+        }
+        // `Ready -> Released` is only for a capture whose staged bytes were
+        // cleaned up without a consumer ever finishing with it; `Consumed ->
+        // Released` is the normal path. Every allowed step needs the capture
+        // to be free of unfinished consumers, and no step deletes bytes.
+        let now = schema::checked_i64(schema::now_ms())?;
+        {
+            let conn = self.account_conn(account)?;
+            if Self::snapshot_has_unfinished_consumers(conn, connection_id, snapshot_id)? {
+                return Err(StateError::invalid_state(
+                    "snapshot",
+                    snapshot_id,
+                    "unfinished work still references this capture",
+                ));
+            }
+            conn.execute(
+                "UPDATE snapshots SET status = ?3, updated_at_ms = ?4
+                  WHERE connection_id = ?1 AND snapshot_id = ?2",
+                params![
+                    connection_id.as_bytes().as_slice(),
+                    snapshot_id.as_bytes().as_slice(),
+                    s::snapshot_status_text(target),
+                    now,
+                ],
+            )?;
+        }
+        self.snapshot(account, connection_id, snapshot_id)?
+            .ok_or_else(|| StateError::not_found("snapshot", snapshot_id))
     }
 
     // ---------------------------------------------------------------
