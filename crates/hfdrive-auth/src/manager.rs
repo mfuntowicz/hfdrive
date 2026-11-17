@@ -56,6 +56,10 @@ pub struct AuthSnapshot {
     pub active_login: Option<LoginSession>,
     /// Most recent sanitized error, for diagnostics.
     pub last_error: Option<AuthError>,
+    /// The active account whose shared credential state is rejected. This is
+    /// independent of `last_error`: a later denied or expired login changes
+    /// only the login outcome and must not make the rejected account active.
+    pub rejected: Option<AccountKey>,
 }
 
 /// Browser-launch boundary: opens exactly one validated authorization URL.
@@ -91,6 +95,8 @@ struct Inner {
     credential_commit: Mutex<()>,
     snapshot_publish: Mutex<()>,
     signing_out: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_rejection_replacement: AtomicBool,
 }
 
 struct LoginSlot {
@@ -140,12 +146,21 @@ impl AuthManager {
     /// A restored record whose issuer/subject no longer hash to `restore` is
     /// preserved untouched and surfaces as
     /// [`AuthError::ExistingSessionPreserved`] — the session is never rebound.
+    /// An account whose durable status recorded a rejected credential must
+    /// pass `None` and restore via [`Self::restore_rejected_account`], so the
+    /// rejected envelope is never reactivated.
     pub fn new(config: AuthConfig, state_base: PathBuf, restore: Option<AccountKey>) -> Self {
         Self::with_settings(config, OidcSettings::huggingface(), state_base, restore)
     }
 
     /// Constructor with explicit OIDC trust settings (deterministic fixture
     /// providers in tests use the same code path).
+    ///
+    /// `restore` is restored with [`Self::restore_account`] semantics (the
+    /// envelope may be reactivated). A caller that honors a persisted
+    /// `NeedsSignIn` rejection must pass `None` and call
+    /// [`Self::restore_rejected_account`] instead so the rejected envelope is
+    /// never reactivated.
     pub fn with_settings(
         config: AuthConfig,
         settings: OidcSettings,
@@ -176,6 +191,7 @@ impl AuthManager {
             profile: None,
             active_login: None,
             last_error: None,
+            rejected: None,
         });
         let manager = Self(Arc::new(Inner {
             config,
@@ -198,6 +214,8 @@ impl AuthManager {
             credential_commit: Mutex::new(()),
             snapshot_publish: Mutex::new(()),
             signing_out: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_rejection_replacement: AtomicBool::new(false),
         }));
         if let Some(account) = restore {
             let _ = manager.restore_account(account);
@@ -215,6 +233,14 @@ impl AuthManager {
     /// The current snapshot.
     pub fn snapshot(&self) -> AuthSnapshot {
         self.0.watch_tx.borrow().clone()
+    }
+
+    /// Force the replacement boundary to fail after a rejected record was
+    /// loaded successfully. Used only by the cross-crate recovery regression.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_rejection_replacement_for_test(&self, fail: bool) {
+        self.0.fail_rejection_replacement.store(fail, Ordering::SeqCst);
     }
 
     /// The active verified identity, when signed in.
@@ -239,7 +265,35 @@ impl AuthManager {
     }
 
     /// Restore the explicitly selected account from its protected record.
+    ///
+    /// Only call this for an account whose **durable** status is not
+    /// `NeedsSignIn`: an envelope rejected earlier (`invalid_grant`, failed
+    /// identity validation, unreadable record) must be restored with
+    /// [`Self::restore_rejected_account`] instead, or it would be reactivated.
     pub fn restore_account(&self, account: AccountKey) -> Result<AccountProfile, AuthError> {
+        self.restore_account_with(account, RestoreMode::Reusable)
+    }
+
+    /// Restore a selected account whose durable account status recorded a
+    /// rejected credential (`NeedsSignIn`) — startup display and recovery
+    /// only.
+    ///
+    /// The verified display identity is rebuilt from the preserved envelope,
+    /// but the rejected envelope is **never reactivated**: its bearer and
+    /// refresh secrets are dropped, `needs_sign_in` is forced, and the
+    /// authorization epoch stays disabled. The retained session cannot produce
+    /// a usable token epoch until a fresh interactive login durably replaces
+    /// the record; the credential generation stays available so that
+    /// replacement remains monotonic per account.
+    pub fn restore_rejected_account(&self, account: AccountKey) -> Result<AccountProfile, AuthError> {
+        self.restore_account_with(account, RestoreMode::Rejected)
+    }
+
+    fn restore_account_with(
+        &self,
+        account: AccountKey,
+        mode: RestoreMode,
+    ) -> Result<AccountProfile, AuthError> {
         let _commit = lock(&self.0.credential_commit);
         if self.0.signing_out.load(Ordering::SeqCst) {
             return Err(AuthError::SignOutInProgress);
@@ -256,7 +310,7 @@ impl AuthManager {
             if AccountKey::from_subject(&envelope.issuer, &envelope.subject) != account {
                 return Err(AuthError::ExistingSessionPreserved);
             }
-            let (entry, profile) = entry_from_envelope(account, envelope)?;
+            let (entry, profile) = entry_from_envelope(account, envelope, mode)?;
             let needs_sign_in = lock(&entry.shared).needs_sign_in;
             if !needs_sign_in {
                 entry.authority.activate().map_err(|_| AuthError::Internal)?;
@@ -273,6 +327,13 @@ impl AuthManager {
         };
         lock(&self.0.accounts).insert(account, entry);
         *lock(&self.0.active) = Some(account);
+        if mode == RestoreMode::Rejected {
+            // Make the recorded rejection durable: the rejected envelope's
+            // replayable secrets are removed so no later restore path (even
+            // the reusable one) can reactivate it. Identity, generation and
+            // epoch bookkeeping survive for display and recovery.
+            self.persist_rejection(account);
+        }
         self.set_last_error(needs_sign_in.then_some(AuthError::NeedsSignIn));
         self.publish();
         Ok(profile)
@@ -563,7 +624,20 @@ impl AuthManager {
     fn publish(&self) {
         let _publish = lock(&self.0.snapshot_publish);
         let revision = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        let profile = self.active_profile();
+        let (profile, rejected) = if self.0.signing_out.load(Ordering::SeqCst) {
+            (None, None)
+        } else {
+            let active = *lock(&self.0.active);
+            active
+                .and_then(|account| self.entry_opt(account).map(|entry| (account, entry)))
+                .map_or((None, None), |(account, entry)| {
+                    let shared = lock(&entry.shared);
+                    (
+                        Some(shared.profile.clone()),
+                        shared.needs_sign_in.then_some(account),
+                    )
+                })
+        };
         let active_login = lock(&self.0.login).session.clone();
         let last_error = lock(&self.0.last_error).clone();
         self.0.watch_tx.send_replace(AuthSnapshot {
@@ -571,6 +645,7 @@ impl AuthManager {
             profile,
             active_login,
             last_error,
+            rejected,
         });
     }
 
@@ -696,12 +771,12 @@ impl AuthManager {
         epoch: u64,
     ) -> Result<AccountProfile, AuthError> {
         let provider = self.provider().await?;
-        let device_client = flows::build_device_client(&provider.metadata, client_id)?;
+        let device_client = flows::build_device_client(&self.0.settings, &provider.metadata, client_id)?;
         let code_client = flows::build_code_client(&provider.metadata, client_id, None)?;
         let http = self.http_client()?;
 
         let authorization =
-            flows::device_authorize(&device_client, &http, request).await?;
+            flows::device_authorize(&self.0.settings, &device_client, &http, request).await?;
         let user_code = authorization.user_code().secret().to_owned();
         let verification_uri = authorization.verification_uri().to_string();
         self.update_session(session_id, |session| {
@@ -1142,8 +1217,35 @@ impl AuthManager {
         {
             return;
         }
+        // Durably record the rejection before the state observer can see it,
+        // so no later startup can reactivate the rejected envelope. Failure
+        // leaves the in-memory rejection authoritative for this run.
+        self.persist_rejection(entry.account);
         self.set_last_error(Some(AuthError::NeedsSignIn));
         self.publish();
+    }
+
+    /// Durably mark one account's preserved credential record as rejected.
+    ///
+    /// The record keeps its verified identity, generation and durable
+    /// authorization epoch (so a fresh login replacement stays monotonic and
+    /// rebindable) but loses every replayable secret: the bearer and refresh
+    /// token are cleared and the expiry is zeroed, which forces
+    /// [`entry_from_envelope`] to restore it `needs_sign_in` in any mode. A
+    /// missing or unreadable record is left untouched — an unreadable record
+    /// already fails closed and a missing one has nothing to reactivate.
+    fn persist_rejection(&self, account: AccountKey) {
+        let dir = account_credentials_dir(&self.0.state_base, account);
+        let Ok(store) = AccountCredentialStore::open(dir, account) else { return };
+        let Ok(mut envelope) = store.load() else { return };
+        #[cfg(any(test, feature = "test-support"))]
+        if self.0.fail_rejection_replacement.load(Ordering::SeqCst) {
+            return;
+        }
+        envelope.access_token = String::new();
+        envelope.refresh_token = None;
+        envelope.expires_at = 0;
+        let _ = store.save(&envelope);
     }
 }
 
@@ -1155,30 +1257,72 @@ fn revoke_entry(entry: &AccountEntry) {
     shared.refresh_token = None;
 }
 
+/// How startup treats a preserved credential envelope.
+///
+/// The distinction is durable: an envelope whose rejection was recorded
+/// (`invalid_grant`, failed identity validation, unreadable record) is
+/// display/recovery material only and is never reactivated, while an envelope
+/// without a recorded rejection may still hold a usable session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreMode {
+    /// No recorded rejection: an unexpired envelope with refresh capability
+    /// may be reactivated into a usable token epoch.
+    Reusable,
+    /// A rejected envelope: the verified identity is rebuilt for display and
+    /// recovery, but every bearer/refresh secret is dropped, the entry stays
+    /// `needs_sign_in`, and the authorization epoch is never activated.
+    Rejected,
+}
+
 fn entry_from_envelope(
     account: AccountKey,
     envelope: CredentialEnvelope,
+    mode: RestoreMode,
 ) -> Result<(Arc<AccountEntry>, AccountProfile), AuthError> {
     let profile = profile_from_envelope(&envelope)?;
     let expires_at = envelope.expires_at;
-    let needs_sign_in = unix_now() >= expires_at && envelope.refresh_token.is_none();
-    let inactive_epoch = envelope.authorization_epoch.checked_sub(1)
+    // A rejected envelope is never reactivated regardless of its preserved
+    // token/refresh material: the recorded rejection is authoritative.
+    let needs_sign_in = mode == RestoreMode::Rejected
+        || (unix_now() >= expires_at && envelope.refresh_token.is_none());
+    // A record without a whole durable epoch is unreadable in every mode.
+    let inactive_epoch = envelope
+        .authorization_epoch
+        .checked_sub(1)
         .ok_or(AuthError::CredentialRecordUnreadable)?;
-    let entry = Arc::new(AccountEntry {
-        account,
-        issuer: envelope.issuer.clone(),
-        subject: envelope.subject.clone(),
-        authority: AuthorizationAuthority::new(account,
-            if needs_sign_in { envelope.authorization_epoch } else { inactive_epoch }),
-        refresh_lock: tokio::sync::Mutex::new(()),
-        shared: Mutex::new(SharedAccount {
-            token: Some(Arc::new(SecretAccessToken::new(
+    // A reactivatable session is restored one below the durable epoch and the
+    // activation below advances it back to the durable value. A session that
+    // can never be activated keeps the durable epoch as-is: the bookkeeping
+    // stays monotonic per account and the disabled authority issues no lease.
+    let authority_epoch = if mode == RestoreMode::Reusable && !needs_sign_in {
+        inactive_epoch
+    } else {
+        envelope.authorization_epoch
+    };
+    // An unusable session keeps no secret in memory: only the generation
+    // survives so a future login replacement stays monotonic.
+    let (token, refresh_token) = if needs_sign_in {
+        (None, None)
+    } else {
+        (
+            Some(Arc::new(SecretAccessToken::new(
                 Zeroizing::new(envelope.access_token.clone()),
                 account,
                 envelope.generation,
                 expires_at,
             ))),
-            refresh_token: envelope.refresh_token.clone().map(Zeroizing::new),
+            envelope.refresh_token.clone().map(Zeroizing::new),
+        )
+    };
+    let entry = Arc::new(AccountEntry {
+        account,
+        issuer: envelope.issuer.clone(),
+        subject: envelope.subject.clone(),
+        authority: AuthorizationAuthority::new(account, authority_epoch),
+        refresh_lock: tokio::sync::Mutex::new(()),
+        shared: Mutex::new(SharedAccount {
+            token,
+            refresh_token,
             refresh_due_at: flows::refresh_due_at(expires_at, envelope.lifetime_secs),
             expires_at,
             generation: envelope.generation,

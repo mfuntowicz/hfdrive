@@ -81,6 +81,19 @@ pub struct Provider {
 impl Provider {
     /// Open preserved state before accepting IPC. A corrupt or foreign database is never replaced.
     pub async fn open(paths: StatePaths, user_sid: String) -> Result<Arc<Self>, hfdrive_state::StateError> {
+        let auth = AuthManager::new(
+            hfdrive_auth::AuthConfig::production(),
+            paths.base().to_path_buf(),
+            None,
+        );
+        Self::open_with_auth(paths, user_sid, auth).await
+    }
+
+    async fn open_with_auth(
+        paths: StatePaths,
+        user_sid: String,
+        auth: AuthManager,
+    ) -> Result<Arc<Self>, hfdrive_state::StateError> {
         let engine_state_dir = paths.base().to_path_buf();
         let state = Arc::new(StateStore::open(paths.clone()).await?);
         let selected = state.selected_account().await?;
@@ -103,7 +116,26 @@ impl Provider {
                 device_id
             }
         };
-        let auth = AuthManager::new(hfdrive_auth::AuthConfig::production(), paths.base().to_path_buf(), selected);
+        // K11: startup honors the persisted account status. An account whose
+        // durable status recorded a rejected credential (`NeedsSignIn`) is
+        // restored for display/recovery only and is never reactivated into a
+        // usable token epoch — its envelope is preserved but its bearer and
+        // refresh secrets are dropped and the authorization epoch stays
+        // disabled. Any other status (including an absent record) restores
+        // normally; restore failure stays non-fatal and surfaces as the
+        // sign-in-required state below. The retained selection survives for
+        // display/recovery either way.
+        if let Some(selected_account) = selected {
+            let rejected = state
+                .get_account(selected_account)
+                .await?
+                .is_some_and(|record| record.status == hfdrive_state::AccountStatus::NeedsSignIn);
+            let _ = if rejected {
+                auth.restore_rejected_account(selected_account)
+            } else {
+                auth.restore_account(selected_account)
+            };
+        }
         let tokens = Arc::new(DurableTokens::new(auth.clone()));
         let (status, _) = watch::channel(StatusSnapshot {
             sequence: 0,
@@ -655,5 +687,439 @@ mod tests {
         assert_eq!(snapshot.account.state, AuthenticationState::NeedsSignIn, "a restore failure never relaxes an established state");
         assert_eq!(snapshot.account.profile, account().profile);
         assert_eq!(snapshot.connections, vec![connection]);
+    }
+
+    // ---- bounded startup over unusable selected credentials (K11/G06) ----
+
+    /// The preserved envelope of a rejected session. It still carries
+    /// usable-looking secrets on purpose: only the persisted
+    /// [`hfdrive_state::AccountStatus::NeedsSignIn`] record keeps startup from
+    /// reactivating it.
+    fn rejected_envelope(subject: &str) -> hfdrive_auth::CredentialEnvelope {
+        hfdrive_auth::CredentialEnvelope {
+            schema: hfdrive_auth::store::ENVELOPE_SCHEMA,
+            issuer: "https://huggingface.co".to_owned(),
+            subject: subject.to_owned(),
+            namespace: "fixture-person".to_owned(),
+            avatar_url: None,
+            orgs: Vec::new(),
+            granted_scopes: Some(vec!["openid".to_owned(), "profile".to_owned()]),
+            covered_purpose: hfdrive_auth::LoginPurpose::WriteStorage,
+            login_flow: hfdrive_auth::LoginFlow::Pkce,
+            generation: 1,
+            authorization_epoch: 1,
+            lifetime_secs: 3_600,
+            expires_at: 4_000_000_000,
+            access_token: "HFDRIVE-REJECTED-SECRET-do-not-render".to_owned(),
+            refresh_token: Some("HFDRIVE-REJECTED-REFRESH-do-not-render".to_owned()),
+        }
+    }
+
+    /// Records and selects one account in the control database, then releases
+    /// the state worker so the provider reopens the same database as a restart.
+    async fn select_account(
+        paths: &StatePaths,
+        subject: &str,
+        status: hfdrive_state::AccountStatus,
+    ) -> AccountKey {
+        let account = AccountKey::from_subject("https://huggingface.co", subject);
+        let state = StateStore::open(paths.clone()).await.expect("state database");
+        state.record_account(hfdrive_state::AccountRecord {
+            account_key: account,
+            issuer: "https://huggingface.co".to_owned(),
+            subject: subject.to_owned(),
+            namespace: "fixture-person".to_owned(),
+            credential_ref: hfdrive_state::CredentialRef("oauth.hfdcred".to_owned()),
+            auth_epoch: 1,
+            status,
+        }).await.expect("record account");
+        state.select_account(account).await.expect("select account");
+        drop(state);
+        account
+    }
+
+    /// The common sign-in-required assertions: a bounded open, the exact
+    /// usable NeedsSignIn state, a retained selection for display/recovery, and
+    /// a fresh login still permitted without a usable session (G06).
+    async fn assert_sign_in_required_startup(provider: &Arc<Provider>, account: AccountKey) {
+        let account_status = provider.status.borrow().account.clone();
+        assert_eq!(account_status.state, AuthenticationState::NeedsSignIn);
+        assert_eq!(
+            account_status.last_error.as_ref().map(|failure| failure.code),
+            Some(ProtocolErrorCode::NeedsSignIn)
+        );
+        assert_eq!(
+            provider.state.selected_account().await.expect("selection"),
+            Some(account),
+            "the retained selection survives startup for display and recovery"
+        );
+        assert_eq!(
+            provider.state.get_account(account).await.expect("account row")
+                .expect("account row persists").status,
+            hfdrive_state::AccountStatus::NeedsSignIn,
+            "the rejection is durably persisted"
+        );
+        // No usable token epoch is admitted: account-scoped remote work fails
+        // closed at the credential boundary.
+        assert!(hfdrive_auth::TokenSource::access_token(&*provider.tokens, account).await.is_err());
+        assert!(hfdrive_auth::TokenSource::authorization_lease(&*provider.tokens, account).is_err());
+        // A fresh login is permitted without a usable session (G06).
+        let login = Request::StartLogin(hfdrive_protocol::StartLoginRequest {
+            operation_id: Uuid::new_v4(),
+            flow: hfdrive_protocol::LoginFlow::Pkce,
+            purpose: hfdrive_protocol::LoginPurpose::Signin,
+            organization_id: None,
+        });
+        assert_eq!(provider.operation_scope(&login).await, Ok((None, None)));
+        // GetStatus still answers the sign-in-required state promptly.
+        let reply = provider
+            .dispatch(Request::GetStatus(GetStatusRequest {}), CancellationToken::new())
+            .await;
+        let ResponseResult::GetStatus(status) = reply.result.expect("status reply") else {
+            panic!("get_status answers");
+        };
+        assert_eq!(status.account.state, AuthenticationState::NeedsSignIn);
+    }
+
+    /// G06: with no active profile and a retained selection, startup persists
+    /// and publishes NeedsSignIn exactly once instead of spinning on
+    /// selected-account equality with `None`.
+    #[tokio::test]
+    async fn startup_with_missing_selected_credentials_is_bounded_and_needs_sign_in() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(directory.path().to_path_buf());
+        // A stale `active` row whose credential record is missing.
+        let account = select_account(&paths, "missing-fixture-subject", hfdrive_state::AccountStatus::Active).await;
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Provider::open(paths, "S-1-5-21-fixture".to_owned()),
+        )
+        .await
+        .expect("startup stays bounded with missing selected credentials")
+        .expect("provider opens");
+        assert_sign_in_required_startup(&provider, account).await;
+        // A repeat synchronization is a no-op: the state was persisted and
+        // published once, not rewritten on every observation.
+        let sequence = provider.status.borrow().sequence;
+        provider.synchronize_account().await.expect("synchronize");
+        assert_eq!(provider.status.borrow().sequence, sequence, "NeedsSignIn is published once");
+    }
+
+    /// K11: an unreadable selected credential record keeps startup bounded,
+    /// honors the recorded rejection, and is preserved untouched.
+    #[tokio::test]
+    async fn startup_with_corrupt_selected_credentials_preserves_the_record() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(directory.path().to_path_buf());
+        let account = select_account(&paths, "corrupt-fixture-subject", hfdrive_state::AccountStatus::NeedsSignIn).await;
+        let record_path = paths
+            .account(account)
+            .credentials()
+            .join(hfdrive_auth::AccountCredentialStore::record_file_name());
+        std::fs::create_dir_all(record_path.parent().expect("credentials dir")).expect("credentials dir");
+        std::fs::write(&record_path, b"NOT-HFDCRED1-corrupt-record").expect("corrupt record");
+        let before = std::fs::read(&record_path).expect("corrupt record");
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Provider::open(paths, "S-1-5-21-fixture".to_owned()),
+        )
+        .await
+        .expect("startup stays bounded with corrupt selected credentials")
+        .expect("provider opens");
+        assert_eq!(
+            std::fs::read(&record_path).expect("corrupt record"),
+            before,
+            "an unreadable credential record is preserved untouched"
+        );
+        assert_sign_in_required_startup(&provider, account).await;
+    }
+
+    /// K11: startup honors the persisted `NeedsSignIn` rejection and never
+    /// reactivates the rejected envelope — even though the preserved record
+    /// still carries an unexpired bearer and a refresh token that the
+    /// permissive restore path would otherwise accept.
+    #[tokio::test]
+    async fn startup_honors_recorded_rejection_and_never_reactivates_the_envelope() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(directory.path().to_path_buf());
+        let subject = "rejected-fixture-subject";
+        let account = select_account(&paths, subject, hfdrive_state::AccountStatus::NeedsSignIn).await;
+        let store = hfdrive_auth::AccountCredentialStore::open(paths.account(account).credentials(), account)
+            .expect("credential store");
+        store.save(&rejected_envelope(subject)).expect("persist rejected envelope");
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Provider::open(paths, "S-1-5-21-fixture".to_owned()),
+        )
+        .await
+        .expect("startup stays bounded over a rejected credential envelope")
+        .expect("provider opens");
+        // The verified identity is retained for display and recovery.
+        let profile = provider.status.borrow().account.profile.clone().expect("display identity");
+        assert_eq!(profile.subject, subject);
+        assert_sign_in_required_startup(&provider, account).await;
+        // The rejected envelope's replayable secrets are neutralized durably:
+        // no later restore path can reactivate them.
+        let saved = store.load().expect("preserved record");
+        assert!(saved.access_token.is_empty(), "a rejected bearer must not survive startup");
+        assert!(saved.refresh_token.is_none(), "a rejected refresh token must not survive startup");
+        assert_eq!(saved.expires_at, 0);
+        assert_eq!(saved.generation, 1, "generation bookkeeping stays monotonic for the replacement login");
+        assert_eq!(saved.subject, subject);
+    }
+
+    struct DeniedLoginFixture {
+        issuer: String,
+        discovery_url: String,
+    }
+
+    impl DeniedLoginFixture {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("OIDC fixture listener");
+            let port = listener.local_addr().expect("OIDC fixture address").port();
+            let issuer = format!("http://127.0.0.1:{port}");
+            let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+            let server_issuer = issuer.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else { return };
+                    let issuer = server_issuer.clone();
+                    tokio::spawn(serve_oidc_connection(stream, issuer));
+                }
+            });
+            Self { issuer, discovery_url }
+        }
+
+        fn auth_manager(&self, state_base: &std::path::Path) -> AuthManager {
+            let manager = AuthManager::with_settings_and_launcher(
+                hfdrive_auth::AuthConfig::with_client_id(Some("fixture-client".to_owned())),
+                hfdrive_auth::OidcSettings::fixture(
+                    &self.issuer,
+                    &self.discovery_url,
+                    "127.0.0.1",
+                    300,
+                ),
+                state_base.to_path_buf(),
+                None,
+                Arc::new(|_: &str| Ok(())),
+            );
+            // The record remains readable, but its neutralizing replacement
+            // fails at the persistence boundary. This preserves the original
+            // unexpired bearer/refresh material across the whole regression.
+            manager.fail_rejection_replacement_for_test(true);
+            manager
+        }
+    }
+
+    async fn serve_oidc_connection(mut stream: tokio::net::TcpStream, issuer: String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let Ok(read) = stream.read(&mut chunk).await else { return };
+            if read == 0 { return; }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+            if request.len() > 64 * 1024 { return; }
+        }
+        let request = String::from_utf8_lossy(&request);
+        let target = request.split_whitespace().nth(1).unwrap_or("");
+        let path = target.split('?').next().unwrap_or(target);
+        let (status, body) = match path {
+            "/.well-known/openid-configuration" => (
+                "200 OK",
+                serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "userinfo_endpoint": format!("{issuer}/userinfo"),
+                    "jwks_uri": format!("{issuer}/jwks"),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["RS256"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                })
+                .to_string(),
+            ),
+            // Discovery requires one RSA key, but a denied authorization never
+            // exchanges a code or verifies an ID-token signature.
+            "/jwks" => (
+                "200 OK",
+                serde_json::json!({"keys": [{
+                    "kty": "RSA", "use": "sig", "kid": "fixture-key",
+                    "alg": "RS256", "n": "AQAB", "e": "AQAB"
+                }]})
+                .to_string(),
+            ),
+            _ => ("404 Not Found", "{\"error\":\"not_found\"}".to_owned()),
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    fn query_parameter<'a>(url: &'a str, name: &str) -> &'a str {
+        url.split_once('?')
+            .and_then(|(_, query)| {
+                query.split('&').find_map(|pair| {
+                    let (candidate, value) = pair.split_once('=')?;
+                    (candidate == name).then_some(value)
+                })
+            })
+            .expect("authorization URL query parameter")
+    }
+
+    fn decode_query_component(value: &str) -> String {
+        let input = value.as_bytes();
+        let mut decoded = Vec::with_capacity(input.len());
+        let mut index = 0;
+        while index < input.len() {
+            if input[index] == b'%' && index + 2 < input.len() {
+                let high = (input[index + 1] as char).to_digit(16);
+                let low = (input[index + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push((high * 16 + low) as u8);
+                    index += 3;
+                    continue;
+                }
+            }
+            decoded.push(input[index]);
+            index += 1;
+        }
+        String::from_utf8(decoded).expect("decoded callback URL is UTF-8")
+    }
+
+    async fn deny_login(authorization_url: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = decode_query_component(query_parameter(authorization_url, "state"));
+        let redirect = decode_query_component(query_parameter(authorization_url, "redirect_uri"));
+        let rest = redirect.strip_prefix("http://").expect("loopback callback");
+        let (authority, path) = rest.split_once('/').expect("callback path");
+        let mut stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .expect("connect to login callback");
+        let request = format!(
+            "GET /{path}?error=access_denied&state={state} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write denial");
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("400"),
+            "the valid denial consumes the login attempt"
+        );
+    }
+
+    /// K11 exact recovery regression: the rejected record loads, neutralizing
+    /// replacement fails, a denied re-login replaces only `last_error`, and a
+    /// restart still selects rejected restoration over the intact envelope.
+    #[tokio::test]
+    async fn rejected_envelope_survives_failed_replacement_denied_relogin_and_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(directory.path().to_path_buf());
+        let subject = "nonreplaceable-rejected-subject";
+        let account = select_account(
+            &paths,
+            subject,
+            hfdrive_state::AccountStatus::NeedsSignIn,
+        )
+        .await;
+        let store = hfdrive_auth::AccountCredentialStore::open(
+            paths.account(account).credentials(),
+            account,
+        )
+        .expect("credential store");
+        store.save(&rejected_envelope(subject)).expect("persist original envelope");
+        assert!(!store.load().expect("record remains readable").access_token.is_empty());
+
+        let fixture = DeniedLoginFixture::start().await;
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Provider::open_with_auth(
+                paths.clone(),
+                "S-1-5-21-fixture".to_owned(),
+                fixture.auth_manager(paths.base()),
+            ),
+        )
+        .await
+        .expect("bounded startup over nonreplaceable rejected envelope")
+        .expect("provider opens");
+        assert_eq!(provider.auth.snapshot().rejected, Some(account));
+        assert_eq!(
+            provider.status.borrow().account.state,
+            AuthenticationState::NeedsSignIn
+        );
+        assert!(
+            !store.load().expect("original record remains readable").access_token.is_empty(),
+            "failed neutralization leaves the original bearer in the record"
+        );
+
+        let login = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.start_login(hfdrive_protocol::StartLoginRequest {
+                operation_id: Uuid::new_v4(),
+                flow: hfdrive_protocol::LoginFlow::Pkce,
+                purpose: hfdrive_protocol::LoginPurpose::Signin,
+                organization_id: None,
+            }),
+        )
+        .await
+        .expect("denied login reaches its authorization instructions")
+        .expect("start denied re-login");
+        deny_login(login.authorization_url.as_deref().expect("authorization URL")).await;
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                provider.auth.wait_for_login(login.session_id),
+            )
+            .await
+            .expect("denied login finishes"),
+            Err(hfdrive_auth::AuthError::Denied)
+        );
+        provider.synchronize_account().await.expect("persist denied-login snapshot");
+
+        let snapshot = provider.auth.snapshot();
+        assert_eq!(snapshot.last_error, Some(hfdrive_auth::AuthError::Denied));
+        assert_eq!(
+            snapshot.rejected,
+            Some(account),
+            "a later denial cannot clear the account-scoped rejection"
+        );
+        assert_eq!(provider.status.borrow().account.state, AuthenticationState::NeedsSignIn);
+        assert_eq!(
+            provider.state.get_account(account).await.expect("account row")
+                .expect("account row persists").status,
+            hfdrive_state::AccountStatus::NeedsSignIn,
+            "Denied is not persisted as an Active account"
+        );
+        assert!(hfdrive_auth::TokenSource::access_token(&*provider.tokens, account).await.is_err());
+        assert!(hfdrive_auth::TokenSource::authorization_lease(&*provider.tokens, account).is_err());
+        assert!(!store.load().expect("original record survives denial").access_token.is_empty());
+
+        drop(provider);
+        let restarted = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Provider::open_with_auth(
+                paths.clone(),
+                "S-1-5-21-fixture".to_owned(),
+                fixture.auth_manager(paths.base()),
+            ),
+        )
+        .await
+        .expect("bounded restart over the original rejected envelope")
+        .expect("provider restarts");
+        assert_sign_in_required_startup(&restarted, account).await;
+        assert_eq!(restarted.auth.snapshot().rejected, Some(account));
+        assert!(
+            !store.load().expect("original envelope survives restart").access_token.is_empty(),
+            "the restart denied token and lease even though the original bearer remained"
+        );
     }
 }

@@ -18,7 +18,7 @@ impl Provider {
             let snapshot = self.auth.snapshot();
             if *persisted_revision == snapshot.revision { return Ok(snapshot); }
             let selected = self.state.selected_account().await.map_err(state_error)?;
-            let needs_sign_in = snapshot.last_error.as_ref().is_some_and(AuthError::needs_sign_in);
+            let needs_sign_in = snapshot.rejected.is_some();
             let mut public = account::status(&snapshot)?;
             let mut admitted = None;
             if let Some(profile) = &snapshot.profile {
@@ -39,15 +39,30 @@ impl Provider {
             } else if let Some(selected) = selected {
                 // A retained selected record is not permission to restore a signed-out,
                 // unreadable, unconfigured, or previously rejected credential envelope.
-                self.state.set_account_status(selected, AccountStatus::NeedsSignIn).await.map_err(state_error)?;
+                // The rejection is persisted exactly once (an already-rejected record
+                // is not rewritten), and a retained selection whose record is gone is
+                // display-only residue: it never fails startup and never blocks the
+                // single NeedsSignIn publication below.
+                if let Some(record) = self.state.get_account(selected).await.map_err(state_error)? {
+                    if record.status != AccountStatus::NeedsSignIn {
+                        self.state.set_account_status(selected, AccountStatus::NeedsSignIn).await.map_err(state_error)?;
+                    }
+                }
                 if snapshot.active_login.as_ref().is_none_or(|login| login.state != LoginState::Pending) {
                     public.state = wire::AuthenticationState::NeedsSignIn;
                     if public.last_error.is_none() { public.last_error = Some(account::failure(AuthError::NeedsSignIn)); }
                 }
             }
             if self.auth.snapshot().revision != snapshot.revision { continue; }
-            let persisted = self.state.selected_account().await.map_err(state_error)?;
-            if persisted != snapshot.profile.as_ref().map(|profile| profile.account_key) { continue; }
+            // Only an admitted session is gated on durable selection agreement.
+            // With no active profile nothing is admitted: a retained selection
+            // is display/recovery state, so requiring it to equal `None` here
+            // would spin forever instead of persisting and publishing
+            // NeedsSignIn exactly once.
+            if let Some(active) = snapshot.profile.as_ref().map(|profile| profile.account_key) {
+                let persisted = self.state.selected_account().await.map_err(state_error)?;
+                if persisted != Some(active) { continue; }
+            }
             match admitted {
                 Some((account, epoch)) => self.tokens.admit(account, epoch),
                 None => self.tokens.clear(),
