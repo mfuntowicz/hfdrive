@@ -23,7 +23,7 @@ use windows::Win32::Storage::FileSystem::{
     FileStandardInfo, FindStreamInfoStandard, OPEN_EXISTING, WIN32_FIND_STREAM_DATA,
 };
 
-use super::handle::OwnedHandle;
+use super::handle::{OwnedHandle, Win32Handle};
 use super::{error_code, last_error_code};
 
 /// `ERROR_INVALID_PARAMETER` (87).
@@ -210,12 +210,12 @@ pub(crate) fn check_writable(path: &Path) -> Result<(), u32> {
     }
 }
 
-fn file_info<T: Copy>(handle: &OwnedHandle, class: FILE_INFO_BY_HANDLE_CLASS) -> Result<T, u32> {
+fn file_info<T: Copy>(handle: &impl Win32Handle, class: FILE_INFO_BY_HANDLE_CLASS) -> Result<T, u32> {
     let mut info: T = unsafe { zeroed() };
     // SAFETY: `info` is a valid, correctly sized buffer for `class`.
     unsafe {
         GetFileInformationByHandleEx(
-            handle.as_win(),
+            handle.as_win32(),
             class,
             &mut info as *mut T as *mut c_void,
             size_of::<T>() as u32,
@@ -231,7 +231,7 @@ pub(crate) struct IdInfo {
     pub file_id: [u8; 16],
 }
 
-pub(crate) fn id_info(handle: &OwnedHandle) -> Result<IdInfo, u32> {
+pub(crate) fn id_info(handle: &impl Win32Handle) -> Result<IdInfo, u32> {
     let info: FILE_ID_INFO = file_info(handle, FileIdInfo)?;
     Ok(IdInfo {
         volume_serial_number: info.VolumeSerialNumber,
@@ -245,7 +245,7 @@ pub(crate) struct AttrTag {
     pub reparse_tag: u32,
 }
 
-pub(crate) fn attr_tag(handle: &OwnedHandle) -> Result<AttrTag, u32> {
+pub(crate) fn attr_tag(handle: &impl Win32Handle) -> Result<AttrTag, u32> {
     let info: FILE_ATTRIBUTE_TAG_INFO = file_info(handle, FileAttributeTagInfo)?;
     Ok(AttrTag {
         attributes: info.FileAttributes,
@@ -259,7 +259,7 @@ pub(crate) struct StandardInfo {
     pub link_count: u32,
 }
 
-pub(crate) fn standard_info(handle: &OwnedHandle) -> Result<StandardInfo, u32> {
+pub(crate) fn standard_info(handle: &impl Win32Handle) -> Result<StandardInfo, u32> {
     let info: FILE_STANDARD_INFO = file_info(handle, FileStandardInfo)?;
     Ok(StandardInfo {
         size: info.EndOfFile as u64,
@@ -272,7 +272,7 @@ pub(crate) struct BasicInfo {
     pub last_write_time_100ns: i64,
 }
 
-pub(crate) fn basic_info(handle: &OwnedHandle) -> Result<BasicInfo, u32> {
+pub(crate) fn basic_info(handle: &impl Win32Handle) -> Result<BasicInfo, u32> {
     let info: FILE_BASIC_INFO = file_info(handle, FileBasicInfo)?;
     Ok(BasicInfo {
         last_write_time_100ns: info.LastWriteTime,
@@ -280,7 +280,7 @@ pub(crate) fn basic_info(handle: &OwnedHandle) -> Result<BasicInfo, u32> {
 }
 
 /// Case-sensitivity flags for the directory (`FILE_CASE_SENSITIVE_INFO`).
-pub(crate) fn case_sensitive_flags(handle: &OwnedHandle) -> Result<u32, u32> {
+pub(crate) fn case_sensitive_flags(handle: &impl Win32Handle) -> Result<u32, u32> {
     let info: FILE_CASE_SENSITIVE_INFO = file_info(handle, FileCaseSensitiveInfo)?;
     Ok(info.Flags)
 }
@@ -292,7 +292,7 @@ pub(crate) struct VolumeInfo {
     pub flags: u32,
 }
 
-pub(crate) fn volume_info(handle: &OwnedHandle) -> Result<VolumeInfo, u32> {
+pub(crate) fn volume_info(handle: &impl Win32Handle) -> Result<VolumeInfo, u32> {
     let mut name = vec![0u16; 261];
     let mut fs = vec![0u16; 261];
     let mut serial = 0u32;
@@ -301,7 +301,7 @@ pub(crate) fn volume_info(handle: &OwnedHandle) -> Result<VolumeInfo, u32> {
     // SAFETY: buffers are valid mutable slices for the call.
     unsafe {
         GetVolumeInformationByHandleW(
-            handle.as_win(),
+            handle.as_win32(),
             Some(&mut name),
             Some(&mut serial),
             Some(&mut max_component),
@@ -319,11 +319,11 @@ pub(crate) fn volume_info(handle: &OwnedHandle) -> Result<VolumeInfo, u32> {
 
 /// Final normalized DOS path of an open handle (rejects `.`/`..` spelling
 /// and reveals junction redirection).
-pub(crate) fn final_path(handle: &OwnedHandle) -> Result<String, u32> {
+pub(crate) fn final_path(handle: &impl Win32Handle) -> Result<String, u32> {
     let mut buf = vec![0u16; 32768];
     // SAFETY: `buf` is a valid mutable buffer.
     let len = unsafe {
-        GetFinalPathNameByHandleW(handle.as_win(), &mut buf, windows::Win32::Storage::FileSystem::VOLUME_NAME_DOS)
+        GetFinalPathNameByHandleW(handle.as_win32(), &mut buf, windows::Win32::Storage::FileSystem::VOLUME_NAME_DOS)
     };
     if len == 0 || len as usize >= buf.len() {
         return Err(last_error_code());

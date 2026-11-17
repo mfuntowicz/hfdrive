@@ -3,10 +3,18 @@
 //! Every operation here states its preconditions in types and re-checks the
 //! verifiable ones through handles before touching CFAPI:
 //!
-//! * [`set_in_sync`] / [`update_placeholder`] / [`convert_published`] bind to
-//!   the caller's observed [`FileState`] **including the expected USN**. A
-//!   missing expected USN (`None`) is never a successful match — the guard
-//!   returns [`GuardMismatch::UsnUnknown`] and the file stays dirty/old.
+//! * [`set_in_sync`] / [`update_placeholder`] / [`revert_to_normal`] /
+//!   [`convert_published`] bind to the caller's observed [`FileState`]
+//!   **including the expected USN**. A missing expected USN (`None`) is
+//!   never a successful match — the guard returns
+//!   [`GuardMismatch::UsnUnknown`] and the file stays dirty/old.
+//! * The strict guard is revalidated **on the final guarded object**: the
+//!   identity/size/mtime/USN evidence is read back through the borrowed
+//!   Win32 alias (`CfReferenceProtectedHandle` +
+//!   `CfGetWin32HandleFromProtectedHandle`, never closed) of the very same
+//!   protected handle that performs the mutation. Nothing can be replaced
+//!   between the last check and the CFAPI call, because both run on one
+//!   open.
 //! * [`update_placeholder`] uses `VERIFY_IN_SYNC | MARK_IN_SYNC` and
 //!   invalidates exactly the supplied old ranges.
 //! * [`dehydrate`] requires a [`FreeSpaceEvidence`] with every flag true
@@ -27,6 +35,7 @@ use std::path::Path;
 use hfdrive_core::storage::ByteRange;
 
 use crate::ffi::cfapi::{self as raw, MetadataBytes, PendingCreate};
+use crate::ffi::handle::{BorrowedWin32Handle, CfaHandle, ProtectedHandle, Win32Handle};
 use crate::ffi::volume as raw_volume;
 
 use super::identity::PlaceholderIdentity;
@@ -162,32 +171,35 @@ impl FreeSpaceEvidence {
 // Shared guard machinery
 // ---------------------------------------------------------------------------
 
-fn guard_check(
-    handle: &crate::ffi::handle::OwnedHandle,
+/// Pure comparison between the caller's expected state and the evidence
+/// observed **on the final guarded object**. Deterministic and OS-free, so
+/// replacement/refusal behavior is unit-testable: any difference (including
+/// a different NTFS file id or volume serial — i.e. the path was replaced)
+/// refuses the mutation with the specific [`GuardMismatch`].
+#[allow(clippy::too_many_arguments)]
+fn compare_expected(
     expect: &crate::filesystem::volume::FileState,
+    observed_volume_serial: u64,
+    observed_file_id: [u8; 16],
+    observed_size: u64,
+    observed_mtime_100ns: i64,
+    observed_usn: Option<i64>,
     strict_usn: bool,
 ) -> Result<(), GuardMismatch> {
-    // CFAPI oplock handles are opaque and cannot service Win32 metadata or
-    // USN calls. `handle` is a separate normal query handle opened before
-    // the CFAPI transition handle, never the opaque CFAPI handle itself.
-    let id = raw_volume::id_info(&handle).map_err(|_| GuardMismatch::StateChanged)?;
-    let std = raw_volume::standard_info(&handle).map_err(|_| GuardMismatch::StateChanged)?;
-    let basic = raw_volume::basic_info(&handle).map_err(|_| GuardMismatch::StateChanged)?;
-    if id.volume_serial_number != expect.identity.volume_serial_number
-        || id.file_id != expect.identity.file_id
+    if observed_volume_serial != expect.identity.volume_serial_number
+        || observed_file_id != expect.identity.file_id
     {
         return Err(GuardMismatch::IdentityChanged);
     }
-    if std.size != expect.size {
+    if observed_size != expect.size {
         return Err(GuardMismatch::SizeChanged);
     }
-    if basic.last_write_time_100ns != expect.last_write_time_100ns {
+    if observed_mtime_100ns != expect.last_write_time_100ns {
         return Err(GuardMismatch::TimeChanged);
     }
-    let current = crate::ffi::usn::file_usn(&handle).map_err(|_| GuardMismatch::UsnUnknown)?;
     if strict_usn {
         // A missing expected USN or a missing current USN is never a match.
-        match (expect.usn, current) {
+        match (expect.usn, observed_usn) {
             (Some(expected), Some(current)) if expected == current => Ok(()),
             (Some(_), Some(_)) => Err(GuardMismatch::UsnChanged),
             _ => Err(GuardMismatch::UsnUnknown),
@@ -195,6 +207,41 @@ fn guard_check(
     } else {
         Ok(())
     }
+}
+
+fn guard_check(
+    handle: &impl Win32Handle,
+    expect: &crate::filesystem::volume::FileState,
+    strict_usn: bool,
+) -> Result<(), GuardMismatch> {
+    // Win32 metadata queries run on a Win32 handle view: an ordinary query
+    // handle, or the borrowed (never closed) `CfGetWin32HandleFromProtectedHandle`
+    // alias of the protected handle that will perform the mutation. The
+    // opaque CFAPI handle itself cannot service these calls.
+    let id = raw_volume::id_info(handle).map_err(|_| GuardMismatch::StateChanged)?;
+    let std = raw_volume::standard_info(handle).map_err(|_| GuardMismatch::StateChanged)?;
+    let basic = raw_volume::basic_info(handle).map_err(|_| GuardMismatch::StateChanged)?;
+    // Identity/size/mtime precede USN evidence so a USN query failure never
+    // masks a replacement (identity) mismatch.
+    compare_expected(
+        expect,
+        id.volume_serial_number,
+        id.file_id,
+        std.size,
+        basic.last_write_time_100ns,
+        None,
+        false,
+    )?;
+    let current = crate::ffi::usn::file_usn(handle).map_err(|_| GuardMismatch::UsnUnknown)?;
+    compare_expected(
+        expect,
+        id.volume_serial_number,
+        id.file_id,
+        std.size,
+        basic.last_write_time_100ns,
+        current,
+        strict_usn,
+    )
 }
 
 fn map_open(code: u32) -> CfError {
@@ -220,16 +267,36 @@ fn map_fs(error: super::super::filesystem::FsError) -> CfError {
 // Guarded transitions
 // ---------------------------------------------------------------------------
 
+/// Revalidate `expect` on the **final guarded object**: the same open that
+/// will perform the mutation. The Win32 metadata/USN queries run through the
+/// borrowed alias of the protected handle (never closed; the protected
+/// handle is closed exactly once when `open` drops), so nothing can be
+/// replaced between this check and the CFAPI call. `None` means the alias
+/// could not be derived: the guard cannot be proven and the caller must
+/// refuse the mutation.
+fn alias_guard(
+    open: &ProtectedHandle,
+    expect: &crate::filesystem::volume::FileState,
+) -> Option<Result<(), GuardMismatch>> {
+    let alias: BorrowedWin32Handle<'_> = open.win32()?;
+    Some(guard_check(&alias, expect, true))
+}
+
 /// Mark a placeholder in-sync **only** when the local state still matches
 /// `expect` (identity, size, mtime and exactly the expected USN). A mismatch
 /// (including any unknown USN) leaves the file dirty.
+///
+/// The expected state is revalidated on the final guarded object — the same
+/// protected handle that runs `CfSetInSyncState` — so an object replaced
+/// between opens can never be marked in-sync against stale evidence.
 pub fn set_in_sync(path: &Path, expect: &crate::filesystem::volume::FileState) -> Result<GuardOutcome, CfError> {
-    let metadata_handle = raw_volume::open_query(path, true).map_err(map_open)?;
-    if let Err(mismatch) = guard_check(&metadata_handle, expect, true) {
-        return Ok(GuardOutcome::Mismatch(mismatch));
-    }
-    drop(metadata_handle);
     let handle = raw::open_with_oplock(path, true, true).map_err(map_open)?;
+    match alias_guard(&handle, expect) {
+        // No alias: the object cannot be revalidated on this open; refuse.
+        None => return Ok(GuardOutcome::Mismatch(GuardMismatch::StateChanged)),
+        Some(Err(mismatch)) => return Ok(GuardOutcome::Mismatch(mismatch)),
+        Some(Ok(())) => {}
+    }
     let usn = raw::set_in_sync(&handle).map_err(|code| CfError::Win32 {
         operation: "CfSetInSyncState",
         code,
@@ -240,19 +307,20 @@ pub fn set_in_sync(path: &Path, expect: &crate::filesystem::volume::FileState) -
 /// Apply a new immutable version to a placeholder:
 /// `CfUpdatePlaceholder` with `VERIFY_IN_SYNC | MARK_IN_SYNC`, new metadata,
 /// new identity and invalidated old ranges. Requires the strict guard
-/// (identity, size, mtime, exact expected USN); old-version fetch requests
-/// must already be drained by the caller's scheduler.
+/// (identity, size, mtime, exact expected USN), revalidated on the final
+/// guarded object — the same protected handle that runs the update; old
+/// version fetch requests must already be drained by the caller's scheduler.
 pub fn update_placeholder(
     path: &Path,
     spec: &UpdateSpec,
     expect: &crate::filesystem::volume::FileState,
 ) -> Result<GuardOutcome, CfError> {
-    let metadata_handle = raw_volume::open_query(path, true).map_err(map_open)?;
-    if let Err(mismatch) = guard_check(&metadata_handle, expect, true) {
-        return Ok(GuardOutcome::Mismatch(mismatch));
-    }
-    drop(metadata_handle);
     let handle = raw::open_with_oplock(path, true, true).map_err(map_open)?;
+    match alias_guard(&handle, expect) {
+        None => return Ok(GuardOutcome::Mismatch(GuardMismatch::StateChanged)),
+        Some(Err(mismatch)) => return Ok(GuardOutcome::Mismatch(mismatch)),
+        Some(Ok(())) => {}
+    }
     let identity = spec.identity.encode();
     let mut invalidate = Vec::with_capacity(spec.invalidate.len());
     for range in &spec.invalidate {
@@ -324,9 +392,12 @@ pub fn convert_published(
 ///    function is idempotent for reconnect/unlink loops).
 /// 2. Strict guard against `expect`: identity, size, modification time and
 ///    **exactly the expected USN** (a missing expected or current USN is
-///    `GuardOutcome::Mismatch(UsnUnknown)`, never success). Content that
-///    changed since the caller's observation — including dirty local edits —
-///    therefore stays a placeholder for the caller's recovery path.
+///    `GuardOutcome::Mismatch(UsnUnknown)`, never success). The evidence is
+///    revalidated on the **final guarded object** — the same protected
+///    handle that runs `CfRevertPlaceholder` — through its borrowed Win32
+///    alias. Content that changed since the caller's observation —
+///    including dirty local edits or a replaced object — therefore stays a
+///    placeholder for the caller's recovery path.
 /// 3. Full residency is proven from real on-disk ranges before the call:
 ///    online-only content must be hydrated or exported first
 ///    ([`CfError::Precondition`]). No bytes are ever discarded, so this
@@ -351,14 +422,17 @@ pub fn revert_to_normal(
         return Ok(GuardOutcome::Applied { usn: state.usn });
     }
 
-    // 2. Strict identity/size/mtime/USN guard through a normal metadata
-    //    handle, closed before the write+exclusive CFAPI oplock is acquired.
-    let metadata_handle = raw_volume::open_query(path, true).map_err(map_open)?;
-    if let Err(mismatch) = guard_check(&metadata_handle, expect, true) {
-        return Ok(GuardOutcome::Mismatch(mismatch));
-    }
-    drop(metadata_handle);
+    // 2. Strict identity/size/mtime/USN guard, revalidated on the final
+    //    guarded object: the same protected handle that will revert, with
+    //    the metadata evidence read back through its borrowed (never
+    //    closed) Win32 alias. No separate pre-open can be replaced by a
+    //    racing object between the check and the mutation.
     let handle = raw::open_with_oplock(path, true, true).map_err(map_open)?;
+    match alias_guard(&handle, expect) {
+        None => return Ok(GuardOutcome::Mismatch(GuardMismatch::StateChanged)),
+        Some(Err(mismatch)) => return Ok(GuardOutcome::Mismatch(mismatch)),
+        Some(Ok(())) => {}
+    }
 
     // 3. Proof of full residency (empty files are trivially resident).
     if !is_fully_resident(&handle, expect.size)? {
@@ -376,7 +450,9 @@ pub fn revert_to_normal(
 
 /// Set pin state and report, separately, whether the content is now fully
 /// resident. The residency answer is computed from the real on-disk ranges;
-/// it is never assumed.
+/// it is never assumed. The Win32 size query runs on the borrowed
+/// `CfGetWin32HandleFromProtectedHandle` alias of this same open (never
+/// closed; the protected handle is closed exactly once on drop).
 pub fn set_pin_state(path: &Path, request: PinRequest) -> Result<PinOutcome, CfError> {
     let handle = raw::open_with_oplock(path, false, false).map_err(map_open)?;
     let pin = match request {
@@ -388,7 +464,10 @@ pub fn set_pin_state(path: &Path, request: PinRequest) -> Result<PinOutcome, CfE
         operation: "CfSetPinState",
         code,
     })?;
-    let std = raw_volume::standard_info(&handle).map_err(|code| CfError::Win32 {
+    let alias = handle.win32().ok_or(CfError::Precondition(
+        "protected handle could not be converted for Win32 metadata queries",
+    ))?;
+    let std = raw_volume::standard_info(&alias).map_err(|code| CfError::Win32 {
         operation: "GetFileInformationByHandleEx(FileStandardInfo)",
         code,
     })?;
@@ -400,9 +479,13 @@ pub fn set_pin_state(path: &Path, request: PinRequest) -> Result<PinOutcome, CfE
 }
 
 /// Hydrate one range of a placeholder through the provider's fetch pipeline.
+/// The bound check uses the borrowed Win32 alias of the same open.
 pub fn hydrate_range(path: &Path, range: ByteRange) -> CfResult<()> {
     let handle = raw::open_with_oplock(path, false, false).map_err(map_open)?;
-    let std = raw_volume::standard_info(&handle).map_err(|code| CfError::Win32 {
+    let alias = handle.win32().ok_or(CfError::Precondition(
+        "protected handle could not be converted for Win32 metadata queries",
+    ))?;
+    let std = raw_volume::standard_info(&alias).map_err(|code| CfError::Win32 {
         operation: "GetFileInformationByHandleEx(FileStandardInfo)",
         code,
     })?;
@@ -454,7 +537,7 @@ pub fn resident_bytes(path: &Path, size: u64) -> CfResult<u64> {
 }
 
 fn resident_bytes_on_handle(
-    handle: &crate::ffi::handle::OwnedHandle,
+    handle: &impl CfaHandle,
     size: u64,
 ) -> CfResult<u64> {
     if size == 0 {
@@ -480,7 +563,7 @@ fn resident_bytes_on_handle(
     Ok(total)
 }
 
-fn is_fully_resident(handle: &crate::ffi::handle::OwnedHandle, size: u64) -> CfResult<bool> {
+fn is_fully_resident(handle: &impl CfaHandle, size: u64) -> CfResult<bool> {
     if size == 0 {
         return Ok(true);
     }
@@ -902,5 +985,233 @@ mod tests {
         let result = delete_owned_placeholder(&path, &expected, &identity).unwrap();
         assert_eq!(result, GuardOutcome::Mismatch(GuardMismatch::IdentityChanged));
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement object must survive");
+    }
+
+    // -- final-object guard: replacement refusal (K08) --------------------
+
+    /// The strict guard observes the *final* object; a path replacement
+    /// between the caller's observation and the mutation changes the NTFS
+    /// identity (or at minimum the observed generation) and is refused
+    /// before any CFAPI call. Runs against the real filesystem; the exact
+    /// mismatch kind is asserted separately below (pure, synthetic).
+    #[test]
+    fn a_replacement_between_opens_is_refused_by_the_final_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guarded.txt");
+        std::fs::write(&path, b"reviewed bytes").unwrap();
+        let expect = crate::filesystem::volume::query_file_state(&path).unwrap();
+
+        // The object is replaced by a different NTFS object at the same
+        // path: identity, size and the observed USN all drift from the
+        // caller's evidence.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement bytes are longer").unwrap();
+        let live = crate::filesystem::volume::query_file_state(&path).unwrap();
+
+        let result = compare_expected(
+            &expect,
+            live.identity.volume_serial_number,
+            live.identity.file_id,
+            live.size,
+            live.last_write_time_100ns,
+            live.usn,
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "a replaced object is never mutated against stale evidence: {result:?}"
+        );
+    }
+
+    /// A changed NTFS file id or volume serial — exactly what a replacement
+    /// yields when the path now names a different object — is refused as
+    /// [`GuardMismatch::IdentityChanged`]. Pure and synthetic: deterministic
+    /// on any volume, with or without a USN journal.
+    #[test]
+    fn a_replaced_ntfs_identity_is_refused_as_identity_changed() {
+        let expect = synthetic_state(Some(7));
+        // Same size/mtime/USN, different NTFS object.
+        let mut replacement_id = expect.identity.file_id;
+        replacement_id[0] ^= 1;
+        assert_eq!(
+            compare_expected(
+                &expect,
+                expect.identity.volume_serial_number,
+                replacement_id,
+                expect.size,
+                expect.last_write_time_100ns,
+                expect.usn,
+                true,
+            ),
+            Err(GuardMismatch::IdentityChanged)
+        );
+        // A different volume (the path now resolves elsewhere) likewise.
+        assert_eq!(
+            compare_expected(
+                &expect,
+                expect.identity.volume_serial_number ^ 1,
+                expect.identity.file_id,
+                expect.size,
+                expect.last_write_time_100ns,
+                expect.usn,
+                true,
+            ),
+            Err(GuardMismatch::IdentityChanged)
+        );
+    }
+
+    /// Even with an identical NTFS identity (a same-file content edit), the
+    /// guard distinguishes size, mtime and USN drift — each refusal keeps
+    /// the file untouched. Pure and synthetic: deterministic on any volume.
+    #[test]
+    fn size_time_and_usn_drift_are_each_refused() {
+        let expect = synthetic_state(Some(7));
+        let serial = expect.identity.volume_serial_number;
+        let id = expect.identity.file_id;
+
+        // Size drift at the same identity.
+        assert_eq!(
+            compare_expected(
+                &expect,
+                serial,
+                id,
+                expect.size + 1,
+                expect.last_write_time_100ns,
+                expect.usn,
+                true,
+            ),
+            Err(GuardMismatch::SizeChanged)
+        );
+
+        // Same identity and size but a new mtime: time drift.
+        assert_eq!(
+            compare_expected(
+                &expect,
+                serial,
+                id,
+                expect.size,
+                expect.last_write_time_100ns + 1,
+                expect.usn,
+                true,
+            ),
+            Err(GuardMismatch::TimeChanged)
+        );
+
+        // Same identity/size/mtime but a newer USN: USN drift.
+        assert_eq!(
+            compare_expected(
+                &expect,
+                serial,
+                id,
+                expect.size,
+                expect.last_write_time_100ns,
+                Some(8),
+                true,
+            ),
+            Err(GuardMismatch::UsnChanged)
+        );
+    }
+
+    /// USN evidence is never a wildcard: an unknown expected or observed USN
+    /// refuses the mutation instead of matching anything.
+    #[test]
+    fn unknown_usn_evidence_is_never_a_match() {
+        let observed = synthetic_state(Some(7));
+        let serial = observed.identity.volume_serial_number;
+        let id = observed.identity.file_id;
+
+        // Observed USN unknown.
+        assert_eq!(
+            compare_expected(
+                &observed,
+                serial,
+                id,
+                observed.size,
+                observed.last_write_time_100ns,
+                None,
+                true,
+            ),
+            Err(GuardMismatch::UsnUnknown)
+        );
+
+        // Expected USN unknown (the caller never observed one).
+        let mut unobserved = observed.clone();
+        unobserved.usn = None;
+        assert_eq!(
+            compare_expected(
+                &unobserved,
+                serial,
+                id,
+                unobserved.size,
+                unobserved.last_write_time_100ns,
+                Some(7),
+                true,
+            ),
+            Err(GuardMismatch::UsnUnknown)
+        );
+
+        // Both unknown is likewise not a match under the strict guard.
+        assert_eq!(
+            compare_expected(
+                &unobserved,
+                serial,
+                id,
+                unobserved.size,
+                unobserved.last_write_time_100ns,
+                None,
+                true,
+            ),
+            Err(GuardMismatch::UsnUnknown)
+        );
+    }
+
+    /// A fully matching observation applies: identity, size, mtime and the
+    /// exact expected USN.
+    #[test]
+    fn matching_final_evidence_applies() {
+        let expect = synthetic_state(Some(7));
+        assert_eq!(
+            compare_expected(
+                &expect,
+                expect.identity.volume_serial_number,
+                expect.identity.file_id,
+                expect.size,
+                expect.last_write_time_100ns,
+                expect.usn,
+                true,
+            ),
+            Ok(())
+        );
+        // Non-strict mode ignores USN evidence entirely (used where USN is
+        // deliberately not part of the guard, e.g. residency queries).
+        assert_eq!(
+            compare_expected(
+                &expect,
+                expect.identity.volume_serial_number,
+                expect.identity.file_id,
+                expect.size,
+                expect.last_write_time_100ns,
+                None,
+                false,
+            ),
+            Ok(())
+        );
+    }
+
+    /// Synthetic expected state with a fixed identity and USN: the guard
+    /// comparison is pure, so no volume, journal or placeholder is needed.
+    fn synthetic_state(usn: Option<i64>) -> crate::filesystem::volume::FileState {
+        crate::filesystem::volume::FileState {
+            identity: crate::filesystem::volume::FileIdentity {
+                volume_serial_number: 0x1111_2222_3333_4444,
+                file_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                link_count: 1,
+                attributes: 0x20,
+                reparse_tag: 0,
+            },
+            size: 4096,
+            last_write_time_100ns: 133_000_000_000,
+            usn,
+        }
     }
 }

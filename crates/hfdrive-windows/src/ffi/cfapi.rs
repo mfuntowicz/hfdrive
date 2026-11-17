@@ -47,7 +47,7 @@ use crate::cfapi::events::{
     PlaceholdersRequest, ProviderEvent, RenameCompletion, RenameNotification, TransferStatus,
 };
 use crate::cfapi::identity::PlaceholderIdentity;
-use super::handle::OwnedHandle;
+use super::handle::{CfaHandle, ProtectedHandle};
 
 // ---------------------------------------------------------------------------
 // EventSink: the safe side of the boundary
@@ -1370,13 +1370,14 @@ fn execute(
 
 /// Open a placeholder with oplock protection (`CfOpenFileWithOplock`).
 /// `exclusive` requires exclusive access (guarded transitions); `write`
-/// requests write access. The returned opaque CFAPI handle is closed with
-/// `CfCloseHandle`; it is not a normal Win32 file handle.
+/// requests write access. The returned opaque protected handle is closed
+/// exactly once with `CfCloseHandle`; Win32 metadata/USN queries on the same
+/// open go through `ProtectedHandle::win32` (borrowed, never closed).
 pub(crate) fn open_with_oplock(
     path: &Path,
     write: bool,
     exclusive: bool,
-) -> Result<OwnedHandle, u32> {
+) -> Result<ProtectedHandle, u32> {
     let w = wide(path);
     let mut flags = CF_OPEN_FILE_FLAG_FOREGROUND;
     if write {
@@ -1385,12 +1386,13 @@ pub(crate) fn open_with_oplock(
     if exclusive {
         flags |= CF_OPEN_FILE_FLAG_EXCLUSIVE;
     }
-    // SAFETY: `w` is NUL-terminated; the returned handle is owned exactly
-    // once by `OwnedHandle`.
+    // SAFETY: `w` is NUL-terminated; the returned opaque handle is owned
+    // exactly once by `ProtectedHandle`.
     unsafe {
         let raw = CfOpenFileWithOplock(windows::core::PCWSTR(w.as_ptr()), flags)
             .map_err(|e| super::error_code(&e))?;
-        OwnedHandle::from_cfapi_raw(raw).ok_or_else(super::last_error_code)
+        ProtectedHandle::from_raw_with(raw, super::handle::CfaProtectedOps)
+            .ok_or_else(super::last_error_code)
     }
 }
 
@@ -1429,7 +1431,7 @@ pub(crate) fn create_placeholders(
 /// the caller's expected USN. Remote replacement verifies in-sync state;
 /// publication of captured local bytes marks in-sync without invalidating data.
 pub(crate) fn update_placeholder(
-    handle: &OwnedHandle,
+    handle: &impl CfaHandle,
     metadata: Option<&MetadataBytes>,
     identity: &[u8],
     invalidate: &[(i64, i64)],
@@ -1449,7 +1451,7 @@ pub(crate) fn update_placeholder(
     // outlive the synchronous call.
     unsafe {
         CfUpdatePlaceholder(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             metadata.as_ref().map(|metadata| metadata as *const CF_FS_METADATA),
             Some(identity.as_ptr() as *const c_void),
             identity.len() as u32,
@@ -1469,12 +1471,12 @@ pub(crate) fn update_placeholder(
 
 /// Convert a verified, already-published local file into a provider
 /// placeholder, preserving its identity and generation evidence.
-pub(crate) fn convert_to_placeholder(handle: &OwnedHandle, identity: &[u8]) -> Result<i64, u32> {
+pub(crate) fn convert_to_placeholder(handle: &impl CfaHandle, identity: &[u8]) -> Result<i64, u32> {
     let mut usn = 0i64;
     // SAFETY: `identity` outlives the synchronous call.
     unsafe {
         CfConvertToPlaceholder(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             Some(identity.as_ptr() as *const c_void),
             identity.len() as u32,
             CF_CONVERT_FLAG_MARK_IN_SYNC,
@@ -1492,11 +1494,11 @@ pub(crate) fn convert_to_placeholder(handle: &OwnedHandle, identity: &[u8]) -> R
 /// clearing path (cldapi.dll). The safe layer has already proven full
 /// residency, clean state and the exact identity/USN guard before this call;
 /// this adapter never invents success and reports the OS result verbatim.
-pub(crate) fn revert_to_normal(handle: &OwnedHandle) -> Result<(), u32> {
+pub(crate) fn revert_to_normal(handle: &impl CfaHandle) -> Result<(), u32> {
     // SAFETY: handle is a live placeholder handle; synchronous completion.
     unsafe {
         CfRevertPlaceholder(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             CF_REVERT_FLAG_NONE,
             None,
         )
@@ -1507,12 +1509,12 @@ pub(crate) fn revert_to_normal(handle: &OwnedHandle) -> Result<(), u32> {
 /// Mark a placeholder in-sync, returning the USN it was stamped at. Callers
 /// must have verified the expected USN/generation **before** calling; this
 /// call never performs that verification itself.
-pub(crate) fn set_in_sync(handle: &OwnedHandle) -> Result<i64, u32> {
+pub(crate) fn set_in_sync(handle: &impl CfaHandle) -> Result<i64, u32> {
     let mut usn = 0i64;
     // SAFETY: handle is a live placeholder handle.
     unsafe {
         CfSetInSyncState(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             CF_IN_SYNC_STATE_IN_SYNC,
             CF_SET_IN_SYNC_FLAG_NONE,
             Some(&mut usn),
@@ -1530,7 +1532,7 @@ pub(crate) enum PinRequest {
     Excluded,
 }
 
-pub(crate) fn set_pin(handle: &OwnedHandle, pin: PinRequest) -> Result<(), u32> {
+pub(crate) fn set_pin(handle: &impl CfaHandle, pin: PinRequest) -> Result<(), u32> {
     let state = match pin {
         PinRequest::Pinned => CF_PIN_STATE_PINNED,
         PinRequest::Unpinned => CF_PIN_STATE_UNPINNED,
@@ -1539,7 +1541,7 @@ pub(crate) fn set_pin(handle: &OwnedHandle, pin: PinRequest) -> Result<(), u32> 
     // SAFETY: handle is live; synchronous completion.
     unsafe {
         CfSetPinState(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             state,
             CF_SET_PIN_FLAG_NONE,
             None,
@@ -1548,11 +1550,11 @@ pub(crate) fn set_pin(handle: &OwnedHandle, pin: PinRequest) -> Result<(), u32> 
     }
 }
 
-pub(crate) fn hydrate(handle: &OwnedHandle, start: i64, length: i64) -> Result<(), u32> {
+pub(crate) fn hydrate(handle: &impl CfaHandle, start: i64, length: i64) -> Result<(), u32> {
     // SAFETY: handle is live; synchronous completion.
     unsafe {
         CfHydratePlaceholder(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             start,
             length,
             CF_HYDRATE_FLAG_NONE,
@@ -1564,11 +1566,11 @@ pub(crate) fn hydrate(handle: &OwnedHandle, start: i64, length: i64) -> Result<(
 
 /// Dehydrate the whole file. Only called after the safe layer verified the
 /// free-space preconditions (clean, unpinned, in-sync, no pending work).
-pub(crate) fn dehydrate(handle: &OwnedHandle) -> Result<(), u32> {
+pub(crate) fn dehydrate(handle: &impl CfaHandle) -> Result<(), u32> {
     // SAFETY: handle is live; synchronous completion.
     unsafe {
         CfDehydratePlaceholder(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             0,
             0,
             CF_DEHYDRATE_FLAG_NONE,
@@ -1585,13 +1587,13 @@ pub(crate) struct PlaceholderInfoBits {
     pub in_sync_state: i32,
 }
 
-pub(crate) fn placeholder_info(handle: &OwnedHandle) -> Result<PlaceholderInfoBits, u32> {
+pub(crate) fn placeholder_info(handle: &impl CfaHandle) -> Result<PlaceholderInfoBits, u32> {
     let mut buffer = vec![0u8; size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 512];
     let mut returned = 0u32;
     // SAFETY: `buffer` is a valid output buffer for the basic info class.
     unsafe {
         CfGetPlaceholderInfo(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             CF_PLACEHOLDER_INFO_BASIC,
             buffer.as_mut_ptr() as *mut c_void,
             buffer.len() as u32,
@@ -1629,7 +1631,7 @@ pub(crate) const ERROR_NOT_A_CLOUD_FILE: u32 = 376;
 /// generated `CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH`, so any identity the
 /// API can hold fits in one call, and a reported length that overruns the
 /// buffer is `ERROR_INVALID_DATA`, never an over-read.
-pub(crate) fn placeholder_identity(handle: &OwnedHandle) -> Result<Vec<u8>, u32> {
+pub(crate) fn placeholder_identity(handle: &impl CfaHandle) -> Result<Vec<u8>, u32> {
     let mut buffer =
         vec![0u8; IDENTITY_INFO_OFFSET + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize];
     let mut returned = 0u32;
@@ -1638,7 +1640,7 @@ pub(crate) fn placeholder_identity(handle: &OwnedHandle) -> Result<Vec<u8>, u32>
     // the generated API defines.
     unsafe {
         CfGetPlaceholderInfo(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             CF_PLACEHOLDER_INFO_BASIC,
             buffer.as_mut_ptr() as *mut c_void,
             buffer.len() as u32,
@@ -1685,7 +1687,7 @@ fn identity_from_info_buffer(buffer: &[u8]) -> Result<Vec<u8>, u32> {
 
 /// On-disk (resident) ranges of a placeholder as `(offset, length)` pairs.
 pub(crate) fn on_disk_ranges(
-    handle: &OwnedHandle,
+    handle: &impl CfaHandle,
     start: i64,
     length: i64,
 ) -> Result<Vec<(u64, u64)>, u32> {
@@ -1694,7 +1696,7 @@ pub(crate) fn on_disk_ranges(
     // SAFETY: `ranges` is a valid output array.
     unsafe {
         CfGetPlaceholderRangeInfo(
-            super::volume::as_handle(handle),
+            handle.as_cfa(),
             CF_PLACEHOLDER_RANGE_INFO_ONDISK,
             start,
             length,

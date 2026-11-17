@@ -19,7 +19,7 @@ use windows::Win32::System::Ioctl::{
     FSCTL_READ_USN_JOURNAL, FSCTL_QUERY_USN_JOURNAL,
 };
 
-use super::handle::OwnedHandle;
+use super::handle::{OwnedHandle, Win32Handle};
 use super::{error_code, last_error_code};
 
 /// `ERROR_INVALID_PARAMETER` (87).
@@ -201,13 +201,17 @@ pub(crate) fn enum_records(
 
 /// Current USN of an open file as evidence (`FSCTL_READ_FILE_USN_DATA`).
 /// `Ok(None)` when the volume has no usable USN journal for this file.
-pub(crate) fn file_usn(handle: &OwnedHandle) -> Result<Option<i64>, u32> {
+///
+/// Accepts any Win32 handle view: an owned query handle or the borrowed
+/// alias of a protected CFAPI handle (which is exactly what the guarded
+/// transitions use to revalidate the object they are about to mutate).
+pub(crate) fn file_usn(handle: &impl Win32Handle) -> Result<Option<i64>, u32> {
     let mut buffer = vec![0u8; 512];
     let mut returned = 0u32;
     // SAFETY: `buffer` is a valid output buffer.
     let outcome = unsafe {
         DeviceIoControl(
-            super::volume::as_handle(handle),
+            handle.as_win32(),
             FSCTL_READ_FILE_USN_DATA,
             None,
             0,
