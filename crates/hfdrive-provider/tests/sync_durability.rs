@@ -7,7 +7,7 @@
 use hfdrive_core::ids::{ActionId, ConnectionId, ItemId, OperationId, SnapshotId, UploadId};
 use hfdrive_core::storage::{ObjectRef, PayloadKey, Sha256Digest, XetFileId};
 use hfdrive_provider::sync::apply::{
-    ExpectedLocal, RecoveryDecision, classify_recovered, verify_expected,
+    ExpectedLocal, Probe, RecoveryDecision, TargetProof, classify_recovered, verify_expected,
 };
 use hfdrive_provider::sync::observe::{EchoTable, PendingRemovals, echo_matches};
 use hfdrive_provider::sync::outbox::{
@@ -210,13 +210,19 @@ fn identity_size_time_and_usn_all_guard_the_transition() {
 #[test]
 fn interrupted_local_actions_classify_against_real_file_facts() {
     use hfdrive_state::LocalActionKind as K;
+    // A create closes only when the target provably holds this item's exact
+    // placeholder: mere target existence is never "already done".
     assert_eq!(
-        classify_recovered(K::CreatePlaceholder, None, None, true),
+        classify_recovered(K::CreatePlaceholder, None, &Probe::Missing, 0, TargetProof::JournaledObject),
         RecoveryDecision::Done
     );
     assert_eq!(
-        classify_recovered(K::CreatePlaceholder, None, None, false),
+        classify_recovered(K::CreatePlaceholder, None, &Probe::Missing, 0, TargetProof::Missing),
         RecoveryDecision::Retry
+    );
+    assert_eq!(
+        classify_recovered(K::CreatePlaceholder, None, &Probe::Missing, 0, TargetProof::ForeignObject),
+        RecoveryDecision::Requeue
     );
     let expected = ExpectedLocal {
         file_id: [3; 16],
@@ -225,24 +231,42 @@ fn interrupted_local_actions_classify_against_real_file_facts() {
         usn: Some(5),
     };
     assert_eq!(
-        classify_recovered(K::UpdatePlaceholder, Some(&expected), Some(&file_state([3; 16], Some(5))), true),
+        classify_recovered(
+            K::UpdatePlaceholder,
+            Some(&expected),
+            &Probe::Present(file_state([3; 16], Some(5))),
+            2,
+            TargetProof::Missing,
+        ),
         RecoveryDecision::Retry
     );
     // Identity drift: return the item to reconciliation as new local work.
     assert_eq!(
-        classify_recovered(K::UpdatePlaceholder, Some(&expected), Some(&file_state([9; 16], Some(5))), true),
+        classify_recovered(
+            K::UpdatePlaceholder,
+            Some(&expected),
+            &Probe::Present(file_state([9; 16], Some(5))),
+            2,
+            TargetProof::Missing,
+        ),
         RecoveryDecision::Requeue
     );
     // A delete with unsynchronized bytes preserves them first, never drops
     // them.
     let dirty = file_state([3; 16], Some(5));
     assert_eq!(
-        classify_recovered(K::DeletePlaceholder, None, Some(&dirty), true),
+        classify_recovered(K::DeletePlaceholder, None, &Probe::Present(dirty), 0, TargetProof::Missing),
         RecoveryDecision::PreserveFirst
     );
+    // Only proven absence of the target closes a delete; a path that merely
+    // cannot be inspected stays pending.
     assert_eq!(
-        classify_recovered(K::DeletePlaceholder, None, None, true),
+        classify_recovered(K::DeletePlaceholder, None, &Probe::Missing, 0, TargetProof::Missing),
         RecoveryDecision::Done
+    );
+    assert_eq!(
+        classify_recovered(K::DeletePlaceholder, None, &Probe::Unreadable, 0, TargetProof::Missing),
+        RecoveryDecision::Retry
     );
 }
 

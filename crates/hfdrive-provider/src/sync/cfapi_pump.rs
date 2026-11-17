@@ -107,8 +107,9 @@ pub trait PumpHost<R: RemoteOps>: Send + Sync + 'static {
     /// The connection's workspace (placeholder identity validation).
     fn workspace(&self) -> WorkspaceId;
     /// Durably ingest local observations (classification + intent
-    /// persistence). Returns only after the durable records exist.
-    fn observe(&self, observations: Vec<RawObservation>) -> impl Future<Output = ()> + Send;
+    /// persistence). Returns only after the durable records exist; `Err(())`
+    /// means persistence failed and the OS operation must not be acknowledged.
+    fn observe(&self, observations: Vec<RawObservation>) -> impl Future<Output = Result<(), ()>> + Send;
     /// Preserve dirty bytes before a destructive local removal. `Ok(())`
     /// means the bytes are durable outside the sync root.
     fn preserve_dirty(
@@ -896,29 +897,40 @@ async fn handle_rename<R: RemoteOps, H: PumpHost<R>>(
     // Provider-applied renames echo through this channel too; the durable
     // echo filter absorbs them inside `observe`, so persisting the raw
     // observation is always correct here.
-    if source_in_scope && target_in_scope {
-        host.observe(vec![RawObservation {
+    let observation = if source_in_scope && target_in_scope {
+        Some(RawObservation {
             relative_path: std::path::PathBuf::from(&target_path),
             action: WatchAction::RenamedTo,
-        }])
-        .await;
+        })
     } else if source_in_scope && !target_in_scope {
         // Moved out of the namespace: the item left this drive.
-        host.observe(vec![RawObservation {
+        Some(RawObservation {
             relative_path: std::path::PathBuf::from(&normalized_path),
             action: WatchAction::Removed,
-        }])
-        .await;
+        })
     } else if !source_in_scope && target_in_scope {
         // Moved in: the watcher observes the new path as a create.
-        host.observe(vec![RawObservation {
+        Some(RawObservation {
             relative_path: std::path::PathBuf::from(&target_path),
             action: WatchAction::Added,
-        }])
-        .await;
+        })
+    } else {
+        None
+    };
+    let observed = match observation {
+        Some(observation) => host.observe(vec![observation]).await,
+        None => Ok(()),
+    };
+    // A failed observation is never a successful acknowledgement: the OS
+    // operation must be retried/vetoed instead of losing its durable intent.
+    let _ = connection.ack_rename(ack, observation_ack_status(observed));
+}
+
+fn observation_ack_status(observed: Result<(), ()>) -> TransferStatus {
+    match observed {
+        Ok(()) => TransferStatus::Success,
+        Err(()) => TransferStatus::Failed(FetchFailure::Internal),
     }
-    // Acknowledge only after the durable queue/persistence above returned.
-    let _ = connection.ack_rename(ack, TransferStatus::Success);
 }
 
 async fn handle_delete<R: RemoteOps, H: PumpHost<R>>(
@@ -930,12 +942,12 @@ async fn handle_delete<R: RemoteOps, H: PumpHost<R>>(
     if is_undelete {
         // The user restored the entry; the ordinary observation path handles
         // the reappearance.
-        host.observe(vec![RawObservation {
+        let observed = host.observe(vec![RawObservation {
             relative_path: std::path::PathBuf::from(&normalized_path),
             action: WatchAction::Added,
         }])
         .await;
-        let _ = connection.ack_delete(ack, TransferStatus::Success);
+        let _ = connection.ack_delete(ack, observation_ack_status(observed));
         return;
     }
 
@@ -957,12 +969,12 @@ async fn handle_delete<R: RemoteOps, H: PumpHost<R>>(
             return;
         }
     }
-    host.observe(vec![RawObservation {
+    let observed = host.observe(vec![RawObservation {
         relative_path: std::path::PathBuf::from(&normalized_path),
         action: WatchAction::Removed,
     }])
     .await;
-    let _ = connection.ack_delete(ack, TransferStatus::Success);
+    let _ = connection.ack_delete(ack, observation_ack_status(observed));
 }
 
 async fn handle_completion<R: RemoteOps, H: PumpHost<R>>(host: &H, completion: CompletionEvent) {
@@ -984,6 +996,16 @@ async fn handle_completion<R: RemoteOps, H: PumpHost<R>>(host: &H, completion: C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_observation_is_acknowledged_as_a_failure() {
+        assert_eq!(observation_ack_status(Ok(())), TransferStatus::Success);
+        assert_eq!(
+            observation_ack_status(Err(())),
+            TransferStatus::Failed(FetchFailure::Internal),
+            "an unpersisted rename/delete must not be acknowledged as durable"
+        );
+    }
 
     fn child(name: &str, is_directory: bool, version: Option<VersionId>) -> PumpChild {
         PumpChild {

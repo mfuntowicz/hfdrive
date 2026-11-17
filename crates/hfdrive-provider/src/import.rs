@@ -91,6 +91,8 @@ enum ImportError {
     Fs(#[from] hfdrive_windows::filesystem::FsError),
     #[error("scheduler admission failed: {0}")]
     Schedule(#[from] crate::scheduler::ScheduleError),
+    #[error("durable state operation failed: {0}")]
+    State(#[from] hfdrive_state::StateError),
     #[error("journal operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("journal serialization failed: {0}")]
@@ -122,6 +124,7 @@ fn map_error(error_value: ImportError) -> wire::ProtocolError {
                 error(wire::ProtocolErrorCode::DiskFull, "The import staging reservation cannot be satisfied")
             }
         },
+        ImportError::State(state) => crate::operations::state_error(state),
         ImportError::Io(io) => detailed_error(wire::ProtocolErrorCode::Internal, io.to_string()),
         ImportError::Json(json) => detailed_error(wire::ProtocolErrorCode::Internal, json.to_string()),
     }
@@ -326,7 +329,34 @@ async fn capture_file(provider: &Provider, file: &mut ImportFile, import_id: uui
     let source = file.source_path();
     source_path_is_supported(&source)?;
     let state = query_file_state(&source)?;
-    let _reservation = provider.scheduler.reserve_staging(crate::scheduler::WorkClass::LocalEdit, import_id, &source, state.size, cancel).await?;
+    // Staging admission is one serialized critical section: the retained
+    // occupancy sample, the staging reservation and this capture's completion
+    // all run while its guard is held (the guard below lives until the staged
+    // file is produced). The sample charges this capture's bytes plus the
+    // durable occupancy the account's retained `Capturing`/`Ready` snapshots
+    // already hold (reconstructed from state, never from live reservations),
+    // and free space is asked of the staging volume holding the staged file —
+    // never the import source's volume.
+    let profile = provider.current_account().map_err(|error| ImportError::Invalid(error.message))?;
+    let account = provider.state.open_account(profile.account_key).await?;
+    let _admission = provider
+        .scheduler
+        .staging_admission(
+            crate::scheduler::WorkClass::LocalEdit,
+            import_id,
+            &file.staged_path,
+            state.size,
+            async {
+                let retained = crate::sync::capture::retained_staging_bytes(&account).await?;
+                Ok::<u64, hfdrive_state::StateError>(retained)
+            },
+            cancel,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::scheduler::StagingAdmissionError::RetainedOccupancy(error) => ImportError::State(error),
+            crate::scheduler::StagingAdmissionError::Refused(error) => ImportError::Schedule(error),
+        })?;
     let staging = file.staged_path.clone();
     let snapshot_id = file.snapshot_id;
     let captured = tokio::task::spawn_blocking(move || capture_snapshot(&source, &staging, snapshot_id, None))

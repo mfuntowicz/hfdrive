@@ -25,7 +25,14 @@
 //! metadata) keep working while paused or on metered networks (the metered
 //! choice is the caller's `background_allowed` flag); background reads/pins
 //! and all mutation scheduling stop. Staging admission is local work and is
-//! bounded by budget and free space only.
+//! bounded by the staging budget — the capture's own bytes plus the durable
+//! occupancy its retained snapshots already hold — and the staging volume's
+//! free space; it never reclaims a pending snapshot to make room. Admission
+//! is **one serialized critical section per capture**
+//! ([`Scheduler::staging_admission`]): the retained-occupancy sample, the
+//! staging reservation and the capture's completion all run while that
+//! section is held, so a second capture can never sample occupancy before the
+//! first snapshot is `Ready` (nor admit against a pre-capture zero).
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -37,6 +44,7 @@ use std::task::{Context, Poll, Waker};
 
 use hfdrive_hf::RangeCache;
 use hfdrive_hf::wire_budget::{ByteBudget, ByteReservation, WireBudget};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -158,11 +166,11 @@ impl Default for SchedulerConfig {
 }
 
 /// Free-space observation for staging admission. Supplied by the parent from
-/// the Windows volume APIs; `None` means the system cannot report free space
-/// (budget-only admission then applies and the provider reports the unknown
-/// honestly).
+/// the Windows volume APIs for the **staging** path being admitted — never the
+/// sync root; `None` means the system cannot report free space (budget-only
+/// admission then applies and the provider reports the unknown honestly).
 pub trait FreeSpaceProbe: Send + Sync {
-    fn available_bytes(&self, volume_root: &Path) -> Option<u64>;
+    fn available_bytes(&self, staging_path: &Path) -> Option<u64>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +557,51 @@ pub struct SchedulerStats {
     pub network: NetworkState,
 }
 
+/// Staging-admission failure: the caller's retained-occupancy sample failed
+/// (nothing was admitted) or admission refused the capture. Pending snapshots
+/// are never reclaimed to change either outcome.
+#[derive(Debug, thiserror::Error)]
+pub enum StagingAdmissionError {
+    /// Durable state could not report the retained occupancy; the section is
+    /// released and nothing is admitted.
+    #[error("durable state could not report retained staging occupancy: {0}")]
+    RetainedOccupancy(#[source] hfdrive_state::StateError),
+    /// Staging admission refused the capture.
+    #[error(transparent)]
+    Refused(#[from] ScheduleError),
+}
+
+/// The exclusive occupancy sample + staging reservation of one capture, held
+/// across that capture's completion. A [`StagingAdmission`] guard **is** the
+/// serialized critical section: while any guard lives, no other capture can
+/// take the section, sample retained occupancy or admit. Dropping the guard
+/// ends the section and releases the reservation together. The reservation is
+/// charged the capture's own bytes **plus** the retained occupancy the sample
+/// stood behind, so the section's occupancy never shrinks between the sample
+/// and the capture's `Ready` boundary.
+pub struct StagingAdmission {
+    // Field order is load-bearing: dropping the guard returns the byte
+    // reservation **before** releasing the section, so the next capture can
+    // never see the previous capture's still-held quota inside its own
+    // sampling window.
+    reservation: ByteReservation,
+    _section: OwnedMutexGuard<()>,
+}
+
+impl StagingAdmission {
+    /// Reserved bytes: the capture's own bytes plus the retained occupancy
+    /// the sample stood behind (the whole occupancy charged by admission).
+    pub fn bytes(&self) -> u64 {
+        self.reservation.bytes()
+    }
+}
+
+impl std::fmt::Debug for StagingAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingAdmission").field("bytes", &self.bytes()).finish()
+    }
+}
+
 /// The provider-wide scheduler. Cheap to clone; all state is shared.
 #[derive(Clone)]
 pub struct Scheduler {
@@ -561,6 +614,10 @@ struct SchedulerInner {
     metadata: Arc<GateInner>,
     transfer_memory: ByteBudget,
     staging: ByteBudget,
+    /// The serialized staging-admission section: one capture at a time samples
+    /// retained occupancy and reserves staging, and holds the section until
+    /// its capture completes (see [`Scheduler::staging_admission`]).
+    staging_admission_section: Arc<AsyncMutex<()>>,
     range_cache: RangeCache,
     budget: WireBudget,
     policy: Arc<Mutex<PolicyState>>,
@@ -608,6 +665,7 @@ impl Scheduler {
                 metadata,
                 transfer_memory: ByteBudget::new(config.transfer_memory_bytes),
                 staging: ByteBudget::new(config.staging_admission_bytes),
+                staging_admission_section: Arc::new(AsyncMutex::new(())),
                 range_cache: RangeCache::new(config.range_cache_bytes),
                 budget,
                 policy,
@@ -675,7 +733,8 @@ impl Scheduler {
         pump(&self.inner.metadata);
     }
 
-    /// Free-space observation used by [`Scheduler::reserve_staging`].
+    /// Free-space observation used by staging admission
+    /// ([`Scheduler::staging_admission`]).
     pub fn set_free_space_probe(&self, probe: Option<Arc<dyn FreeSpaceProbe>>) {
         self.inner.limits.lock().unwrap_or_else(|e| e.into_inner()).free_space_probe = probe;
     }
@@ -735,24 +794,34 @@ impl Scheduler {
         self.inner.transfer_memory.reserve(bytes, cancel).await.map_err(map_budget_error)
     }
 
-    /// Reserve capture-staging bytes on the volume rooted at `volume_root`
-    /// (RAII). Admission enforces the staging budget and the free-space floor
-    /// (`available >= bytes + minimum_free_bytes`) when a probe reports the
-    /// volume; unknown free space admits on budget alone and is reported as
-    /// unknown by the provider. Staging is local work: pause/metered/offline
-    /// never block it (captures become queued durable intent).
-    pub async fn reserve_staging(
+    /// Inner step of [`Scheduler::staging_admission`]: reserves the capture's
+    /// own `bytes` **plus** `retained_bytes`, the occupancy the `Capturing`/
+    /// `Ready` snapshots the account still retains already hold. The caller
+    /// samples `retained_bytes` from durable state inside the admission
+    /// section on every capture, so the occupancy survives a restart where no
+    /// transient reservation does. Pending snapshots are never reclaimed to
+    /// satisfy admission: an occupancy that cannot fit is refused outright
+    /// ([`ScheduleError::ReservationTooLarge`]) and the caller keeps its
+    /// durable intent queued.
+    ///
+    /// The free-space floor (`available >= bytes + minimum_free_bytes`) is
+    /// checked against the **staging** volume — never the sync root; unknown
+    /// free space admits on budget alone and is reported as unknown by the
+    /// provider. Staging is local work: pause/metered/offline never block it
+    /// (captures become queued durable intent).
+    async fn reserve_staging(
         &self,
         class: WorkClass,
         drive: Uuid,
-        volume_root: &Path,
+        staging_path: &Path,
         bytes: u64,
+        retained_bytes: u64,
         cancel: &CancellationToken,
     ) -> Result<ByteReservation, ScheduleError> {
         let _ = (class, drive);
         let (minimum_free, available) = {
             let limits = self.inner.limits.lock().unwrap_or_else(|e| e.into_inner());
-            let available = limits.free_space_probe.as_ref().and_then(|probe| probe.available_bytes(volume_root));
+            let available = limits.free_space_probe.as_ref().and_then(|probe| probe.available_bytes(staging_path));
             (limits.minimum_free_bytes, available)
         };
         if let Some(available) = available
@@ -760,7 +829,49 @@ impl Scheduler {
         {
             return Err(ScheduleError::DiskFull);
         }
-        self.inner.staging.reserve(bytes, cancel).await.map_err(map_budget_error)
+        // The whole occupancy is charged while the capture stands, so a
+        // concurrent capture cannot admit past the retained snapshots either.
+        let occupancy = bytes.saturating_add(retained_bytes);
+        if occupancy > self.inner.staging.capacity_bytes() {
+            return Err(ScheduleError::ReservationTooLarge);
+        }
+        self.inner.staging.reserve(occupancy, cancel).await.map_err(map_budget_error)
+    }
+
+    /// The serialized staging-admission critical section for one capture:
+    /// enter the section, **sample** the durable retained occupancy inside it
+    /// (`retained` is a lazy future and is first polled here, never before),
+    /// reserve the capture's own bytes plus that occupancy, and return a
+    /// [`StagingAdmission`] guard the caller holds across its capture
+    /// completion. The section is released only when the guard drops — after
+    /// the caller's completion side effects — so a second capture can never
+    /// sample occupancy before the first snapshot is `Ready` (nor admit
+    /// against a stale pre-capture zero).
+    ///
+    /// Pending snapshots are never reclaimed here: admission is decided
+    /// against the sampled occupancy exactly as durable state reports it, and
+    /// a refused capture keeps its queued intent. A failed sample releases the
+    /// section and admits nothing.
+    pub async fn staging_admission<R>(
+        &self,
+        class: WorkClass,
+        drive: Uuid,
+        staging_path: &Path,
+        bytes: u64,
+        retained: R,
+        cancel: &CancellationToken,
+    ) -> Result<StagingAdmission, StagingAdmissionError>
+    where
+        R: Future<Output = Result<u64, hfdrive_state::StateError>> + Send,
+    {
+        // `lock_owned` yields a 'static guard: it outlives this call by
+        // design (the caller holds it until its capture completes).
+        let section = self.inner.staging_admission_section.clone().lock_owned().await;
+        let retained_bytes = retained.await.map_err(StagingAdmissionError::RetainedOccupancy)?;
+        let reservation = self
+            .reserve_staging(class, drive, staging_path, bytes, retained_bytes, cancel)
+            .await?;
+        Ok(StagingAdmission { reservation, _section: section })
     }
 
     /// Occupancy snapshot for status/diagnostics.
@@ -995,6 +1106,29 @@ mod tests {
         );
     }
 
+    /// Admits one capture through the serialized staging-admission section,
+    /// with the retained occupancy sampled by the given future. Tests use the
+    /// public entry (the section, sample, reservation and guard) exactly as
+    /// the capture path does.
+    async fn admit(
+        scheduler: &Scheduler,
+        staging: &Path,
+        bytes: u64,
+        retained: u64,
+        token: &CancellationToken,
+    ) -> Result<StagingAdmission, StagingAdmissionError> {
+        scheduler
+            .staging_admission(
+                WorkClass::LocalEdit,
+                drive(1),
+                staging,
+                bytes,
+                std::future::ready(Ok(retained)),
+                token,
+            )
+            .await
+    }
+
     #[tokio::test]
     async fn byte_budgets_and_free_space_gate_staging() {
         let scheduler = Scheduler::new(SchedulerConfig {
@@ -1003,32 +1137,114 @@ mod tests {
             ..SchedulerConfig::default()
         });
         let token = CancellationToken::new();
-        struct Probe(Option<u64>);
+        struct Probe {
+            available: Option<u64>,
+            asked: Mutex<Vec<std::path::PathBuf>>,
+        }
         impl FreeSpaceProbe for Probe {
-            fn available_bytes(&self, _volume_root: &Path) -> Option<u64> {
-                self.0
+            fn available_bytes(&self, staging_path: &Path) -> Option<u64> {
+                self.asked.lock().unwrap().push(staging_path.to_path_buf());
+                self.available
             }
         }
-        scheduler.set_free_space_probe(Some(Arc::new(Probe(Some(120)))));
-        assert_eq!(
-            scheduler.reserve_staging(WorkClass::LocalEdit, drive(1), Path::new("C:\\work"), 80, &token).await.unwrap_err(),
-            ScheduleError::DiskFull,
-            "free-space floor is enforced before the budget"
+        let staging = Path::new("C:\\staging");
+        let probe = Arc::new(Probe { available: Some(120), asked: Mutex::new(Vec::new()) });
+        scheduler.set_free_space_probe(Some(probe.clone()));
+        let error = admit(&scheduler, staging, 80, 0, &token).await.unwrap_err();
+        assert!(
+            matches!(error, StagingAdmissionError::Refused(ScheduleError::DiskFull)),
+            "free-space floor is enforced before the budget, got {error:?}"
         );
-        let reservation = scheduler
-            .reserve_staging(WorkClass::LocalEdit, drive(1), Path::new("C:\\work"), 60, &token)
-            .await
-            .unwrap();
+        // Free space is asked of the staging path — never a sync root.
+        assert_eq!(*probe.asked.lock().unwrap(), vec![staging.to_path_buf()]);
+        let reservation = admit(&scheduler, staging, 60, 0, &token).await.unwrap();
         assert_eq!(scheduler.stats().staging_used_bytes, 60);
         drop(reservation);
+        // Durable occupancy is charged together with the capture's own bytes:
+        // 6 new bytes behind 60 retained bytes hold 66 of the 100-byte budget.
+        let retained = admit(&scheduler, staging, 6, 60, &token).await.unwrap();
+        assert_eq!(retained.bytes(), 66);
+        assert_eq!(scheduler.stats().staging_used_bytes, 66);
+        drop(retained);
+        // A retained occupancy that cannot fit is refused outright: pending
+        // snapshots are never reclaimed to make room for a new capture.
+        let error = admit(&scheduler, staging, 6, 95, &token).await.unwrap_err();
+        assert!(
+            matches!(error, StagingAdmissionError::Refused(ScheduleError::ReservationTooLarge)),
+            "got {error:?}"
+        );
         // Unknown free space admits on budget alone.
-        scheduler.set_free_space_probe(Some(Arc::new(Probe(None))));
-        assert!(scheduler.reserve_staging(WorkClass::LocalEdit, drive(1), Path::new("C:\\work"), 60, &token).await.is_ok());
+        scheduler.set_free_space_probe(Some(Arc::new(Probe { available: None, asked: Mutex::new(Vec::new()) })));
+        assert!(admit(&scheduler, staging, 60, 0, &token).await.is_ok());
         // Live shrink blocks new admission beyond the new budget.
         scheduler.set_memory_limits(64 * 1024 * 1024, 64 * 1024 * 1024, 10, 50);
+        let error = admit(&scheduler, staging, 60, 0, &token).await.unwrap_err();
+        assert!(
+            matches!(error, StagingAdmissionError::Refused(ScheduleError::ReservationTooLarge)),
+            "got {error:?}"
+        );
+    }
+
+    /// Staging admission is **one serialized critical section**: the retained
+    /// occupancy sample runs only after the previous capture's guard (its
+    /// capture completion) is released. A second capture can therefore never
+    /// sample occupancy before the first snapshot is `Ready` — nor admit
+    /// against a stale pre-capture zero.
+    #[tokio::test]
+    async fn staging_admission_serializes_the_sample_until_the_guard_drops() {
+        let scheduler = Scheduler::new(SchedulerConfig {
+            staging_admission_bytes: 10,
+            minimum_free_bytes: 0,
+            ..SchedulerConfig::default()
+        });
+        let token = CancellationToken::new();
+        let staging = Path::new("C:\\staging");
+
+        // The first capture admits 6 bytes and holds the section across its
+        // completion (the guard *is* the section).
+        let first = admit(&scheduler, staging, 6, 0, &token).await.unwrap();
+        assert_eq!(first.bytes(), 6);
+        assert_eq!(scheduler.stats().staging_used_bytes, 6);
+
+        // A second capture queues at the section entrance. Its occupancy
+        // sample must not run at all while the first capture's guard is alive.
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let record = samples.clone();
+        let second = scheduler.staging_admission(
+            WorkClass::LocalEdit,
+            drive(2),
+            staging,
+            6,
+            async move {
+                record.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // The first capture's snapshot is `Ready`: 6 retained bytes.
+                Ok(6)
+            },
+            &token,
+        );
+        tokio::pin!(second);
+        poll_pending(second.as_mut());
         assert_eq!(
-            scheduler.reserve_staging(WorkClass::LocalEdit, drive(1), Path::new("C:\\work"), 60, &token).await.unwrap_err(),
-            ScheduleError::ReservationTooLarge
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no occupancy sample before the section is released"
+        );
+
+        // Dropping the guard completes the first capture's section and
+        // returns its reservation with it. The second sample now runs and
+        // reports the retained bytes: 6 + 6 = 12 > the 10-byte budget, so the
+        // capture is refused without reclaiming anything.
+        drop(first);
+        assert_eq!(scheduler.stats().staging_used_bytes, 0, "the guard returned its reservation with it");
+        let error = second.await.unwrap_err();
+        assert!(
+            matches!(error, StagingAdmissionError::Refused(ScheduleError::ReservationTooLarge)),
+            "got {error:?}"
+        );
+        assert_eq!(
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the sample runs exactly once, after the section opens"
         );
     }
 

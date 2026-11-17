@@ -414,6 +414,23 @@ impl AccountStore {
             .await
     }
 
+    /// Active durable work only: every non-`Complete` row of one connection in
+    /// the durable oldest-first `(created_at_ms, operation_id)` order the
+    /// scheduling rounds drive them in, capped at `limit` rows. Completed
+    /// history stays in the table for durability but is excluded in SQL: it is
+    /// never scanned, deserialized or sorted by an active pass. `limit` bounds
+    /// the returned rows (`0` yields none); `u32::MAX` drains every active row,
+    /// whose count is bounded by in-flight work rather than by retained
+    /// history.
+    pub async fn list_active_outbox(
+        &self,
+        connection_id: ConnectionId,
+        limit: u32,
+    ) -> Result<Vec<OutboxEntry>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.list_active_outbox(account, connection_id, limit)).await
+    }
+
     pub async fn work_counts(
         &self,
         connection_id: ConnectionId,
@@ -869,11 +886,23 @@ impl AccountStore {
 
     // ---- common bases -------------------------------------------
 
-    /// Stores the remembered base item record verbatim: `item_json` holds
+    /// Stores (or replaces) the remembered base item record verbatim: `item_json` holds
     /// canonical format bytes and is never re-serialized by the state layer.
     pub async fn put_common_base(&self, record: CommonBaseRecord) -> Result<CommonBaseRecord, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.put_common_base(account, &record)).await
+    }
+
+    /// One worker command and one SQLite transaction for a whole sealed
+    /// common-base namespace: every record lands or none does, so a commit's
+    /// base never persists half-written. The returned flags report per record
+    /// whether a row was actually written: a record whose stored `item_json`
+    /// already matches byte-for-byte is not rewritten and reports `false`.
+    /// Rows absent from the batch are never removed — per-commit history is
+    /// durable work, not a cache.
+    pub async fn put_common_bases(&self, records: Vec<CommonBaseRecord>) -> Result<Vec<bool>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.put_common_bases(account, &records)).await
     }
 
     pub async fn get_common_base(
@@ -903,6 +932,18 @@ impl AccountStore {
     pub async fn upsert_item(&self, item: ItemRecord) -> Result<ItemRecord, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.upsert_item(account, &item)).await
+    }
+
+    /// One worker command and one SQLite transaction for a whole registry
+    /// write: every record lands or none does. The returned flags report per
+    /// record whether a row was actually written: a record whose stored row
+    /// already equals the requested record column-for-column is not rewritten
+    /// and reports `false`; a differing (or new) record reports `true`. Rows
+    /// absent from the batch are never removed: the registry must keep every
+    /// item durable work refers to.
+    pub async fn upsert_items(&self, items: Vec<ItemRecord>) -> Result<Vec<bool>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.upsert_items(account, &items)).await
     }
 
     pub async fn excluded_observations(

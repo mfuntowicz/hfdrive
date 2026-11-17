@@ -688,17 +688,41 @@ impl Provider {
         for component in &local.components {
             source.push(component);
         }
-        let reservation = self.scheduler.reserve_staging(
+        // Staging admission is one serialized critical section: the retained
+        // occupancy sample, the staging reservation and this capture's
+        // completion all run while its guard is held (the guard below lives
+        // until the staged file is produced). The sample charges this
+        // capture's bytes plus the durable occupancy the account's retained
+        // `Capturing`/`Ready` snapshots already hold (reconstructed from state
+        // on every capture), and free space is asked of the staging volume
+        // holding the staged file — never the sync root's volume.
+        let account = self
+            .state
+            .open_account(self.current_account()?.account_key)
+            .await
+            .map_err(crate::operations::state_error)?;
+        let admission = self.scheduler.staging_admission(
             crate::scheduler::WorkClass::LocalEdit,
             drive,
-            root,
+            staging_dir,
             local.size,
+            async {
+                let retained = crate::sync::capture::retained_staging_bytes(&account).await?;
+                Ok::<u64, hfdrive_state::StateError>(retained)
+            },
             cancel,
         ).await;
-        let Ok(_reservation) = reservation else {
+        let admission = match admission {
+            Ok(admission) => admission,
+            // The occupancy sample is a durable-state read: a failure there is
+            // a real error, not a missing digest proof.
+            Err(crate::scheduler::StagingAdmissionError::RetainedOccupancy(error)) => {
+                return Err(crate::operations::state_error(error));
+            }
             // Staging admission refused: no proof, no deletion, no claim.
-            return Ok(None);
+            Err(crate::scheduler::StagingAdmissionError::Refused(_)) => return Ok(None),
         };
+        let _admission = admission;
         let snapshot_id = SnapshotId::new();
         let staging = staging_dir.to_path_buf();
         let expected = local.state.clone();

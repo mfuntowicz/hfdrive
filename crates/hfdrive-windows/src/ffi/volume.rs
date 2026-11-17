@@ -21,6 +21,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo, FileCaseSensitiveInfo, FileIdInfo,
     FileStandardInfo, FindStreamInfoStandard, OPEN_EXISTING, WIN32_FIND_STREAM_DATA,
+    FILE_DISPOSITION_INFO, FILE_RENAME_INFO, FileDispositionInfo, FileRenameInfo,
+    SetFileInformationByHandle,
 };
 
 use super::handle::{OwnedHandle, Win32Handle};
@@ -88,6 +90,63 @@ pub(crate) fn open_query(path: &Path, open_reparse_point: bool) -> Result<OwnedH
     }
 }
 
+/// Open one final file/directory object for a guarded rename. Delete sharing
+/// is denied while the object is inspected and moved, so the checked object
+/// cannot be removed or replaced by a path race between check and rename.
+pub(crate) fn open_rename(path: &Path) -> Result<OwnedHandle, u32> {
+    use windows::Win32::Storage::FileSystem::DELETE;
+    let w = wide(path);
+    // SAFETY: `w` is NUL-terminated; the returned handle has one RAII owner.
+    unsafe {
+        let raw = CreateFileW(
+            windows::core::PCWSTR(w.as_ptr()),
+            DELETE.0 | GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(
+                FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0,
+            ),
+            None,
+        )
+        .map_err(|e| error_code(&e))?;
+        OwnedHandle::from_raw(raw).ok_or_else(last_error_code)
+    }
+}
+
+/// Rename/move the exact open object to `target`, which must be an absolute
+/// path. The source path is never re-resolved, and `ReplaceIfExists` is
+/// always false: an object that appeared at the destination between the
+/// probe and this call fails the rename instead of being replaced.
+pub(crate) fn rename_to(handle: &OwnedHandle, target: &Path) -> Result<(), u32> {
+    let name = wide(target);
+    // `FILE_RENAME_INFO` ends with a one-element `FileName` array; the real
+    // allocation carries the whole name inline after the fixed header, so
+    // the layout arithmetic is explicit here and the buffer stays alive for
+    // the synchronous call.
+    let header = size_of::<FILE_RENAME_INFO>() - size_of::<u16>();
+    let name_bytes = name.len().saturating_mul(size_of::<u16>());
+    let total = header.checked_add(name_bytes).ok_or(ERROR_INVALID_PARAMETER)?;
+    let mut buffer = vec![0u8; total];
+    // SAFETY: `buffer` is `total` bytes: the fixed header plus the name, and
+    // `name` is copied into exactly that trailing region.
+    unsafe {
+        let info = buffer.as_mut_ptr() as *mut FILE_RENAME_INFO;
+        // No silent destination replacement: `ReplaceIfExists` stays false.
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = windows::Win32::Foundation::HANDLE::default();
+        (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        SetFileInformationByHandle(
+            handle.as_win(),
+            FileRenameInfo,
+            buffer.as_ptr() as *const c_void,
+            u32::try_from(total).map_err(|_| ERROR_INVALID_PARAMETER)?,
+        )
+        .map_err(|e| error_code(&e))
+    }
+}
+
 /// Open one final file/directory object for guarded deletion. Write and
 /// delete sharing are denied while the object is inspected and marked, so a
 /// path replacement or concurrent writer cannot occur between check/delete.
@@ -116,9 +175,6 @@ pub(crate) fn open_delete(path: &Path) -> Result<OwnedHandle, u32> {
 /// resolved again; nonempty directories and changed/sharing-locked objects
 /// fail without a fallback path deletion.
 pub(crate) fn mark_deleted(handle: &OwnedHandle) -> Result<(), u32> {
-    use windows::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-    };
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: the input points to a valid disposition value for the exact
     // generated size and remains alive for the synchronous call.
@@ -136,7 +192,10 @@ pub(crate) fn mark_deleted(handle: &OwnedHandle) -> Result<(), u32> {
 /// Open an existing regular file for a coherent read: read access with
 /// **write and delete sharing denied** (share mode = `FILE_SHARE_READ`
 /// only), so no other writer can change or remove the file while it is
-/// held. Never follows reparse points into other volumes.
+/// held. `FILE_FLAG_OPEN_REPARSE_POINT` opens the **final reparse point
+/// itself** instead of following it, so a junction, mount point or symlink
+/// can never redirect this handle (and therefore the read) into another
+/// volume; the safe layer verifies the handle before any byte is read.
 pub(crate) fn open_read_coherent(path: &Path) -> Result<OwnedHandle, u32> {
     let w = wide(path);
     // SAFETY: as `open_query`.
@@ -147,7 +206,11 @@ pub(crate) fn open_read_coherent(path: &Path) -> Result<OwnedHandle, u32> {
             FILE_SHARE_READ,
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_SEQUENTIAL_SCAN.0),
+            FILE_FLAGS_AND_ATTRIBUTES(
+                FILE_FLAG_BACKUP_SEMANTICS.0
+                    | FILE_FLAG_SEQUENTIAL_SCAN.0
+                    | FILE_FLAG_OPEN_REPARSE_POINT.0,
+            ),
             None,
         )
         .map_err(|e| error_code(&e))?;

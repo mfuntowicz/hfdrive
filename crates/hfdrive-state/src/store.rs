@@ -1338,6 +1338,35 @@ impl Db {
         }
     }
 
+    /// Active durable work only: every non-`Complete` outbox row of one
+    /// connection, in the durable oldest-first `(created_at_ms, operation_id)`
+    /// order the scheduling rounds drive them in. Completed history stays in
+    /// the table for durability and is excluded in SQL — it is never scanned,
+    /// deserialized or sorted by an active pass. `limit` caps the returned
+    /// rows (`0` yields none); `u32::MAX` drains every active row, whose count
+    /// is bounded by in-flight work rather than by retained history.
+    /// Pinned to the `outbox_active_by_creation` index (migration 0006): the
+    /// planner must not fall back to `outbox_work_page`, which reaches the
+    /// active rows by scanning across the completed history first.
+    pub(crate) fn list_active_outbox(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        limit: u32,
+    ) -> SResult<Vec<OutboxEntry>> {
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            &format!(
+                "SELECT {OUTBOX_COLUMNS} FROM outbox INDEXED BY outbox_active_by_creation
+                 WHERE connection_id = ?1 AND state <> 'complete'
+                 ORDER BY created_at_ms, operation_id LIMIT ?2"
+            ),
+            params![connection_id.as_bytes().as_slice(), i64::from(limit)],
+            s::read_outbox,
+        )
+    }
+
     /// Unfinished outbox work with its durable creation timestamp, ordered
     /// oldest first. The timestamp is the activity start evidence; it is read
     /// from the row, never synthesized. Paging is keyset: `after` is a pure
@@ -2821,33 +2850,43 @@ impl Db {
     /// Stores (or replaces) the remembered base item record for
     /// (connection, item, commit). `item_json` is canonical format bytes and
     /// is stored exactly as given: it is validated to be JSON but never
-    /// re-serialized, so byte identity survives restart.
+    /// re-serialized, so byte identity survives restart. A row already holding
+    /// the same bytes is not rewritten.
     pub(crate) fn put_common_base(
         &mut self,
         account: AccountKey,
         record: &CommonBaseRecord,
     ) -> SResult<CommonBaseRecord> {
-        if serde_json::from_str::<serde_json::Value>(&record.item_json).is_err() {
-            return Err(StateError::invalid_state(
-                "common_base",
-                record.item_id,
-                "item_json is not valid JSON",
-            ));
+        let conn = self.account_conn(account)?;
+        write_common_base(conn, record)?;
+        select_common_base(conn, record.connection_id, record.item_id, record.commit_id)?
+            .ok_or_else(|| StateError::not_found("common_base", record.item_id))
+    }
+
+    /// One worker command and one SQLite transaction for a whole sealed
+    /// common-base namespace: every record lands or none does. A caller's
+    /// commit therefore costs one durable transaction, never one per item, and
+    /// no other command can interleave with the batch. A record whose stored
+    /// `item_json` already matches byte-for-byte is not rewritten; the returned
+    /// flags report per record whether a row was actually written. Rows absent
+    /// from the batch are never removed — per-commit history is durable work,
+    /// not a cache — so nothing already remembered can go missing.
+    pub(crate) fn put_common_bases(
+        &mut self,
+        account: AccountKey,
+        records: &[CommonBaseRecord],
+    ) -> SResult<Vec<bool>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
         }
         let conn = self.account_conn(account)?;
-        conn.execute(
-            "INSERT INTO common_bases (connection_id, item_id, commit_id, item_json)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(connection_id, item_id, commit_id) DO UPDATE SET item_json = excluded.item_json",
-            params![
-                record.connection_id.as_bytes().as_slice(),
-                record.item_id.as_bytes().as_slice(),
-                record.commit_id.as_bytes().as_slice(),
-                record.item_json,
-            ],
-        )?;
-        self.get_common_base(account, record.connection_id, record.item_id, record.commit_id)?
-            .ok_or_else(|| StateError::not_found("common_base", record.item_id))
+        let tx = conn.unchecked_transaction()?;
+        let mut written = Vec::with_capacity(records.len());
+        for record in records {
+            written.push(write_common_base(&tx, record)?);
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     pub(crate) fn get_common_base(
@@ -2857,18 +2896,7 @@ impl Db {
         item_id: ItemId,
         commit_id: CommitId,
     ) -> SResult<Option<CommonBaseRecord>> {
-        let conn = self.account_conn(account)?;
-        query_optional(
-            conn,
-            "SELECT connection_id, item_id, commit_id, item_json FROM common_bases
-             WHERE connection_id = ?1 AND item_id = ?2 AND commit_id = ?3",
-            params![
-                connection_id.as_bytes().as_slice(),
-                item_id.as_bytes().as_slice(),
-                commit_id.as_bytes().as_slice()
-            ],
-            s::read_common_base,
-        )
+        select_common_base(self.account_conn(account)?, connection_id, item_id, commit_id)
     }
 
     pub(crate) fn list_common_bases(
@@ -2893,29 +2921,30 @@ impl Db {
 
     pub(crate) fn upsert_item(&mut self, account: AccountKey, item: &ItemRecord) -> SResult<ItemRecord> {
         let conn = self.account_conn(account)?;
-        conn.execute(
-            "INSERT INTO items
-               (connection_id, item_id, parent_id, name, name_key, kind, revision, content_version_id, deleted, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(connection_id, item_id) DO UPDATE SET
-               parent_id = excluded.parent_id, name = excluded.name, name_key = excluded.name_key,
-               kind = excluded.kind, revision = excluded.revision, content_version_id = excluded.content_version_id,
-               deleted = excluded.deleted, metadata_json = excluded.metadata_json",
-            params![
-                item.connection_id.as_bytes().as_slice(),
-                item.item_id.as_bytes().as_slice(),
-                item.parent_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
-                item.name,
-                item.name_key,
-                s::item_kind_text(item.kind),
-                item.revision.as_bytes().as_slice(),
-                item.content_version_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
-                i64::from(item.deleted),
-                c::to_json("metadata_json", &item.metadata_json)?,
-            ],
-        )?;
-        self.item(account, item.connection_id, item.item_id)?
+        write_item(conn, item)?;
+        select_item(conn, item.connection_id, item.item_id)?
             .ok_or_else(|| StateError::not_found("item", item.item_id))
+    }
+
+    /// One worker command and one SQLite transaction for a whole registry
+    /// write: every record lands or none does, and no other command can
+    /// interleave with the batch. A record whose stored row already matches
+    /// the requested record column-for-column is not rewritten; the returned
+    /// flags report per record whether a row was actually written (`false`
+    /// for an identical row). Rows absent from the batch are never removed:
+    /// the registry must keep every item durable work refers to.
+    pub(crate) fn upsert_items(&mut self, account: AccountKey, items: &[ItemRecord]) -> SResult<Vec<bool>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.account_conn(account)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut written = Vec::with_capacity(items.len());
+        for item in items {
+            written.push(write_item(&tx, item)?);
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     pub(crate) fn item(
@@ -3373,14 +3402,21 @@ pub struct ObservationFlags {
     pub excluded: Option<bool>,
 }
 
-/// The `limit + 1` overflow-probe bound. Pages are limited to 200 rows, so the
-/// probe is bounded too: no caller can make the state layer materialize an
-/// unbounded page, and no offset prefix grows across calls.
-fn checked_page_limit(limit: u32) -> SResult<i64> {
+/// The row bound of a bounded listing. Listings are limited to 200 rows, so no
+/// caller can make the state layer materialize an unbounded page, and no
+/// offset prefix grows across calls.
+fn checked_list_limit(limit: u32) -> SResult<i64> {
     if !(1..=200).contains(&limit) {
         return Err(StateError::invalid_state("work page", limit, "page limit must be 1..=200"));
     }
-    Ok(i64::from(limit) + 1)
+    Ok(i64::from(limit))
+}
+
+/// The `limit + 1` overflow-probe bound for keyset-paged listings (see
+/// [`checked_list_limit`]): the extra row lets the caller detect overflow and
+/// fail closed instead of omitting work.
+fn checked_page_limit(limit: u32) -> SResult<i64> {
+    Ok(checked_list_limit(limit)? + 1)
 }
 
 /// Inserts the durable event/scan bookkeeping row for a connection. An
@@ -3479,6 +3515,147 @@ fn clear_work_error_conn(
         ],
     )?;
     Ok(())
+}
+
+/// Stores one remembered base item record, reporting whether a row was
+/// written. `item_json` is canonical format bytes: validated as JSON and
+/// stored exactly as given. A stored row that already holds those exact bytes
+/// is not rewritten — a replayed write is a no-op on durable media.
+fn write_common_base(conn: &Connection, record: &CommonBaseRecord) -> SResult<bool> {
+    if serde_json::from_str::<serde_json::Value>(&record.item_json).is_err() {
+        return Err(StateError::invalid_state(
+            "common_base",
+            record.item_id,
+            "item_json is not valid JSON",
+        ));
+    }
+    if common_base_stored_verbatim(conn, record)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO common_bases (connection_id, item_id, commit_id, item_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(connection_id, item_id, commit_id) DO UPDATE SET item_json = excluded.item_json",
+        params![
+            record.connection_id.as_bytes().as_slice(),
+            record.item_id.as_bytes().as_slice(),
+            record.commit_id.as_bytes().as_slice(),
+            record.item_json,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// True when the stored row already holds exactly the bytes this record would
+/// write, so the rewrite would be a byte-identical no-op on durable media.
+/// TEXT/BLOB equality is byte equality; anything that differs is rewritten.
+fn common_base_stored_verbatim(conn: &Connection, record: &CommonBaseRecord) -> SResult<bool> {
+    let found: Option<i64> = query_optional(
+        conn,
+        "SELECT 1 FROM common_bases
+          WHERE connection_id = ?1 AND item_id = ?2 AND commit_id = ?3 AND item_json = ?4",
+        params![
+            record.connection_id.as_bytes().as_slice(),
+            record.item_id.as_bytes().as_slice(),
+            record.commit_id.as_bytes().as_slice(),
+            record.item_json,
+        ],
+        |row| Ok(row.get(0)?),
+    )?;
+    Ok(found.is_some())
+}
+
+fn select_common_base(
+    conn: &Connection,
+    connection_id: ConnectionId,
+    item_id: ItemId,
+    commit_id: CommitId,
+) -> SResult<Option<CommonBaseRecord>> {
+    query_optional(
+        conn,
+        "SELECT connection_id, item_id, commit_id, item_json FROM common_bases
+         WHERE connection_id = ?1 AND item_id = ?2 AND commit_id = ?3",
+        params![
+            connection_id.as_bytes().as_slice(),
+            item_id.as_bytes().as_slice(),
+            commit_id.as_bytes().as_slice()
+        ],
+        s::read_common_base,
+    )
+}
+
+/// Writes one durable item registry record, reporting whether a row was
+/// written. A stored row that already equals the requested record
+/// column-for-column is not rewritten: unchanged rows cost no durable write
+/// when a commit refreshes a large registry.
+fn write_item(conn: &Connection, item: &ItemRecord) -> SResult<bool> {
+    let metadata_json = c::to_json("metadata_json", &item.metadata_json)?;
+    if item_stored_identically(conn, item, &metadata_json)? {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO items
+           (connection_id, item_id, parent_id, name, name_key, kind, revision, content_version_id, deleted, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(connection_id, item_id) DO UPDATE SET
+           parent_id = excluded.parent_id, name = excluded.name, name_key = excluded.name_key,
+           kind = excluded.kind, revision = excluded.revision, content_version_id = excluded.content_version_id,
+           deleted = excluded.deleted, metadata_json = excluded.metadata_json",
+        params![
+            item.connection_id.as_bytes().as_slice(),
+            item.item_id.as_bytes().as_slice(),
+            item.parent_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
+            item.name,
+            item.name_key,
+            s::item_kind_text(item.kind),
+            item.revision.as_bytes().as_slice(),
+            item.content_version_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
+            i64::from(item.deleted),
+            metadata_json,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// True when the stored row already holds exactly the column values this
+/// record would write, so the rewrite would be a byte-identical no-op on
+/// durable media. TEXT/BLOB equality is byte equality and `IS` covers the
+/// nullable columns; anything that differs is rewritten.
+fn item_stored_identically(conn: &Connection, item: &ItemRecord, metadata_json: &str) -> SResult<bool> {
+    let found: Option<i64> = query_optional(
+        conn,
+        "SELECT 1 FROM items
+          WHERE connection_id = ?1 AND item_id = ?2
+            AND parent_id IS ?3 AND name = ?4 AND name_key = ?5 AND kind = ?6
+            AND revision = ?7 AND content_version_id IS ?8 AND deleted = ?9 AND metadata_json = ?10",
+        params![
+            item.connection_id.as_bytes().as_slice(),
+            item.item_id.as_bytes().as_slice(),
+            item.parent_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
+            item.name,
+            item.name_key,
+            s::item_kind_text(item.kind),
+            item.revision.as_bytes().as_slice(),
+            item.content_version_id.map(|id| *id.as_bytes()).map(|b| b.to_vec()),
+            i64::from(item.deleted),
+            metadata_json,
+        ],
+        |row| Ok(row.get(0)?),
+    )?;
+    Ok(found.is_some())
+}
+
+fn select_item(
+    conn: &Connection,
+    connection_id: ConnectionId,
+    item_id: ItemId,
+) -> SResult<Option<ItemRecord>> {
+    query_optional(
+        conn,
+        &format!("SELECT {ITEM_COLUMNS} FROM items WHERE connection_id = ?1 AND item_id = ?2"),
+        params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+        s::read_item,
+    )
 }
 
 pub(crate) fn query_optional<T, F>(

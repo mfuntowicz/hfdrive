@@ -108,7 +108,9 @@ pub(crate) fn status(snapshot: &AuthSnapshot) -> Result<wire::AccountStatus, wir
         }
     });
     let login = snapshot.active_login.as_ref().map(progress).transpose()?;
-    let state = if snapshot.last_error.as_ref().is_some_and(AuthError::needs_sign_in) {
+    let state = if snapshot.rejected.is_some()
+        || snapshot.last_error.as_ref().is_some_and(AuthError::needs_sign_in)
+    {
         wire::AuthenticationState::NeedsSignIn
     } else if login.as_ref().is_some_and(|login| login.phase == wire::LoginPhase::Pending) {
         wire::AuthenticationState::SigningIn
@@ -215,7 +217,7 @@ mod tests {
     fn unknown_grants_and_signin_required_survive_public_projection() {
         let snapshot = AuthSnapshot {
             revision: 1, profile: Some(profile("person-a")), active_login: None,
-            last_error: Some(AuthError::NeedsSignIn),
+            last_error: Some(AuthError::NeedsSignIn), rejected: None,
         };
         let account = status(&snapshot).unwrap();
         assert_eq!(account.state, wire::AuthenticationState::NeedsSignIn);

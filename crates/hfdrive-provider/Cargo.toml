@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = []
 fault-injection = []
-provider-test-support = ["dep:tempfile"]
+provider-test-support = ["dep:tempfile", "hfdrive-auth/test-support"]
 
 [dependencies]
 hfdrive-core.workspace = true

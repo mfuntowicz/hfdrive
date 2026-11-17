@@ -41,7 +41,7 @@ async fn fresh_creation_sets_schema_identity() {
     let account_db = paths.account(key).database();
     assert!(account_db.exists());
     assert_eq!(application_id(&account_db), ACCOUNT_APPLICATION_ID);
-    assert_eq!(user_version(&account_db), 5);
+    assert_eq!(user_version(&account_db), 6);
     store.close().await.unwrap();
 }
 
@@ -254,7 +254,7 @@ async fn v2_account_database_migrates_to_current_with_backup() {
     let snapshots = account.list_snapshots(connection_id).await.unwrap();
     store.close().await.unwrap();
 
-    assert_eq!(user_version(&account_db), 5, "the account database must land on the current schema");
+    assert_eq!(user_version(&account_db), 6, "the account database must land on the current schema");
     let conn = Connection::open(&account_db).unwrap();
     for table in ["work_errors"] {
         let found: i64 = conn
@@ -266,7 +266,13 @@ async fn v2_account_database_migrates_to_current_with_backup() {
             .unwrap();
         assert_eq!(found, 1, "{table} must exist after the migration");
     }
-    for index in ["items_by_version", "outbox_work_page", "local_actions_work_page", "transfers_work_page"] {
+    for index in [
+        "items_by_version",
+        "outbox_work_page",
+        "local_actions_work_page",
+        "transfers_work_page",
+        "outbox_active_by_creation",
+    ] {
         let found: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",

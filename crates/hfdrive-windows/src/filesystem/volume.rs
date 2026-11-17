@@ -154,6 +154,106 @@ pub fn query_file_state(path: &Path) -> FsResult<FileState> {
     })
 }
 
+/// An open handle to one final file/directory object, used to verify and then
+/// mutate **that exact object**. Every guarded destructive action (rename,
+/// delete) opens the object once, revalidates identity/size/mtime/USN through
+/// this handle, and issues the mutation on it — the path is never re-resolved
+/// in between, so a replacement object at the path can never be affected.
+pub struct GuardedObject {
+    handle: crate::ffi::handle::OwnedHandle,
+}
+
+impl GuardedObject {
+    /// Open the final object at `path` for a guarded rename. Delete sharing
+    /// is denied, so the object cannot be removed or replaced underneath.
+    pub fn for_rename(path: &Path) -> FsResult<Self> {
+        let handle = raw::open_rename(path).map_err(|code| classify_open(path, code))?;
+        Ok(Self { handle })
+    }
+
+    /// Open the final object at `path` for guarded deletion. Write and delete
+    /// sharing are denied, so it cannot be replaced or written in between.
+    pub fn for_delete(path: &Path) -> FsResult<Self> {
+        let handle = raw::open_delete(path).map_err(|code| classify_open(path, code))?;
+        Ok(Self { handle })
+    }
+
+    /// Read the full observed state of **this** open object through its own
+    /// handle. This is the same-handle evidence the guarded actions use: no
+    /// path is re-resolved, so the facts describe exactly the object about to
+    /// be mutated.
+    pub fn state(&self) -> FsResult<FileState> {
+        let handle = &self.handle;
+        let id = raw::id_info(handle).map_err(op("GetFileInformationByHandleEx(FileIdInfo)"))?;
+        let std = raw::standard_info(handle).map_err(op("GetFileInformationByHandleEx(FileStandardInfo)"))?;
+        let basic = raw::basic_info(handle).map_err(op("GetFileInformationByHandleEx(FileBasicInfo)"))?;
+        let attrs = raw::attr_tag(handle).map_err(op("GetFileInformationByHandleEx(FileAttributeTagInfo)"))?;
+        let usn = crate::ffi::usn::file_usn(handle).map_err(op("FSCTL_READ_FILE_USN_DATA"))?;
+        Ok(FileState {
+            identity: FileIdentity {
+                volume_serial_number: id.volume_serial_number,
+                file_id: id.file_id,
+                link_count: std.link_count,
+                attributes: attrs.attributes,
+                reparse_tag: attrs.reparse_tag,
+            },
+            size: std.size,
+            last_write_time_100ns: basic.last_write_time_100ns,
+            usn,
+        })
+    }
+
+    /// Rename this exact object to `target` (an absolute path).
+    /// `ReplaceIfExists` is always false: an object that appeared at the
+    /// destination fails the rename instead of being replaced, so the
+    /// caller's action stays pending.
+    pub fn rename_to(&self, target: &Path) -> FsResult<()> {
+        raw::rename_to(&self.handle, target)
+            .map_err(op("SetFileInformationByHandle(FileRenameInfo)"))
+    }
+
+    /// Mark this exact object for deletion. The path is never re-opened;
+    /// nonempty directories and changed/sharing-locked objects fail without a
+    /// fallback path deletion.
+    pub fn mark_deleted(&self) -> FsResult<()> {
+        raw::mark_deleted(&self.handle)
+            .map_err(op("SetFileInformationByHandle(FileDispositionInfo)"))
+    }
+}
+
+/// Open the final object at `path` for a guarded rename. Delete sharing is
+/// denied, so the object cannot be removed or replaced underneath.
+pub fn open_rename(path: &Path) -> FsResult<GuardedObject> {
+    GuardedObject::for_rename(path)
+}
+
+/// Open the final object at `path` for guarded deletion. Write and delete
+/// sharing are denied, so it cannot be replaced or written in between.
+pub fn open_delete(path: &Path) -> FsResult<GuardedObject> {
+    GuardedObject::for_delete(path)
+}
+
+/// Read the full observed state of one guarded object through its own handle.
+/// No path is re-resolved, so the facts describe exactly the object the
+/// caller is about to mutate.
+pub fn state_on_handle(object: &GuardedObject) -> FsResult<FileState> {
+    object.state()
+}
+
+/// Rename the exact object behind `object` to `target` (an absolute path).
+/// `ReplaceIfExists` is always false, so a destination occupant is never
+/// replaced: the rename fails and the caller's action stays pending.
+pub fn rename_to(object: &GuardedObject, target: &Path) -> FsResult<()> {
+    object.rename_to(target)
+}
+
+/// Mark the exact object behind `object` for deletion. The path is never
+/// re-opened; nonempty directories and changed/sharing-locked objects fail
+/// without a fallback path deletion.
+pub fn mark_deleted(object: &GuardedObject) -> FsResult<()> {
+    object.mark_deleted()
+}
+
 /// Query the volume that contains `path` (via a handle on that path).
 pub fn query_volume(path: &Path) -> FsResult<VolumeIdentity> {
     let handle = raw::open_query(path, true).map_err(|code| classify_open(path, code))?;

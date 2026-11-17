@@ -271,7 +271,9 @@ async fn run_round_inner<R: RemoteOps>(
 ) -> Result<RoundOutcome, PublishError> {
     let mut outcome = RoundOutcome::default();
     let round_started_ms = now_ms();
-    let all = ctx.state.list_outbox(ctx.connection, None, u32::MAX).await?;
+    // Active work only: completed rows are durable history and are never
+    // scanned, deserialized or sorted by a round.
+    let all = ctx.state.list_active_outbox(ctx.connection, u32::MAX).await?;
 
     // 1. Crash-safe resume: dispatched candidates are resolved by identity
     //    and never re-driven; absent candidates re-plan with fresh IDs.
@@ -969,6 +971,13 @@ async fn finish_commit<R: RemoteOps>(
 /// the later batches that re-plan in a later round. A remote-only round (or
 /// any round without a publication) overlays nothing and adopts the complete
 /// remote view as-is.
+///
+/// Registry rows carry the payload identity and display metadata of their
+/// bound version: this round's planned version metadata for newly published
+/// content, otherwise the remote view's content facts and the registry's last
+/// known `modified_at`. A remote-only or unchanged version keeps its metadata
+/// across the base advance — a known remote file is never rewritten as an
+/// unknown zero-length payload.
 async fn advance_base<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     commit_id: CommitId,
@@ -987,24 +996,63 @@ async fn advance_base<R: RemoteOps>(
     }
     let records: Vec<ItemRecord> = namespace.into_values().collect();
     record_common_bases(ctx.state, ctx.connection, commit_id, &records).await?;
-    for record in &records {
-        let (digest, size, modified_at) = planned
-            .plan
-            .versions
-            .iter()
-            .find(|version| Some(version.version_id) == record.content_version_id)
-            .map(|version| {
-                (
+    // The registry's last known display metadata is read once for the whole
+    // refresh (one listing, never one lookup per item): a remote-only or
+    // unchanged version keeps the `modified_at` its row already proved.
+    let prior_rows = ctx.state.list_all_items(ctx.connection, true).await?;
+    let prior: HashMap<ItemId, &hfdrive_state::ItemRecord> = prior_rows
+        .iter()
+        .map(|row| (row.item_id, row))
+        .collect();
+    // One worker command and one transaction for the whole registry refresh:
+    // every record lands or none does, and no other command can interleave
+    // with the batch. The per-row write flags are a diagnostic only — success
+    // is the completed batch command, never a per-row flag (an identical row
+    // reports `false` and is not rewritten).
+    let registry: Vec<hfdrive_state::ItemRecord> = records
+        .iter()
+        .map(|record| {
+            // Newly published content carries its planned version metadata.
+            let planned_version = planned
+                .plan
+                .versions
+                .iter()
+                .find(|version| Some(version.version_id) == record.content_version_id);
+            let (digest, size, modified_at) = match planned_version {
+                Some(version) => (
                     Some(version.object.sha256),
                     Some(version.object.size),
                     Some(version.display.modified_at.clone()),
-                )
-            })
-            .unwrap_or((None, None, None));
-        ctx.state
-            .upsert_item(registry_item(ctx.connection, record, digest, size, modified_at))
-            .await?;
-    }
+                ),
+                // A remote-only or unchanged version keeps the content facts
+                // the remote view proved and the display metadata the registry
+                // already bound to that exact version. A known remote file is
+                // never re-defaulted to an unknown zero-length payload by a
+                // base advance, and no digest is borrowed from another version.
+                None => {
+                    let remote_state = sources
+                        .remote
+                        .get(record.item_id)
+                        .filter(|state| state.content_version_id == record.content_version_id);
+                    let prior_row = prior
+                        .get(&record.item_id)
+                        .copied()
+                        .filter(|row| row.content_version_id == record.content_version_id);
+                    let (digest, size) = match remote_state {
+                        Some(state) => (state.content_sha256, state.content_size),
+                        None => prior_row.map(registry_digest).unwrap_or((None, None)),
+                    };
+                    let modified_at = prior_row.and_then(|row| {
+                        row.metadata_json.get("modified_at")?.as_str().map(str::to_owned)
+                    });
+                    (digest, size, modified_at)
+                }
+            };
+            registry_item(ctx.connection, record, digest, size, modified_at)
+        })
+        .collect();
+    let written = ctx.state.upsert_items(registry).await?;
+    debug_assert_eq!(written.len(), records.len(), "one flag is reported per requested record");
     ctx.state
         .set_baseline(ctx.connection, BaselineKind::Observed, Some(commit_id))
         .await?;
@@ -1125,11 +1173,47 @@ async fn execute_one_action<R: RemoteOps>(
                 identity,
                 mark_in_sync: true,
             };
-            apply::create_placeholders(&ctx.root.join(&parent), &[create])
-                .map_err(PublishError::LocalApply)?;
+            let mut outcomes =
+                apply::create_placeholders(&ctx.root.join(&parent), &[create])
+                    .map_err(PublishError::LocalApply)?;
+            // K04/G14: every per-entry outcome is inspected; only a real
+            // `Created`, or an `AlreadyExists` target holding this item's
+            // exact expected HFDR placeholder identity, ever succeeds.
+            let absolute = ctx.root.join(path);
+            let mut satisfied = false;
+            for outcome in &mut outcomes {
+                if outcome.name != name {
+                    return Err(PublishError::LocalApply(
+                        "placeholder creation returned an outcome for a different entry",
+                    ));
+                }
+                match apply::classify_creation(path, &outcome.outcome, || {
+                    apply::occupant_at(&absolute, ctx.workspace, &identity)
+                }) {
+                    apply::CreationOutcome::Created { .. }
+                    | apply::CreationOutcome::AlreadyCreated => satisfied = true,
+                    // A foreign or unverifiable occupant is preserved untouched
+                    // and keeps the action pending for reconciliation.
+                    apply::CreationOutcome::Occupied(_) => return Ok(false),
+                    // The entry itself failed with an OS error: a real failure,
+                    // recorded by the caller and retried; never "created".
+                    apply::CreationOutcome::EntryFailed { .. } => {
+                        return Err(PublishError::LocalApply(
+                            "placeholder creation failed for one entry",
+                        ));
+                    }
+                }
+            }
+            outcomes.clear();
+            if !satisfied {
+                return Err(PublishError::LocalApply("placeholder creation returned no outcome"));
+            }
         }
         StateActionKind::Rename => {
             let (Some(from), Some(to)) = (&source, &target) else { return Ok(false); };
+            let Some((_expected_state, expected, generation)) = expected_guard_state(ctx, row).await else {
+                return Ok(false);
+            };
             let case_only = hfdrive_windows::filesystem::names::windows_case_equivalent(
                 &from.to_string_lossy(),
                 &to.to_string_lossy(),
@@ -1137,19 +1221,30 @@ async fn execute_one_action<R: RemoteOps>(
                 &from.to_string_lossy(),
                 &to.to_string_lossy(),
             );
-            let intermediate = to.with_file_name(format!(
-                "{}.hfdrive-rename-{}",
-                to.file_name().and_then(|n| n.to_str()).unwrap_or("item"),
-                row.action_id
-            ));
-            apply::rename_local(ctx.root, from, to, case_only, &intermediate)
-                .map_err(PublishError::LocalApply)?;
+            let intermediate = apply::rename_intermediate(to, row.action_id);
+            match apply::rename_local(
+                ctx.root,
+                from,
+                to,
+                case_only,
+                &intermediate,
+                Some(&expected),
+                generation,
+            ) {
+                Ok(_) => {}
+                Err(
+                    apply::RENAME_UNPROVEN
+                    | apply::RENAME_SOURCE_UNREADABLE
+                    | apply::RENAME_OCCUPIED,
+                ) => return Ok(false),
+                Err(error) => return Err(PublishError::LocalApply(error)),
+            }
         }
         StateActionKind::UpdatePlaceholder => {
             let (Some(path), Some(version)) = (&target, row.new_version) else {
                 return Ok(false);
             };
-            let Some(expected_state) = expected_guard_state(ctx, row).await else {
+            let Some((expected_state, _, _)) = expected_guard_state(ctx, row).await else {
                 // Expectation cannot be proven: the action stays pending and
                 // the file keeps its old state (the designed recovery path).
                 return Ok(false);
@@ -1176,7 +1271,23 @@ async fn execute_one_action<R: RemoteOps>(
         }
         StateActionKind::DeletePlaceholder => {
             let Some(path) = source.as_ref().or(target.as_ref()) else { return Ok(false); };
-            match apply::delete_local(ctx.root, path) {
+            let Some((_expected_state, expected, generation)) = expected_guard_state(ctx, row).await else {
+                // Proven absence already satisfies deletion. Every other
+                // guard/query failure keeps the action pending and untouched.
+                return Ok(matches!(
+                    apply::probe(&ctx.root.join(path)),
+                    apply::Probe::Missing
+                ));
+            };
+            let Some(item_id) = row.item_id else { return Ok(false); };
+            let identity = apply::journaled_identity(ctx.workspace, item_id, row.old_version);
+            match apply::delete_local(
+                ctx.root,
+                path,
+                Some(&expected),
+                generation,
+                Some(&identity),
+            ) {
                 Ok(apply::ApplyOutcome::Applied { .. })
                 | Ok(apply::ApplyOutcome::AlreadySatisfied) => {}
                 _ => return Ok(false),
@@ -1232,7 +1343,11 @@ async fn version_object<R: RemoteOps>(
 async fn expected_guard_state<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     row: &LocalAction,
-) -> Option<hfdrive_windows::filesystem::volume::FileState> {
+) -> Option<(
+    hfdrive_windows::filesystem::volume::FileState,
+    crate::sync::apply::ExpectedLocal,
+    u64,
+)> {
     let source_path = row.source_path.as_ref().or(row.target_path.as_ref())?;
     let live =
         hfdrive_windows::filesystem::volume::query_file_state(&ctx.root.join(source_path)).ok()?;
@@ -1250,7 +1365,8 @@ async fn expected_guard_state<R: RemoteOps>(
         .ok()?
         .map(|observation| observation.generation)
         .unwrap_or(expected.generation);
-    crate::sync::apply::verify_expected(&expected, &live, generation).then_some(live)
+    crate::sync::apply::verify_expected(&expected, &live, generation)
+        .then_some((live, expected, generation))
 }
 
 /// Parses a journaled 32-hex-digit NTFS file identity.
@@ -1417,7 +1533,6 @@ async fn upload_entry_inner<R: RemoteOps>(
                 upload_id,
                 expected: None,
                 workspace: ctx.workspace,
-                root: ctx.root.to_path_buf(),
             };
             let captured = match crate::sync::capture::capture_local_change(
                 ctx.state,
@@ -2265,6 +2380,478 @@ mod tests {
         fixture.state.close().await.unwrap();
     }
 
+    // -- K07/G13: one batch command refreshes the whole registry ----------
+
+    /// The registry refresh is one transaction over the complete post-round
+    /// namespace: a mid-batch failure leaves no partial write, an identical
+    /// replay rewrites nothing, and a later batch's operation never enters an
+    /// earlier base.
+    #[tokio::test]
+    async fn registry_refresh_is_one_transaction_and_skips_identical_rows() {
+        use hfdrive_core::reconcile::CatalogView;
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let committed = item_record(
+            ItemId::new(), Some(fixture.root_item), "committed.bin", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        let later = item_record(
+            ItemId::new(), Some(fixture.root_item), "later-batch.bin", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let planned = planned_round(
+            fixture.workspace,
+            vec![create_op(committed.clone()), create_op(later.clone())],
+        );
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let commit = CommitId::new();
+        let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+            .account(fixture.account.account_key())
+            .database();
+
+        // A failure at the second row of the registry batch rolls the whole
+        // registry batch back: one transaction, one durable step. Per-row
+        // upserts would leave the first row behind, so a partial registry
+        // refresh is impossible.
+        let root_before = fixture.account.item(fixture.connection, fixture.root_item).await.unwrap();
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch(&format!(
+                "CREATE TRIGGER abort_second_item BEFORE INSERT ON items
+                   WHEN NEW.item_id = X'{:032x}'
+                   BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+                committed.item_id.as_uuid().as_u128()
+            ))
+            .unwrap();
+        }
+        assert!(matches!(
+            advance_base(&ctx, commit, &planned.plan.remote_ops[..1], &planned, &sources).await,
+            Err(PublishError::State(_))
+        ));
+        assert!(
+            fixture.account.item(fixture.connection, committed.item_id).await.unwrap().is_none(),
+            "an aborted registry batch leaves no partial write behind"
+        );
+        assert_eq!(
+            fixture.account.item(fixture.connection, fixture.root_item).await.unwrap(),
+            root_before,
+            "the row written earlier in the same batch is rolled back with it"
+        );
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch("DROP TRIGGER abort_second_item").unwrap();
+        }
+
+        // The retry lands the complete committed namespace in both stores.
+        advance_base(&ctx, commit, &planned.plan.remote_ops[..1], &planned, &sources).await.unwrap();
+        let rows = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        assert_eq!(rows.len(), 2, "the root and the committed operation belong to this base");
+        assert!(!rows.iter().any(|row| row.item_id == later.item_id));
+        assert!(fixture.account.item(fixture.connection, committed.item_id).await.unwrap().is_some());
+        assert!(
+            fixture.account.item(fixture.connection, later.item_id).await.unwrap().is_none(),
+            "a later batch's operation must not enter this base"
+        );
+
+        // An identical replay rewrites nothing: a trigger aborting any UPDATE
+        // of the table stays silent only if the batch truly writes no row.
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER refuse_item_rewrite BEFORE UPDATE ON items
+                 BEGIN SELECT RAISE(ABORT, 'identical row rewritten'); END;",
+            )
+            .unwrap();
+        }
+        advance_base(&ctx, commit, &planned.plan.remote_ops[..1], &planned, &sources).await.unwrap();
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch("DROP TRIGGER refuse_item_rewrite").unwrap();
+        }
+
+        // A genuinely changed row *is* written, and the change rolls back with
+        // its batch if the write is refused.
+        let mut renamed = committed.clone();
+        renamed.name = "renamed.bin".to_owned();
+        let renamed_plan = planned_round(fixture.workspace, vec![create_op(renamed)]);
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER refuse_item_rewrite BEFORE UPDATE ON items
+                 BEGIN SELECT RAISE(ABORT, 'identical row rewritten'); END;",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            advance_base(&ctx, commit, &renamed_plan.plan.remote_ops, &renamed_plan, &sources).await,
+            Err(PublishError::State(_))
+        ));
+        assert_eq!(
+            fixture.account.item(fixture.connection, committed.item_id).await.unwrap().unwrap().name,
+            "committed.bin",
+            "the aborted change is rolled back"
+        );
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch("DROP TRIGGER refuse_item_rewrite").unwrap();
+        }
+        advance_base(&ctx, commit, &renamed_plan.plan.remote_ops, &renamed_plan, &sources).await.unwrap();
+        assert_eq!(
+            fixture.account.item(fixture.connection, committed.item_id).await.unwrap().unwrap().name,
+            "renamed.bin",
+            "the changed row is persisted once the guard is gone"
+        );
+
+        // The later batch's operation lands only in its own later base, and
+        // the earlier base keeps every row it sealed.
+        let later_commit = CommitId::new();
+        advance_base(&ctx, later_commit, &planned.plan.remote_ops[1..], &planned, &sources).await.unwrap();
+        assert!(fixture.account.item(fixture.connection, later.item_id).await.unwrap().is_some());
+        assert_eq!(
+            fixture.account.list_common_bases(fixture.connection, commit).await.unwrap().len(),
+            2,
+            "the earlier sealed namespace is untouched"
+        );
+        fixture.state.close().await.unwrap();
+    }
+
+    /// A bound version's digest/size/modification metadata reaches the
+    /// registry row of the record that names it, and only that row.
+    #[tokio::test]
+    async fn registry_refresh_binds_the_planned_version_metadata() {
+        use hfdrive_core::ids::UploadId;
+        use hfdrive_core::reconcile::CatalogView;
+        use hfdrive_core::storage::{PayloadKey, Sha256Digest, XetFileId};
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let version = VersionId::new();
+        let file = item_record(
+            ItemId::new(), Some(fixture.root_item), "bound.bin", ItemKind::File,
+            Some(version), revision,
+        );
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let digest = Sha256Digest::of(b"bound payload");
+        let object = ObjectRef {
+            key: PayloadKey::new(UploadId::new()),
+            xet_file_id: XetFileId::new(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+            )
+            .unwrap(),
+            size: 13,
+            sha256: digest,
+        };
+        let mut planned = planned_round(fixture.workspace, vec![create_op(file.clone())]);
+        planned.plan.versions.push(hfdrive_core::reconcile::PlannedVersion {
+            version_id: version,
+            object,
+            display: format::DisplayMetadata {
+                name: "bound.bin".to_owned(),
+                modified_at: "2026-11-17T00:00:00Z".to_owned(),
+            },
+        });
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        advance_base(&ctx, CommitId::new(), &planned.plan.remote_ops, &planned, &sources).await.unwrap();
+
+        let bound = fixture.account.item(fixture.connection, file.item_id).await.unwrap().unwrap();
+        let (stored_digest, stored_size) = registry_digest(&bound);
+        assert_eq!(stored_digest, Some(digest));
+        assert_eq!(stored_size, Some(13));
+        assert_eq!(
+            bound.metadata_json.get("modified_at").and_then(|v| v.as_str()),
+            Some("2026-11-17T00:00:00Z")
+        );
+        // The directory record has no content version, so it carries no digest.
+        let root_row = fixture.account.item(fixture.connection, fixture.root_item).await.unwrap().unwrap();
+        assert_eq!(registry_digest(&root_row), (None, None));
+        fixture.state.close().await.unwrap();
+    }
+
+    /// G04: a base advance never erases a remote version's digest, size or
+    /// display metadata. Planned version metadata wins for newly published
+    /// content; a remote-only or unchanged version keeps the content facts the
+    /// remote view proved and the `modified_at` the registry already bound to
+    /// that exact version. A known remote file is never re-defaulted to an
+    /// unknown zero-length payload.
+    #[tokio::test]
+    async fn base_advance_preserves_nonempty_remote_version_metadata() {
+        use hfdrive_core::ids::UploadId;
+        use hfdrive_core::reconcile::{CatalogView, ItemState};
+        use hfdrive_core::storage::{PayloadKey, Sha256Digest, XetFileId};
+        let modified_at = |row: &hfdrive_state::ItemRecord| {
+            row.metadata_json.get("modified_at").and_then(|value| value.as_str()).map(str::to_owned)
+        };
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+
+        // A nonempty remote-only file: the round published nothing for it.
+        let remote_file = item_record(
+            ItemId::new(), Some(fixture.root_item), "remote.bin", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        let remote_digest = Sha256Digest::of(b"remote payload bytes");
+        let remote_size = 20u64;
+
+        // A locally published file: its committed record names a fresh
+        // version, and the planned version metadata must replace the stale
+        // facts of the version it supersedes.
+        let published_item = ItemId::new();
+        let old_version = VersionId::new();
+        let published_old = item_record(
+            published_item, Some(fixture.root_item), "published.bin", ItemKind::File,
+            Some(old_version), revision,
+        );
+        let new_version = VersionId::new();
+        let published_new = item_record(
+            published_item, Some(fixture.root_item), "published.bin", ItemKind::File,
+            Some(new_version), OperationId::new(),
+        );
+        // A second committed operation belonging to a later batch.
+        let later = item_record(
+            ItemId::new(), Some(fixture.root_item), "later.bin", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        let new_digest = Sha256Digest::of(b"fresh payload");
+        let new_size = 13u64;
+
+        let root_state = ItemState::from_record(&root, None, None).unwrap();
+        let remote_state =
+            ItemState::from_record(&remote_file, Some(remote_digest), Some(remote_size)).unwrap();
+        let old_state =
+            ItemState::from_record(&published_old, Some(Sha256Digest::of(b"stale")), Some(1)).unwrap();
+        let sources = PlanSources {
+            base: CatalogView::new(vec![root_state.clone()]).unwrap(),
+            remote: CatalogView::new(vec![root_state.clone(), remote_state.clone(), old_state]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let object = ObjectRef {
+            key: PayloadKey::new(UploadId::new()),
+            xet_file_id: XetFileId::new(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+            )
+            .unwrap(),
+            size: new_size,
+            sha256: new_digest,
+        };
+        let mut planned = planned_round(
+            fixture.workspace,
+            vec![
+                hfdrive_core::reconcile::RemoteOp {
+                    record: published_new.clone(),
+                    change: format::ChangeKind::Content,
+                    old_revision: Some(revision),
+                },
+                create_op(later.clone()),
+            ],
+        );
+        planned.plan.versions.push(hfdrive_core::reconcile::PlannedVersion {
+            version_id: new_version,
+            object,
+            display: format::DisplayMetadata {
+                name: "published.bin".to_owned(),
+                modified_at: "2026-11-18T00:00:00Z".to_owned(),
+            },
+        });
+
+        // Earlier rounds already proved both files' display metadata.
+        fixture.account.upsert_item(registry_item(
+            fixture.connection,
+            &remote_file,
+            Some(remote_digest),
+            Some(remote_size),
+            Some("2026-06-01T00:00:00Z".to_owned()),
+        ))
+        .await
+        .unwrap();
+        fixture.account.upsert_item(registry_item(
+            fixture.connection,
+            &published_old,
+            Some(Sha256Digest::of(b"stale")),
+            Some(1),
+            Some("2020-01-01T00:00:00Z".to_owned()),
+        ))
+        .await
+        .unwrap();
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let commit = CommitId::new();
+        // Only the first operation committed in this batch; `later.bin`
+        // belongs to a later batch and re-plans afterwards.
+        advance_base(&ctx, commit, &planned.plan.remote_ops[..1], &planned, &sources).await.unwrap();
+
+        // The remote-only nonempty file keeps its content facts and its
+        // display metadata through the base advance.
+        let remote_row = fixture.account.item(fixture.connection, remote_file.item_id).await.unwrap().unwrap();
+        let (stored_digest, stored_size) = registry_digest(&remote_row);
+        assert_eq!(stored_digest, Some(remote_digest));
+        assert_eq!(stored_size, Some(remote_size));
+        assert!(stored_size.is_some_and(|size| size > 0), "a known remote file is never zeroed");
+        assert_eq!(modified_at(&remote_row).as_deref(), Some("2026-06-01T00:00:00Z"));
+
+        // The published version adopts its planned metadata, not the stale
+        // facts of the version it replaced.
+        let published_row = fixture.account.item(fixture.connection, published_item).await.unwrap().unwrap();
+        let (published_digest, published_size) = registry_digest(&published_row);
+        assert_eq!(published_digest, Some(new_digest));
+        assert_eq!(published_size, Some(new_size));
+        assert_eq!(modified_at(&published_row).as_deref(), Some("2026-11-18T00:00:00Z"));
+        assert_eq!(published_row.content_version_id, Some(new_version));
+
+        // The sealed base is the complete remote view overlaid with the
+        // committed batch only; the later batch's operation never enters it.
+        let rows = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        assert_eq!(rows.len(), 3, "the root and the complete remote view are sealed");
+        assert!(rows.iter().any(|row| row.item_id == fixture.root_item));
+        assert!(rows.iter().any(|row| row.item_id == remote_file.item_id));
+        assert!(rows.iter().any(|row| row.item_id == published_item));
+        assert!(!rows.iter().any(|row| row.item_id == later.item_id));
+        assert!(fixture.account.item(fixture.connection, later.item_id).await.unwrap().is_none());
+
+        // A later round that publishes nothing leaves every unchanged
+        // version's metadata in place — including the display metadata that
+        // round no longer has planned version records for.
+        let published_kept =
+            ItemState::from_record(&published_new, Some(new_digest), Some(new_size)).unwrap();
+        let later_sources = PlanSources {
+            base: CatalogView::new(vec![root_state.clone()]).unwrap(),
+            remote: CatalogView::new(vec![root_state, remote_state, published_kept]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let later_planned = planned_round(fixture.workspace, Vec::new());
+        let second_commit = CommitId::new();
+        advance_base(&ctx, second_commit, &[], &later_planned, &later_sources).await.unwrap();
+
+        let remote_row = fixture.account.item(fixture.connection, remote_file.item_id).await.unwrap().unwrap();
+        assert_eq!(registry_digest(&remote_row), (Some(remote_digest), Some(remote_size)));
+        assert_eq!(modified_at(&remote_row).as_deref(), Some("2026-06-01T00:00:00Z"));
+        let published_row = fixture.account.item(fixture.connection, published_item).await.unwrap().unwrap();
+        assert_eq!(registry_digest(&published_row), (Some(new_digest), Some(new_size)));
+        assert_eq!(modified_at(&published_row).as_deref(), Some("2026-11-18T00:00:00Z"));
+        fixture.state.close().await.unwrap();
+    }
+
+    /// K17: a publication round reads active durable work only. Completed
+    /// rows are durable history: a round never scans, decodes or sorts them,
+    /// so a corrupted history row can never fail one.
+    #[tokio::test]
+    async fn a_round_never_scans_completed_outbox_history() {
+        use crate::sync::outbox::SyncIntent;
+        let fixture = connection_fixture().await;
+        let completed_op = OperationId::new();
+        let queued_item = ItemId::new();
+        let queued_op = OperationId::new();
+
+        // The history row: a metadata-only intent driven through its whole
+        // legal lifecycle to a durable completion.
+        let completed = crate::sync::outbox::intent_entry(
+            fixture.connection,
+            completed_op,
+            None,
+            None,
+            None,
+            0,
+            &SyncIntent::Move {
+                item_id: *ItemId::new().as_uuid(),
+                parent_id: *fixture.root_item.as_uuid(),
+                name: "history.bin".to_owned(),
+            },
+        )
+        .unwrap();
+        fixture.account.record_outbox(completed).await.unwrap();
+        for transition in [
+            OutboxTransition::MetadataReady {
+                candidate_commit: CommitId::new(),
+                candidate_head_json: serde_json::json!({ "generation": "g1" }),
+                expected_etag: "etag-1".to_owned(),
+            },
+            OutboxTransition::Published,
+            OutboxTransition::LocalApplyPending,
+        ] {
+            fixture.account
+                .transition_outbox(fixture.connection, completed_op, transition)
+                .await
+                .unwrap();
+        }
+        fixture.account.complete_outbox(fixture.connection, completed_op).await.unwrap();
+
+        // One active metadata-only intent: the round still drives real work.
+        let queued = crate::sync::outbox::intent_entry(
+            fixture.connection,
+            queued_op,
+            Some(queued_item),
+            None,
+            None,
+            1,
+            &SyncIntent::Move {
+                item_id: *queued_item.as_uuid(),
+                parent_id: *fixture.root_item.as_uuid(),
+                name: "queued.bin".to_owned(),
+            },
+        )
+        .unwrap();
+        fixture.account.record_outbox(queued).await.unwrap();
+
+        // The history row's intent payload is corrupted in place. Any pass
+        // that decodes completed history fails on it — the publication round
+        // never issues that pass.
+        let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+            .account(fixture.account.account_key())
+            .database();
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute(
+                "UPDATE outbox SET intent_json = '{'
+                  WHERE connection_id = ?1 AND operation_id = ?2",
+                rusqlite::params![
+                    fixture.connection.as_bytes().as_slice(),
+                    completed_op.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        // Proof the poison is load-bearing: the full-history listing still
+        // decodes every row and fails on this one.
+        assert!(fixture.account.list_outbox(fixture.connection, None, u32::MAX).await.is_err());
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        // The round completes normally: completed history was never read.
+        let outcome = run_round(&ctx, true).await.unwrap();
+        assert!(outcome.needs_initialize);
+        // The active row is still queued work; only history is skipped.
+        let active = fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap();
+        assert_eq!(active.len(), 1, "only the active row is work");
+        assert_eq!(active[0].operation_id, queued_op);
+        assert_ne!(active[0].state, OutboxState::Complete);
+        fixture.state.close().await.unwrap();
+    }
+
     // -- K10: head evidence proves its identity ---------------------------
 
     /// Evaluates `catalog_root_of` against a fresh remote serving `body`, so
@@ -2339,6 +2926,215 @@ mod tests {
             head_evidence_body(&fixture, &scheduler, &cancel, &head, wrong_workspace).await,
             Err(PublishError::UnsupportedFormat)
         ));
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- K03/G01: destructive actions keep their journaled identity -------
+
+    #[tokio::test]
+    async fn rename_and_delete_preserve_replacement_b() {
+        let fixture = connection_fixture().await;
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+
+        for kind in [StateActionKind::Rename, StateActionKind::DeletePlaceholder] {
+            let from = std::path::PathBuf::from(format!("{kind:?}-source.txt"));
+            let to = std::path::PathBuf::from(format!("{kind:?}-target.txt"));
+            let source = fixture.root.join(&from);
+            let target = fixture.root.join(&to);
+            std::fs::write(&source, b"original A").unwrap();
+            let original = hfdrive_windows::filesystem::volume::query_file_state(&source).unwrap();
+            let row = LocalAction {
+                connection_id: fixture.connection,
+                action_id: ActionId::new(),
+                item_id: Some(ItemId::new()),
+                kind,
+                expected_file_id: Some(hex_file_id(&original.identity.file_id)),
+                expected_generation: Some(3),
+                expected_usn: Some(
+                    u64::try_from(original.usn.expect("the NTFS guard fixture needs a USN"))
+                        .unwrap(),
+                ),
+                old_version: None,
+                new_version: None,
+                source_path: Some(from.clone()),
+                target_path: (kind == StateActionKind::Rename).then_some(to),
+                recovery_path: None,
+                state: LocalActionState::Pending,
+            };
+
+            // The journaled object A is replaced at the same path by B after
+            // planning. Neither destructive action may treat B as A.
+            std::fs::remove_file(&source).unwrap();
+            std::fs::write(&source, b"replacement B").unwrap();
+            let replacement = hfdrive_windows::filesystem::volume::query_file_state(&source).unwrap();
+            assert_ne!(replacement.identity.file_id, original.identity.file_id);
+
+            assert!(!execute_one_action(&ctx, &row).await.unwrap());
+            assert_eq!(std::fs::read(&source).unwrap(), b"replacement B");
+            if kind == StateActionKind::Rename {
+                assert!(!target.exists());
+            } else {
+                // Once absence is actually proven, deletion is already done.
+                std::fs::remove_file(&source).unwrap();
+                assert!(execute_one_action(&ctx, &row).await.unwrap());
+            }
+        }
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- G04: target metadata is durable before any effect ---------------
+
+    #[tokio::test]
+    async fn create_target_metadata_is_persisted_before_any_effect() {
+        use hfdrive_core::reconcile::LocalActionKind;
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        // A remote child of the root: its only ancestor is the fixture's
+        // registered root, so creation must work without any intermediate
+        // registry row.
+        let child = item_record(
+            ItemId::new(),
+            Some(fixture.root_item),
+            "remote.txt",
+            ItemKind::File,
+            Some(VersionId::new()),
+            revision,
+        );
+        let planned = PlannedRound {
+            plan: ReconcilePlan {
+                workspace_id: fixture.workspace,
+                mode: ReconcileMode::ReadOnly,
+                remote_ops: Vec::new(),
+                versions: Vec::new(),
+                changes: Vec::new(),
+                operation_ids: Vec::new(),
+                local_actions: vec![hfdrive_core::reconcile::LocalAction {
+                    action_id: ActionId::new(),
+                    item_id: child.item_id,
+                    action: LocalActionKind::CreatePlaceholder,
+                    expected: None,
+                    target: Some(item_state(&child)),
+                    local_alias: None,
+                }],
+                conflicts: Vec::new(),
+                aliases: Vec::new(),
+                intents: Vec::new(),
+            },
+            outcomes: Vec::new(),
+        };
+        plan::persist_plan_records(
+            &fixture.account,
+            fixture.connection,
+            &planned.plan,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        // The target record is durable before any effect and before
+        // `advance_base`: the create's registry lookup resolves it here.
+        let row = fixture
+            .account
+            .item(fixture.connection, child.item_id)
+            .await
+            .unwrap()
+            .expect("the create target's metadata is persisted with the plan");
+        assert_eq!(row.name, "remote.txt");
+        assert_eq!(row.parent_id, Some(fixture.root_item));
+        assert_eq!(row.kind, hfdrive_state::ItemKind::File);
+        assert_eq!(row.content_version_id, child.content_version_id);
+        let (_, size) = plan::registry_digest(&row);
+        assert_eq!(size, Some(4), "the bound version's size is durable too");
+
+        // The executor's create resolves its identity and size from exactly
+        // this row (`placeholder_identity`'s lookup) and never needs
+        // `advance_base` to have run first.
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let action = fixture
+            .account
+            .pending_local_actions(fixture.connection)
+            .await
+            .unwrap()
+            .remove(0);
+        let (identity, size, directory) = placeholder_identity(&ctx, &action).await.unwrap();
+        assert_eq!(identity, apply::file_identity(
+            fixture.workspace,
+            child.item_id,
+            child.content_version_id.unwrap(),
+        ));
+        assert_eq!(size, 4);
+        assert!(!directory);
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_create_target_occupied_by_a_foreign_object_is_preserved() {
+        let fixture = connection_fixture().await;
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+
+        // The target is a plain local file the plan knows nothing about.
+        let path = std::path::PathBuf::from("occupied.txt");
+        std::fs::write(fixture.root.join(&path), b"foreign bytes").unwrap();
+        let version = VersionId::new();
+        let row = LocalAction {
+            connection_id: fixture.connection,
+            action_id: ActionId::new(),
+            item_id: Some(ItemId::new()),
+            kind: StateActionKind::CreatePlaceholder,
+            expected_file_id: None,
+            expected_generation: None,
+            expected_usn: None,
+            old_version: None,
+            new_version: Some(version),
+            source_path: None,
+            target_path: Some(path.clone()),
+            recovery_path: None,
+            state: LocalActionState::Pending,
+        };
+        fixture
+            .account
+            .upsert_item(hfdrive_state::ItemRecord {
+                connection_id: fixture.connection,
+                item_id: row.item_id.unwrap(),
+                parent_id: Some(fixture.root_item),
+                name: "occupied.txt".to_owned(),
+                name_key: "occupied.txt".to_owned(),
+                kind: hfdrive_state::ItemKind::File,
+                revision: OperationId::new(),
+                content_version_id: Some(version),
+                deleted: false,
+                metadata_json: serde_json::json!({ "size": 13 }),
+            })
+            .await
+            .unwrap();
+        fixture
+            .account
+            .bump_observation(fixture.connection, row.item_id.unwrap(), None)
+            .await
+            .unwrap();
+
+        // A real creation entry reports `AlreadyExists` for the occupied
+        // path; the occupant is not this item's placeholder, so the action
+        // stays pending and the occupant keeps its bytes.
+        fixture.account.record_local_action(row.clone()).await.unwrap();
+        assert_eq!(execute_pending_actions(&ctx).await.unwrap(), 0);
+        assert_eq!(std::fs::read(fixture.root.join(&path)).unwrap(), b"foreign bytes");
+        let pending = fixture
+            .account
+            .pending_local_actions(fixture.connection)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "the guarded create keeps its durable pending action");
+        assert_eq!(pending[0].state, LocalActionState::Pending);
         fixture.state.close().await.unwrap();
     }
 

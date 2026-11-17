@@ -341,3 +341,110 @@ async fn refresh_without_id_token_still_rejects_a_changed_userinfo_subject() {
     assert_eq!(saved.generation, old_token.generation(), "rejected identity must not replace credentials");
     assert_eq!(saved.subject, "subject-1");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_invalid_grant_envelope_is_never_reactivated_after_restart() {
+    let fixture = Fixture::start(Controls::user("alice")).await;
+    let (manager, directory, account) = signed_in_manager(&fixture).await;
+    let first = manager.access_token(account).await.expect("cached");
+    fixture.controls.lock().unwrap().token_fail = true;
+    assert!(matches!(
+        manager.refresh_after_unauthorized(account, first.generation()).await,
+        Err(hfdrive_auth::AuthorizationError::NeedsSignIn)
+    ));
+    assert_eq!(
+        fixture.counters.refresh_requests.load(Ordering::SeqCst),
+        1,
+        "invalid_grant fails closed without a retry loop"
+    );
+
+    // K11: the rejection is durable, not just in-memory. The rejected record
+    // keeps its verified identity, generation and epoch bookkeeping but holds
+    // no replayable secret for a later startup to reactivate.
+    let saved = hfdrive_auth::AccountCredentialStore::open(
+        hfdrive_auth::store::account_credentials_dir(directory.path(), account), account,
+    ).unwrap().load().unwrap();
+    assert!(saved.access_token.is_empty(), "a rejected bearer must not survive for restart");
+    assert!(saved.refresh_token.is_none(), "a rejected refresh token must not survive for restart");
+    assert_eq!(saved.expires_at, 0);
+    assert_eq!(saved.generation, first.generation(), "generation stays monotonic for the replacement login");
+    assert_eq!(saved.subject, "subject-1");
+    assert!(saved.authorization_epoch > 0);
+
+    // Restart over the rejected record: it restores for display/recovery only
+    // and never produces a usable token epoch.
+    let restored = AuthManager::with_settings_and_launcher(
+        AuthConfig::with_client_id(Some(fixture.client_id.clone())),
+        OidcSettings::fixture(&fixture.issuer, &fixture.discovery_url(), "127.0.0.1", 300),
+        directory.path().to_owned(),
+        Some(account),
+        Arc::new(|_: &str| Ok(())),
+    );
+    assert_eq!(restored.snapshot().last_error, Some(AuthError::NeedsSignIn));
+    let profile = restored.active_profile().expect("the verified identity is retained for display");
+    assert_eq!(profile.subject, "subject-1");
+    assert!(matches!(
+        restored.access_token(account).await,
+        Err(hfdrive_auth::AuthorizationError::NeedsSignIn)
+    ));
+    assert!(matches!(
+        restored.authorization_lease(account),
+        Err(hfdrive_auth::AuthorizationError::NeedsSignIn)
+    ));
+    assert_eq!(
+        restored.authorization_epoch(account).unwrap(),
+        saved.authorization_epoch,
+        "epoch bookkeeping survives the rejection but issues no lease"
+    );
+    // The rejected grant is never replayed against the token endpoint.
+    assert!(restored.refresh_after_unauthorized(account, first.generation()).await.is_err());
+    assert_eq!(
+        fixture.counters.refresh_requests.load(Ordering::SeqCst),
+        1,
+        "a restart must not replay the rejected grant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_identity_envelope_is_never_reactivated_after_restart() {
+    let fixture = Fixture::start(Controls::user("alice")).await;
+    let (manager, directory, account) = signed_in_manager(&fixture).await;
+    let first = manager.access_token(account).await.expect("cached");
+    {
+        let mut controls = fixture.controls.lock().unwrap();
+        controls.id_token_mode = IdTokenMode::Omitted;
+        controls.userinfo_subject = Some("different-subject".into());
+    }
+    assert!(manager.refresh_after_unauthorized(account, first.generation()).await.is_err());
+    assert_eq!(manager.snapshot().last_error, Some(AuthError::NeedsSignIn));
+
+    // The rejected credentials are durably neutralized: the identity is
+    // retained for display but no bearer/refresh material survives for a
+    // later startup to reactivate.
+    let saved = hfdrive_auth::AccountCredentialStore::open(
+        hfdrive_auth::store::account_credentials_dir(directory.path(), account), account,
+    ).unwrap().load().unwrap();
+    assert!(saved.access_token.is_empty(), "a rejected bearer must not survive for restart");
+    assert!(saved.refresh_token.is_none(), "a rejected refresh token must not survive for restart");
+    assert_eq!(saved.expires_at, 0);
+    assert_eq!(saved.generation, first.generation());
+    assert_eq!(saved.subject, "subject-1", "rejected identity must not replace credentials");
+
+    // Restart over the rejected record: it must not become a usable session.
+    let restored = AuthManager::with_settings_and_launcher(
+        AuthConfig::with_client_id(Some(fixture.client_id.clone())),
+        OidcSettings::fixture(&fixture.issuer, &fixture.discovery_url(), "127.0.0.1", 300),
+        directory.path().to_owned(),
+        Some(account),
+        Arc::new(|_: &str| Ok(())),
+    );
+    assert_eq!(restored.snapshot().last_error, Some(AuthError::NeedsSignIn));
+    assert!(matches!(
+        restored.access_token(account).await,
+        Err(hfdrive_auth::AuthorizationError::NeedsSignIn)
+    ));
+    assert!(matches!(
+        restored.authorization_lease(account),
+        Err(hfdrive_auth::AuthorizationError::NeedsSignIn)
+    ));
+}

@@ -22,11 +22,12 @@ use hfdrive_core::format::{self, ItemRecord};
 use hfdrive_core::ids::{ActionId, CommitId, ConnectionId, ItemId, OperationId, WorkspaceId};
 use hfdrive_core::reconcile::{
     CatalogView, ConflictRecord as CoreConflict, IdSource, ItemState, LocalIntent, LocalOrigin,
-    OrdinalIgnoreCase, ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
+    OrdinalIgnoreCase, PlannedVersion, ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
 };
 use hfdrive_core::storage::Sha256Digest;
 use hfdrive_state::{
-    AccountStore, ConflictResolution, LocalAction, LocalActionState, OutboxEntry, OutboxState,
+    AccountStore, CommonBaseRecord, ConflictResolution, LocalAction, LocalActionState, OutboxEntry,
+    OutboxState,
 };
 use hfdrive_state::ItemKind as StateItemKind;
 use tokio_util::sync::CancellationToken;
@@ -374,10 +375,73 @@ pub async fn persist_plan_records(
         };
         state.record_local_action(row).await?;
     }
+    // G04: every create action's target item metadata is durable **before**
+    // any effect runs. A `CreatePlaceholder` resolves its registry item (kind
+    // and the bound version's size) at execution time, so the verified target
+    // view/plan must already carry it — never a lookup that only succeeds
+    // after `advance_base` runs later in the round. Rename/update targets are
+    // not persisted here: their registry rows must keep the pre-move facts
+    // until the guarded local action actually applied.
+    persist_target_records(state, connection, plan).await?;
     for conflict in &plan.conflicts {
         state.record_conflict(to_state_conflict(connection, conflict)).await?;
     }
     Ok(())
+}
+
+/// Persists the registry records of every planned `CreatePlaceholder`
+/// action's **target** state from the verified plan, before any effect runs.
+/// The target states are exactly the reconciled records the plan
+/// materializes; the registry row shape is the same one [`registry_item`]
+/// builds for a committed record, so a later `advance_base` write of the same
+/// record is an identical-row skip in the state layer rather than a second
+/// rewrite.
+pub async fn persist_target_records(
+    state: &AccountStore,
+    connection: ConnectionId,
+    plan: &ReconcilePlan,
+) -> Result<(), PlanError> {
+    let mut rows = Vec::new();
+    for action in &plan.local_actions {
+        if action.action != hfdrive_core::reconcile::LocalActionKind::CreatePlaceholder {
+            continue;
+        }
+        let Some(target) = action.target.as_ref() else { continue; };
+        if rows.iter().any(|row: &hfdrive_state::ItemRecord| row.item_id == target.item_id) {
+            continue;
+        }
+        rows.push(target_registry_item(connection, target, &plan.versions));
+    }
+    // One worker command and one transaction; identical rows are not
+    // rewritten by the state layer.
+    state.upsert_items(rows).await?;
+    Ok(())
+}
+
+/// The durable registry entry for one planned target state, with the payload
+/// identity of its bound version (`modified_at` is display-only and never
+/// part of identity).
+pub fn target_registry_item(
+    connection: ConnectionId,
+    target: &ItemState,
+    versions: &[PlannedVersion],
+) -> hfdrive_state::ItemRecord {
+    let record = target.to_record();
+    let modified_at = record
+        .content_version_id
+        .and_then(|version| {
+            versions
+                .iter()
+                .find(|planned| planned.version_id == version)
+        })
+        .map(|planned| planned.display.modified_at.clone());
+    registry_item(
+        connection,
+        &record,
+        target.content_sha256,
+        target.content_size,
+        modified_at,
+    )
 }
 
 fn map_action_kind(kind: hfdrive_core::reconcile::LocalActionKind) -> hfdrive_state::LocalActionKind {
@@ -432,25 +496,30 @@ pub fn state_kind(kind: hfdrive_core::format::ItemKind) -> StateItemKind {
 }
 
 /// Seeds or advances the remembered common-base namespace with one commit's
-/// item records. Batched in bounded transactions.
+/// item records. One worker command and one transaction: every record lands
+/// or none does.
 pub async fn record_common_bases(
     state: &AccountStore,
     connection: ConnectionId,
     commit: CommitId,
     records: &[ItemRecord],
 ) -> Result<(), PlanError> {
+    let mut rows = Vec::with_capacity(records.len());
     for record in records {
         let item_json = String::from_utf8(format::to_item_record_bytes(record).map_err(|_| PlanError::UnsupportedFormat)?)
             .map_err(|_| PlanError::UnsupportedFormat)?;
-        state
-            .put_common_base(hfdrive_state::CommonBaseRecord {
-                connection_id: connection,
-                item_id: record.item_id,
-                commit_id: commit,
-                item_json,
-            })
-            .await?;
+        rows.push(CommonBaseRecord {
+            connection_id: connection,
+            item_id: record.item_id,
+            commit_id: commit,
+            item_json,
+        });
     }
+    // One worker command and one transaction for the whole sealed namespace;
+    // the per-row write flags are a diagnostic only — success is the completed
+    // batch command, never a per-row flag.
+    let written = state.put_common_bases(rows).await?;
+    debug_assert_eq!(written.len(), records.len(), "one flag is reported per requested record");
     Ok(())
 }
 
@@ -627,6 +696,121 @@ mod tests {
         assert_eq!(older.iter().find(|item| item.item_id == child_id).unwrap().name, "old-name");
         let absent = build_base_view(&fixture.account, fixture.connection, None, &mut digests).await;
         assert!(matches!(absent, Err(PlanError::MissingContext(_))));
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- K07/G13: one batch command seals the whole namespace --------------
+
+    /// One record per requested item, verbatim, in one transaction: a failure
+    /// at the third row leaves no partial namespace behind, and an identical
+    /// replay rewrites nothing.
+    #[tokio::test]
+    async fn common_base_batch_is_complete_and_skips_identical_rows() {
+        use hfdrive_core::ids::VersionId;
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let revision = OperationId::new();
+        let root = ItemRecord {
+            item_id: fixture.root_item, parent_id: None, name: String::new(),
+            kind: format::ItemKind::Directory, item_revision: revision,
+            content_version_id: None, deleted: false, content_operation: revision,
+            location_operation: revision, deletion_operation: None,
+        };
+        let children: Vec<ItemRecord> = (0..4)
+            .map(|index| ItemRecord {
+                item_id: ItemId::new(), parent_id: Some(fixture.root_item),
+                name: format!("file-{index}.bin"), kind: format::ItemKind::File,
+                content_version_id: Some(VersionId::new()), ..root.clone()
+            })
+            .collect();
+        let mut records = vec![root.clone()];
+        records.extend(children.iter().cloned());
+        let commit = CommitId::new();
+        let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+            .account(fixture.account.account_key())
+            .database();
+
+        // A failure at the third row of the batch rolls the whole batch back:
+        // one transaction, one durable step. Per-row writes would leave the
+        // first two rows behind, so a partial namespace is impossible.
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch(&format!(
+                "CREATE TRIGGER abort_third_base BEFORE INSERT ON common_bases
+                   WHEN NEW.item_id = X'{:032x}'
+                   BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+                records[2].item_id.as_uuid().as_u128()
+            ))
+            .unwrap();
+        }
+        assert!(matches!(
+            record_common_bases(&fixture.account, fixture.connection, commit, &records).await,
+            Err(PlanError::State(_))
+        ));
+        assert!(
+            fixture.account.list_common_bases(fixture.connection, commit).await.unwrap().is_empty(),
+            "an aborted batch leaves no partial namespace behind"
+        );
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch("DROP TRIGGER abort_third_base").unwrap();
+        }
+
+        // The retry lands the complete namespace: every requested item has a
+        // row, stored verbatim.
+        record_common_bases(&fixture.account, fixture.connection, commit, &records).await.unwrap();
+        let stored = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        assert_eq!(stored.len(), records.len(), "every requested record lands");
+        let sealed: HashMap<ItemId, ItemRecord> = stored
+            .iter()
+            .map(|row| {
+                let record = format::from_item_record_bytes(row.item_json.as_bytes()).unwrap();
+                (record.item_id, record)
+            })
+            .collect();
+        for expected in &records {
+            assert_eq!(sealed.get(&expected.item_id), Some(expected), "the record is stored verbatim");
+        }
+
+        // An identical replay rewrites nothing: a trigger aborting any UPDATE
+        // of the table stays silent only if the batch truly writes no row.
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER refuse_base_rewrite BEFORE UPDATE ON common_bases
+                 BEGIN SELECT RAISE(ABORT, 'identical row rewritten'); END;",
+            )
+            .unwrap();
+        }
+        record_common_bases(&fixture.account, fixture.connection, commit, &records).await.unwrap();
+        {
+            let raw = rusqlite::Connection::open(&database).unwrap();
+            raw.execute_batch("DROP TRIGGER refuse_base_rewrite").unwrap();
+        }
+
+        // A later commit's namespace is added, never replacing an earlier one,
+        // and a subset batch removes nothing.
+        let later = CommitId::new();
+        let mut renamed = children[0].clone();
+        renamed.name = "renamed.bin".to_owned();
+        record_common_bases(&fixture.account, fixture.connection, later, &[root.clone(), renamed])
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.account.list_common_bases(fixture.connection, later).await.unwrap().len(),
+            2,
+            "the later namespace is complete"
+        );
+        assert_eq!(
+            fixture.account.list_common_bases(fixture.connection, commit).await.unwrap().len(),
+            records.len(),
+            "the earlier sealed namespace is untouched"
+        );
+        record_common_bases(&fixture.account, fixture.connection, commit, &records[..1]).await.unwrap();
+        assert_eq!(
+            fixture.account.list_common_bases(fixture.connection, commit).await.unwrap().len(),
+            records.len(),
+            "a subset batch never removes remembered rows"
+        );
         fixture.state.close().await.unwrap();
     }
 

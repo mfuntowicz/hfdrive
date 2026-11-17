@@ -21,10 +21,20 @@
 //! * the coherent read is bound to the state observed at capture entry: a
 //!   path replacement in that window — even an ordinary file, even a
 //!   same-size/same-timestamp one — is drift ([`FsError::IdentityChanged`],
-//!   retried after re-observation), never accepted snapshot bytes;
-//! * admission is bounded by the shared scheduler's staging budget and the
-//!   volume's free space (`minimum_free_bytes`); exceeding it stops new
-//!   captures but never deletes staged snapshots or dirty work;
+//!   retried after re-observation), never accepted snapshot bytes. So is any
+//!   length change: a source that grew past the bytes admission reserved for
+//!   is refused before the coherent read, never staged past its reservation;
+//! * admission is charged for the capture's own bytes plus the durable
+//!   occupancy every retained `Capturing`/`Ready` snapshot already holds —
+//!   reconstructed from state on every capture, so it survives a restart —
+//!   against the **staging** volume's free space (`minimum_free_bytes`);
+//!   exceeding it stops new captures but never deletes or reclaims staged
+//!   snapshots or dirty work;
+//! * the retained-occupancy sample, the staging reservation and the capture's
+//!   completion are **one serialized critical section**
+//!   ([`Scheduler::staging_admission`]): the admission guard is held until the
+//!   snapshot is `Ready`, so a concurrent capture can never sample occupancy
+//!   before that — nor admit against a stale pre-capture zero;
 //! * retryable failures (sharing, disk space, identity drift, partially
 //!   materialized sources) retain the durable intent for retry; nothing is
 //!   uploaded and nothing is marked clean.
@@ -62,8 +72,6 @@ pub struct CaptureRequest {
     /// The connection's workspace: a recaptured placeholder must belong to
     /// it, or the capture is refused and re-observed — never re-bound.
     pub workspace: WorkspaceId,
-    /// The connection's local root (for staging admission checks).
-    pub root: PathBuf,
 }
 
 /// A fully staged, flushed, hash-verified payload with its binding evidence.
@@ -116,6 +124,41 @@ impl CaptureFailure {
     pub fn detail(&self) -> String {
         self.to_string()
     }
+}
+
+/// Durable staging occupancy: the recorded sizes of every `Capturing`/`Ready`
+/// snapshot the account still retains. Retired captures (`Consumed`/
+/// `Released`) never count — their bytes are consumed or already gone — and a
+/// capture whose size state has not recorded yet counts its staged file's
+/// current length (`0` when it is not there). This is reconstructed from
+/// state, never from live reservations, so retained snapshots keep blocking
+/// admission after a restart.
+pub(crate) fn retained_snapshot_bytes(snapshots: &[hfdrive_state::SnapshotRecord]) -> u64 {
+    let mut bytes = 0u64;
+    for snapshot in snapshots {
+        if !matches!(
+            snapshot.status,
+            hfdrive_state::SnapshotStatus::Capturing | hfdrive_state::SnapshotStatus::Ready
+        ) {
+            continue;
+        }
+        let size = snapshot
+            .size
+            .unwrap_or_else(|| std::fs::metadata(&snapshot.path).map(|meta| meta.len()).unwrap_or(0));
+        bytes = bytes.saturating_add(size);
+    }
+    bytes
+}
+
+/// The account-wide durable staging occupancy behind
+/// [`retained_snapshot_bytes`]: every connection's retained snapshots, since
+/// the staging budget is provider-wide and never per-connection.
+pub(crate) async fn retained_staging_bytes(state: &AccountStore) -> Result<u64, hfdrive_state::StateError> {
+    let mut snapshots = Vec::new();
+    for connection in state.list_connections().await? {
+        snapshots.extend(state.list_snapshots(connection.connection_id).await?);
+    }
+    Ok(retained_snapshot_bytes(&snapshots))
 }
 
 /// Materializes `path` fully when it is not resident on disk. Uses the
@@ -183,19 +226,41 @@ pub async fn capture_local_change(
         return Err(CaptureFailure::Cancelled);
     }
 
-    // 2. Staging admission: bounded staging + always keep minimum free space.
+    // 2. Staging admission — **one serialized critical section**: the retained
+    //    occupancy sample, the staging reservation and this capture's
+    //    completion all run while the section is held, so a concurrent capture
+    //    can never sample occupancy before this snapshot is `Ready` (nor admit
+    //    against a stale pre-capture zero). The occupancy charged is the
+    //    durable one every retained `Capturing`/`Ready` snapshot already holds
+    //    — reconstructed from state on every attempt, so nothing transient has
+    //    to survive a restart — plus this capture's own bytes, against the
+    //    staging volume's free space (the staging dir, never the sync root).
+    //    Pending snapshots are never reclaimed to satisfy admission: a capture
+    //    that cannot fit is refused and its durable intent stays queued for
+    //    retry. The guard is held to the end of this function — past the
+    //    `Ready` boundary below.
     let _admission = scheduler
-        .reserve_staging(
+        .staging_admission(
             WorkClass::LocalEdit,
             drive,
-            &request.root,
+            &request.staging_dir,
             live.size,
+            async {
+                let retained = retained_staging_bytes(state).await?;
+                seams::after_retained_sample(retained);
+                Ok::<u64, hfdrive_state::StateError>(retained)
+            },
             cancel,
         )
         .await
-        .map_err(|error| CaptureFailure::Admission {
-            code: crate::sync::work_errors::schedule_code(&error),
-            detail: error.to_string(),
+        .map_err(|error| match error {
+            crate::scheduler::StagingAdmissionError::RetainedOccupancy(error) => {
+                CaptureFailure::Blocked(leak_state_error(&error))
+            }
+            crate::scheduler::StagingAdmissionError::Refused(error) => CaptureFailure::Admission {
+                code: crate::sync::work_errors::schedule_code(&error),
+                detail: error.to_string(),
+            },
         })?;
 
     // 3. Durable capture intent, then the coherent read. The snapshot row is
@@ -382,11 +447,13 @@ fn gate_source(
 /// decision refuses anything that observation no longer shares with the
 /// step-1 gate:
 ///
-/// * the path must still name the same file (identity only: materialization
-///   legitimately advances the USN and clears recall attributes). A
+/// * the path must still name the same file **at the same length**: a
 ///   replacement since the gate — **even an ordinary file** — is
 ///   [`FsError::IdentityChanged`] drift: retried after re-observation,
-///   never captured as this work's bytes;
+///   never captured as this work's bytes. Any size change at all, growth or
+///   shrink, means the bytes the admission reserved for are no longer the
+///   bytes at the path, so the capture is refused before it can stage more
+///   than the reservation covers;
 /// * the ownership gate must reach the identical verdict for the boundary
 ///   observation. A plain target that became a placeholder or the reverse,
 ///   a placeholder of another item/workspace, or an identity that cannot be
@@ -402,9 +469,13 @@ fn bind_capture_source(
 ) -> Result<PlaceholderPolicy, CaptureFailure> {
     if live.identity.file_id != observed.identity.file_id
         || live.identity.volume_serial_number != observed.identity.volume_serial_number
+        || live.size != observed.size
     {
-        // The path was replaced since the gate: re-observe instead of
-        // capturing against a stale identity.
+        // The path was replaced or resized since the gate: re-observe instead
+        // of capturing against a stale identity or a stale length. The
+        // admission below is charged for `live.size`, so a growth must never
+        // reach the coherent read — it would stage more bytes than the
+        // reservation covers.
         return Err(CaptureFailure::Retry(FsError::IdentityChanged));
     }
     let boundary = gate_source(observed, lookup_now, workspace, item_id)?;
@@ -431,10 +502,10 @@ fn leak_state_error(error: &hfdrive_state::StateError) -> &'static str {
     "durable state rejected the snapshot journal update"
 }
 
-/// Deterministic interleaving seam for the capture regressions. The hook is
-/// thread-local (the capture runs on the calling task's thread between these
-/// calls, so parallel tests can never share a hook) and one-shot. Production
-/// code calls the empty stub and pays nothing.
+/// Deterministic interleaving seams for the capture regressions. The hooks
+/// are thread-local (the capture runs on the calling task's thread between
+/// these calls, so parallel tests can never share a hook). Production code
+/// calls the empty stubs and pays nothing.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::RefCell;
@@ -442,6 +513,7 @@ pub(crate) mod seams {
 
     thread_local! {
         static BEFORE_SNAPSHOT: RefCell<Option<Box<dyn FnMut(&Path)>>> = RefCell::new(None);
+        static RETAINED_SAMPLES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Runs (and clears) the pre-capture hook: it observes the source after
@@ -458,6 +530,20 @@ pub(crate) mod seams {
     pub(crate) fn install_before_coherent_capture(hook: Box<dyn FnMut(&Path)>) {
         BEFORE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(hook));
     }
+
+    /// Records the retained-occupancy value this capture sampled inside the
+    /// serialized staging-admission section. A test reads the sequence to
+    /// prove no capture samples occupancy before the previous capture's
+    /// snapshot is `Ready` — the second sample sees the retained bytes, never
+    /// a stale pre-capture zero.
+    pub(crate) fn after_retained_sample(retained: u64) {
+        RETAINED_SAMPLES.with(|samples| samples.borrow_mut().push(retained));
+    }
+
+    /// Drains the recorded sample sequence for the current test thread.
+    pub(crate) fn take_retained_samples() -> Vec<u64> {
+        RETAINED_SAMPLES.with(|samples| std::mem::take(&mut *samples.borrow_mut()))
+    }
 }
 
 #[cfg(not(test))]
@@ -466,12 +552,382 @@ mod seams {
 
     #[inline]
     pub(super) fn before_coherent_capture(_source: &Path) {}
+
+    #[inline]
+    pub(super) fn after_retained_sample(_retained: u64) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hfdrive_windows::filesystem::volume::FileIdentity;
+
+    /// A free-space probe that records every path it is asked about, proving
+    /// staging admission asks the staging volume and never the sync root.
+    struct Probe {
+        available: Option<u64>,
+        asked: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl crate::scheduler::FreeSpaceProbe for Probe {
+        fn available_bytes(&self, staging_path: &Path) -> Option<u64> {
+            self.asked.lock().unwrap().push(staging_path.to_path_buf());
+            self.available
+        }
+    }
+
+    /// The reconstruction counts only live captures: `Capturing`/`Ready` rows
+    /// by their recorded size, an unmeasured `Capturing` row by its staged
+    /// file's current length, and never a `Consumed`/`Released` row.
+    #[test]
+    fn retained_occupancy_counts_only_live_snapshots() {
+        let record = |status: hfdrive_state::SnapshotStatus, size: Option<u64>, path: &str| {
+            hfdrive_state::SnapshotRecord {
+                connection_id: hfdrive_core::ids::ConnectionId::new(),
+                snapshot_id: SnapshotId::new(),
+                path: PathBuf::from(path),
+                size,
+                sha256: None,
+                status,
+                operation_id: None,
+            }
+        };
+        let retained = retained_snapshot_bytes(&[
+            record(hfdrive_state::SnapshotStatus::Capturing, None, "staging\\no-size-yet.snap"),
+            record(hfdrive_state::SnapshotStatus::Ready, Some(6), "staging\\six.snap"),
+            record(hfdrive_state::SnapshotStatus::Capturing, Some(3), "staging\\three.snap"),
+            // Completed/retired snapshots never count.
+            record(hfdrive_state::SnapshotStatus::Consumed, Some(100), "staging\\retired.snap"),
+            record(hfdrive_state::SnapshotStatus::Released, Some(100), "staging\\retired.snap"),
+        ]);
+        assert_eq!(retained, 9, "a row with no recorded size contributes nothing here");
+
+        // An unmeasured capture counts its staged file's current length.
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("open.snap");
+        std::fs::write(&staged, b"12345").unwrap();
+        let retained = retained_snapshot_bytes(&[record(
+            hfdrive_state::SnapshotStatus::Capturing,
+            None,
+            staged.to_str().unwrap(),
+        )]);
+        assert_eq!(retained, 5);
+    }
+
+    /// G11's acceptance: with a 10-byte staging budget, one retained 6-byte
+    /// `Ready` snapshot blocks a second 6-byte capture — before **and** after
+    /// reopening state — and the refusal never reclaims the pending snapshot.
+    /// Free space is asked of the staging volume (never the sync root), and
+    /// retired (`Consumed`/`Released`) snapshots do not count.
+    #[tokio::test]
+    async fn a_retained_ready_snapshot_blocks_a_new_capture_before_and_after_reopen() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let staging = fixture.directory.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        // One pending `Ready` snapshot whose 6 staged bytes are still needed.
+        let retained_id = SnapshotId::new();
+        let retained_path = staging.join(format!("{retained_id}.snap"));
+        std::fs::write(&retained_path, b"retain").unwrap();
+        fixture
+            .account
+            .begin_snapshot(fixture.connection, retained_id, retained_path.clone())
+            .await
+            .unwrap();
+        fixture
+            .account
+            .complete_snapshot(fixture.connection, retained_id, 6, hfdrive_core::storage::Sha256Digest::of(b"retain"))
+            .await
+            .unwrap();
+        // A retired capture: its bytes never block admission again.
+        let retired_id = SnapshotId::new();
+        fixture
+            .account
+            .begin_snapshot(fixture.connection, retired_id, staging.join(format!("{retired_id}.snap")))
+            .await
+            .unwrap();
+        fixture
+            .account
+            .complete_snapshot(fixture.connection, retired_id, 100, hfdrive_core::storage::Sha256Digest::of(b"retired"))
+            .await
+            .unwrap();
+        fixture.account.retire_snapshot_consumed(fixture.connection, retired_id).await.unwrap();
+
+        let source = fixture.root.join("six.bin");
+        std::fs::write(&source, b"123456").unwrap();
+        let cancel = CancellationToken::new();
+        let probe = std::sync::Arc::new(Probe { available: Some(200), asked: std::sync::Mutex::new(Vec::new()) });
+        let blocking = |budget| {
+            let scheduler = crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig {
+                staging_admission_bytes: budget,
+                minimum_free_bytes: 100,
+                ..crate::scheduler::SchedulerConfig::default()
+            });
+            scheduler.set_free_space_probe(Some(probe.clone()));
+            scheduler
+        };
+
+        // Before reopen: 6 new bytes behind the retained 6 need 12 of 10.
+        let request = CaptureRequest {
+            connection_id: fixture.connection,
+            source: source.clone(),
+            staging_dir: staging.clone(),
+            item_id: ItemId::new(),
+            operation_id: OperationId::new(),
+            snapshot_id: SnapshotId::new(),
+            upload_id: hfdrive_core::ids::UploadId::new(),
+            expected: None,
+            workspace: fixture.workspace,
+        };
+        let error = match capture_local_change(&fixture.account, &blocking(10), *request.workspace.as_uuid(), &request, &cancel)
+            .await
+        {
+            Ok(_) => panic!("the retained 6-byte snapshot blocks a second 6-byte capture"),
+            Err(error) => error,
+        };
+        // 6 retained + 6 new = 12 > the 10-byte budget: refused outright, and
+        // the refusal never reclaims the pending snapshot to make room.
+        assert_eq!(error.error_code(), "reservation_too_large", "got {error:?}");
+        assert!(matches!(error, CaptureFailure::Admission { .. }));
+        // Free space was asked of the staging volume — the staged file's
+        // directory — and never of the sync root.
+        assert_eq!(*probe.asked.lock().unwrap(), vec![staging.clone()]);
+        // The refusal keeps the pending snapshot: same row, same staged bytes.
+        let row = fixture
+            .account
+            .snapshot(fixture.connection, retained_id)
+            .await
+            .unwrap()
+            .expect("the retained snapshot is still journaled");
+        assert_eq!(row.status, hfdrive_state::SnapshotStatus::Ready);
+        assert_eq!(row.size, Some(6));
+        assert_eq!(std::fs::read(&retained_path).unwrap(), b"retain");
+        // The refused capture journaled nothing and staged nothing.
+        assert!(fixture
+            .account
+            .snapshot(fixture.connection, request.snapshot_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // After reopen: a fresh scheduler holds no transient reservation, so
+        // only the durable state rows can be blocking — and they still do.
+        fixture.state.close().await.unwrap();
+        let reopened = hfdrive_state::StateStore::open(hfdrive_state::StatePaths::new(
+            fixture.directory.path().join("state"),
+        ))
+        .await
+        .unwrap();
+        let account = reopened
+            .open_account(hfdrive_core::ids::AccountKey::from_subject("https://huggingface.co", "sync-fixture"))
+            .await
+            .unwrap();
+        let retry = CaptureRequest {
+            snapshot_id: SnapshotId::new(),
+            operation_id: OperationId::new(),
+            ..request
+        };
+        let error = match capture_local_change(&account, &blocking(10), *retry.workspace.as_uuid(), &retry, &cancel)
+            .await
+        {
+            Ok(_) => panic!("the durable occupancy still blocks after reopen"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, CaptureFailure::Admission { .. }),
+            "admission refused the capture after reopen, got {error:?}"
+        );
+
+        // Retiring the retained capture frees exactly its occupancy: the same
+        // 6-byte capture now fits the 10-byte budget (6 + 0 ≤ 10). Nothing was
+        // reclaimed to make that happen — retirement is the consumer's proof.
+        account.retire_snapshot_consumed(fixture.connection, retained_id).await.unwrap();
+        let captured = capture_local_change(&account, &blocking(10), *retry.workspace.as_uuid(), &retry, &cancel)
+            .await
+            .expect("the capture fits once the retired snapshot no longer counts");
+        assert_eq!(captured.staged.size, 6);
+        assert_eq!(std::fs::read(&captured.staged.staged_path).unwrap(), b"123456");
+        reopened.close().await.unwrap();
+    }
+
+    /// Registers a second independent connection on the fixture account, so
+    /// two connections can race for the one provider-wide staging budget.
+    async fn second_connection(
+        fixture: &crate::sync::test_support::TestConnection,
+    ) -> (hfdrive_core::ids::ConnectionId, WorkspaceId) {
+        use hfdrive_core::ids::AccountKey;
+        use hfdrive_core::storage::{
+            BucketBinding, BucketId, BucketName, DriveBinding, Namespace, OwnerId, OwnerKind,
+            RemotePrefix,
+        };
+        use hfdrive_state::{ConnectionMode, SetupDraft};
+
+        let account_key = AccountKey::from_subject("https://huggingface.co", "sync-fixture");
+        let workspace = WorkspaceId::new();
+        let setup = fixture
+            .state
+            .reserve_setup(SetupDraft {
+                operation_id: OperationId::new(),
+                account_key,
+                binding: DriveBinding {
+                    account_key,
+                    workspace_id: workspace,
+                    bucket: BucketBinding {
+                        bucket_id: BucketId::new("test-bucket-b".to_owned()).unwrap(),
+                        bucket_name: BucketName::new("test-bucket-b".to_owned()).unwrap(),
+                        owner_id: OwnerId::new("test-owner-b".to_owned()).unwrap(),
+                        owner_kind: OwnerKind::Personal,
+                        owner_namespace: Namespace::new("test-user".to_owned()).unwrap(),
+                    },
+                    prefix: RemotePrefix::new(format!("hfdrive/{workspace}")).unwrap(),
+                },
+                initialize: false,
+            })
+            .await
+            .unwrap();
+        fixture
+            .state
+            .attach_setup_preview(
+                setup.setup_id,
+                serde_json::json!({ "root_item_id": ItemId::new().to_string() }),
+                fixture.directory.path().join("drive-b"),
+                ConnectionMode::Writable,
+            )
+            .await
+            .unwrap();
+        fixture.state.finalize_setup(setup.setup_id).await.unwrap();
+        (setup.connection_id, workspace)
+    }
+
+    /// The interleaving regression: two connections each attempt a 6-byte
+    /// capture against one 10-byte staging budget. Retained-occupancy sampling
+    /// and admission are **one serialized critical section through capture
+    /// completion**, so exactly one capture becomes `Ready`; the other is
+    /// refused and can never admit using a stale pre-capture zero occupancy
+    /// (its sample would be 0 and 6 + 0 would fit). Pending snapshots are
+    /// never reclaimed: the refused capture leaves the winner's `Ready` row
+    /// and staged bytes untouched.
+    #[tokio::test]
+    async fn concurrent_captures_serialize_occupancy_sampling_until_ready() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let (other, other_workspace) = second_connection(&fixture).await;
+        let staging = fixture.directory.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let source_a = fixture.root.join("a.bin");
+        std::fs::write(&source_a, b"AAAAAA").unwrap();
+        let source_b = fixture.root.join("b.bin");
+        std::fs::write(&source_b, b"BBBBBB").unwrap();
+
+        // One provider-wide budget shared by both connections' captures.
+        let scheduler = crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig {
+            staging_admission_bytes: 10,
+            minimum_free_bytes: 0,
+            ..crate::scheduler::SchedulerConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let request = |connection: hfdrive_core::ids::ConnectionId,
+                       workspace: WorkspaceId,
+                       source: &Path|
+         -> CaptureRequest {
+            CaptureRequest {
+                connection_id: connection,
+                source: source.to_path_buf(),
+                staging_dir: staging.clone(),
+                item_id: ItemId::new(),
+                operation_id: OperationId::new(),
+                snapshot_id: SnapshotId::new(),
+                upload_id: hfdrive_core::ids::UploadId::new(),
+                expected: None,
+                workspace,
+            }
+        };
+        let request_a = request(fixture.connection, fixture.workspace, &source_a);
+        let request_b = request(other, other_workspace, &source_b);
+
+        // Both captures attempt concurrently against the same account state
+        // and scheduler; the admission section orders them.
+        let (result_a, result_b) = tokio::join!(
+            capture_local_change(
+                &fixture.account,
+                &scheduler,
+                *request_a.workspace.as_uuid(),
+                &request_a,
+                &cancel,
+            ),
+            capture_local_change(
+                &fixture.account,
+                &scheduler,
+                *request_b.workspace.as_uuid(),
+                &request_b,
+                &cancel,
+            ),
+        );
+        let (winner, loser) = match (result_a, result_b) {
+            (Ok(captured), Err(error)) => {
+                ((request_a, fixture.connection, source_a, captured), (request_b, other, error))
+            }
+            (Err(error), Ok(captured)) => {
+                ((request_b, other, source_b, captured), (request_a, fixture.connection, error))
+            }
+            (Ok(_), Ok(_)) => panic!("both 6-byte captures admitted against a 10-byte budget"),
+            (Err(first), Err(second)) => {
+                panic!("neither capture completed: {first:?}; {second:?}")
+            }
+        };
+        let (win_request, win_connection, win_source, captured) = winner;
+        let (lose_request, lose_connection, error) = loser;
+
+        // Exactly one capture became `Ready` with its own bytes staged.
+        assert_eq!(captured.staged.size, 6);
+        assert_eq!(std::fs::read(&captured.staged.staged_path).unwrap(), std::fs::read(&win_source).unwrap());
+
+        // The other capture is refused: 6 new bytes behind the retained 6 do
+        // not fit the 10-byte budget. Its intent stays queued; nothing is
+        // reclaimed to make room for it.
+        assert!(matches!(error, CaptureFailure::Admission { .. }), "got {error:?}");
+        assert_eq!(
+            error.error_code(),
+            "reservation_too_large",
+            "the refused capture cannot fit behind the retained snapshot"
+        );
+
+        // The decisive evidence: occupancy sampling is serialized through
+        // capture completion. The losing capture sampled exactly the winner's
+        // retained 6 bytes — possible only after the winner's snapshot was
+        // `Ready` — never a stale pre-capture zero (a zero would have let it
+        // admit: 6 + 0 ≤ 10).
+        assert_eq!(
+            seams::take_retained_samples(),
+            vec![0, 6],
+            "the second sample must see the first snapshot's retained bytes"
+        );
+
+        // The refused capture journaled nothing and staged nothing.
+        assert!(fixture
+            .account
+            .snapshot(lose_connection, lose_request.snapshot_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Pending snapshots are never reclaimed: the winner's `Ready` row and
+        // staged bytes survive the refusal untouched.
+        let row = fixture
+            .account
+            .snapshot(win_connection, win_request.snapshot_id)
+            .await
+            .unwrap()
+            .expect("the winner's snapshot is journaled");
+        assert_eq!(row.status, hfdrive_state::SnapshotStatus::Ready);
+        assert_eq!(row.size, Some(6));
+        assert_eq!(
+            std::fs::read(&row.path).unwrap(),
+            std::fs::read(&win_source).unwrap(),
+            "the refused capture never reclaims or overwrites the staged snapshot"
+        );
+        fixture.state.close().await.unwrap();
+    }
 
     fn plain_state() -> FileState {
         FileState {
@@ -624,7 +1080,143 @@ mod tests {
         // too: a link substituted after this boundary fails before payload use.
         let policy = bind_capture_source(None, &plain_state(), &plain_state(), Ok(None), workspace, item)
             .expect("plain binding");
+        // A source that merely **grew** at the boundary — same file, same
+        // volume, different length — is drift too: the reservation covers the
+        // gate's length, so the grown bytes are never captured.
+        let grown = FileState { size: 12, ..placeholder.clone() };
+        let result = bind_capture_source(
+            Some(identity),
+            &placeholder,
+            &grown,
+            Ok(Some(identity)),
+            workspace,
+            item,
+        );
+        assert!(
+            matches!(result, Err(CaptureFailure::Retry(FsError::IdentityChanged))),
+            "a growth at the capture boundary is never bound to the gate's reservation"
+        );
+        let shrunk = FileState { size: 4, ..placeholder.clone() };
+        let result = bind_capture_source(
+            Some(identity),
+            &placeholder,
+            &shrunk,
+            Ok(Some(identity)),
+            workspace,
+            item,
+        );
+        assert!(
+            matches!(result, Err(CaptureFailure::Retry(FsError::IdentityChanged))),
+            "any size change at the capture boundary is drift"
+        );
         assert_eq!(policy, PlaceholderPolicy::Refuse);
+    }
+
+    /// The P2-R3 regression: a source that **grows after admission** is never
+    /// captured. The staging reservation is charged for the length observed at
+    /// the initial gate (`live.size`), so any size change at the capture
+    /// boundary — here 6 -> 12 bytes behind a 10-byte budget — is
+    /// [`FsError::IdentityChanged`]/[`CaptureFailure::Retry`] before the
+    /// coherent read opens. The capture can therefore never stage more bytes
+    /// than its reservation covers, and no snapshot becomes `Ready`.
+    #[tokio::test]
+    async fn a_source_that_grows_after_admission_is_never_captured() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let source = fixture.root.join("growing.bin");
+        std::fs::write(&source, b"AAAAAA").unwrap();
+        let staging = fixture.directory.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        // The reservation is admitted for the 6 bytes observed at the gate;
+        // the 10-byte budget could never also hold the 12 bytes the file
+        // grows to (6 retained + 12 = 18).
+        let scheduler = crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig {
+            staging_admission_bytes: 10,
+            minimum_free_bytes: 0,
+            ..crate::scheduler::SchedulerConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let request = CaptureRequest {
+            connection_id: fixture.connection,
+            source: source.clone(),
+            staging_dir: staging.clone(),
+            item_id: ItemId::new(),
+            operation_id: OperationId::new(),
+            snapshot_id: SnapshotId::new(),
+            upload_id: hfdrive_core::ids::UploadId::new(),
+            // No intent-time expectation: exactly the caller that would
+            // otherwise accept the grown file's bytes.
+            expected: None,
+            workspace: fixture.workspace,
+        };
+
+        // The **same** file grows in the window between the initial live
+        // observation and the capture-boundary observation: file identity and
+        // volume are unchanged, only the length differs.
+        seams::install_before_coherent_capture(Box::new(move |path| {
+            std::fs::write(path, b"AAAAAAAAAAAA").expect("grow the source in place");
+        }));
+
+        let error = match capture_local_change(
+            &fixture.account,
+            &scheduler,
+            *request.workspace.as_uuid(),
+            &request,
+            &cancel,
+        )
+        .await
+        {
+            Ok(_) => panic!("a source that grew past its reservation is never captured"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, CaptureFailure::Retry(FsError::IdentityChanged)),
+            "growth must surface as IdentityChanged/Retry, got {error:?}"
+        );
+
+        // No snapshot bytes were accepted: nothing was staged, and the durable
+        // capture row is still an incomplete `Capturing` entry, not `Ready`.
+        assert!(
+            std::fs::read_dir(&staging).map(|mut entries| entries.next().is_none()).unwrap_or(true),
+            "no staged bytes exist for the grown source"
+        );
+        let record = fixture
+            .account
+            .snapshot(fixture.connection, request.snapshot_id)
+            .await
+            .unwrap()
+            .expect("the capture intent row is journaled");
+        assert_eq!(record.status, hfdrive_state::SnapshotStatus::Capturing);
+        assert_eq!(record.size, None);
+        assert_eq!(record.sha256, None);
+
+        // Control: the same grown source is capturable once it is the observed
+        // state at the gate. This is a separate scheduler whose budget covers
+        // all 12 bytes — the regression above is proved under the 10-byte
+        // budget that cannot hold them, and this control only proves the
+        // refusal was the boundary binding, not an unrelated capture failure.
+        let roomy = crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig {
+            staging_admission_bytes: 64,
+            minimum_free_bytes: 0,
+            ..crate::scheduler::SchedulerConfig::default()
+        });
+        let control = CaptureRequest {
+            snapshot_id: SnapshotId::new(),
+            operation_id: OperationId::new(),
+            ..request
+        };
+        let captured = capture_local_change(
+            &fixture.account,
+            &roomy,
+            *control.workspace.as_uuid(),
+            &control,
+            &cancel,
+        )
+        .await
+        .expect("the grown file is capturable once it is the observed state");
+        assert_eq!(captured.staged.size, 12);
+        assert_eq!(std::fs::read(&captured.staged.staged_path).unwrap(), b"AAAAAAAAAAAA");
+        fixture.state.close().await.unwrap();
     }
 
     /// The regression: the coherent capture is bound to the observation taken
@@ -675,7 +1267,6 @@ mod tests {
             // previously accept any later plain replacement.
             expected: None,
             workspace: fixture.workspace,
-            root: fixture.root.clone(),
         };
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();
@@ -768,7 +1359,6 @@ mod tests {
             // previously accept anything present at the path.
             expected: None,
             workspace: fixture.workspace,
-            root: fixture.root.clone(),
         };
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();
@@ -846,7 +1436,6 @@ mod tests {
             upload_id: hfdrive_core::ids::UploadId::new(),
             expected: None,
             workspace: fixture.workspace,
-            root: fixture.root.clone(),
         };
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();

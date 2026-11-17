@@ -99,10 +99,15 @@ Two distinct layers:
   round-robin fairness across drives (connection ids), and every wait is
   cancellation-aware (drop/cancel never leaks a slot).
 - **Bytes** are bounded by RAII reservations: `reserve_transfer_memory`
-  (256 MiB default), `reserve_staging` (10 GiB default; free-space floor
+  (256 MiB default), `staging_admission` (10 GiB default; free-space floor
   `minimum_free_bytes` = 1 GiB enforced through the parent's
   `FreeSpaceProbe`), and the range-cache budget above. Reservations survive
   live resizes (shrink blocks new admission, never cancels held work).
+  Staging admission is one serialized critical section per capture: the
+  retained-occupancy sample, the staging reservation and the capture's
+  completion all run while its guard is held, so a second capture never
+  samples occupancy before the first snapshot is `Ready` (nor admits against
+  a stale pre-capture zero). Pending snapshots are never reclaimed.
 
 Policy gates are explicit and never lose work (callers keep durable intent and
 retry):

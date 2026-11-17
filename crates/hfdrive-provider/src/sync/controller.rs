@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
+
 use hfdrive_core::ids::{ConnectionId, DeviceId, ItemId, OperationId, UploadId, VersionId, WorkspaceId};
 use hfdrive_core::reconcile::ReconcileMode;
 use hfdrive_state::{
@@ -194,6 +196,11 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     /// Held across each drive round so quiescence can await exactly the
     /// in-flight dispatch instead of guessing at pause timing.
     dispatch: tokio::sync::Mutex<()>,
+    /// The cancellation token of the round currently dispatching. Synchronous
+    /// only for storing/taking the token; never held across an await. `pause`
+    /// cancels it so a pause stops the upload or HEAD mutation already in
+    /// flight, not merely the next round.
+    active_round: std::sync::Mutex<Option<CancellationToken>>,
     pump: tokio::sync::Mutex<Option<PumpHandle>>,
     /// Synchronous only for storing/taking the join handle; never held across
     /// an await. Disconnect joins this worker after cancelling its token.
@@ -295,6 +302,23 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     }
 }
 
+/// A durable clean flag alone is not deletion-safety evidence. The current
+/// placeholder must still be in sync and its USN must match the USN captured
+/// with the observation; missing current evidence fails closed.
+fn dirty_or_stale(
+    observation: &hfdrive_state::LocalObservation,
+    current_in_sync: bool,
+    current_usn: Option<i64>,
+) -> bool {
+    let current_usn = current_usn.and_then(|usn| u64::try_from(usn).ok());
+    observation.dirty
+        || !current_in_sync
+        || !matches!(
+            (observation.observed_usn, current_usn),
+            (Some(observed), Some(current)) if observed == current
+        )
+}
+
 /// The live pump drives this runtime: hydration reads come from the remote
 /// boundary, observations and preservation return to the durable pipeline.
 impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R> {
@@ -318,15 +342,21 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
         self.config.workspace
     }
 
-    fn observe(&self, observations: Vec<crate::sync::observe::RawObservation>) -> impl Future<Output = ()> + Send {
+    fn observe(&self, observations: Vec<crate::sync::observe::RawObservation>) -> impl Future<Output = Result<(), ()>> + Send {
         // The single classification funnel: watcher batches and CFAPI
         // notifications both run through `ingest_observations`, which shares
         // the runtime's echo table and persists generations and intents
         // before any effect.
-        self.ingest_observations(crate::sync::observe::ObservationBatch {
-            observations,
-            rescan_required: false,
-        })
+        async move {
+            let observed = self.ingest_observations(crate::sync::observe::ObservationBatch {
+                observations,
+                rescan_required: false,
+            }).await;
+            if observed.is_err() {
+                self.persistence_failed.store(true, Ordering::Release);
+            }
+            observed
+        }
     }
 
     fn preserve_dirty(
@@ -398,13 +428,25 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
     fn is_dirty(&self, item_id: ItemId) -> impl Future<Output = bool> + Send {
         let state = self.state.clone();
         let connection = self.config.connection_id;
+        let root = self.config.root.clone();
         async move {
-            match state.observation(connection, item_id).await {
-                Ok(Some(observation)) => observation.dirty,
-                Ok(None) => false,
-                // A missing cleanliness proof is never proof of clean data.
-                Err(_) => true,
-            }
+            let observation = match state.observation(connection, item_id).await {
+                Ok(Some(observation)) => observation,
+                // A missing observation or cleanliness query is never proof
+                // that destructive deletion may proceed without preservation.
+                Ok(None) | Err(_) => return true,
+            };
+            let Some(path) = registry_path(&state, connection, item_id).await else {
+                return true;
+            };
+            let Ok(live) = query_file_state(&root.join(path)) else {
+                return true;
+            };
+            let current_in_sync = hfdrive_windows::filesystem::volume::placeholder_state(
+                live.identity.attributes,
+                live.identity.reparse_tag,
+            ).is_in_sync();
+            dirty_or_stale(&observation, current_in_sync, live.usn)
         }
     }
 
@@ -545,6 +587,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             echo: tokio::sync::Mutex::new(EchoTable::default()),
             pending_removals: tokio::sync::Mutex::new(PendingRemovals::default()),
             dispatch: tokio::sync::Mutex::new(()),
+            active_round: std::sync::Mutex::new(None),
             pump: tokio::sync::Mutex::new(None),
             worker: std::sync::Mutex::new(None),
             disconnect_failure: tokio::sync::Mutex::new(None),
@@ -581,7 +624,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                     }
                     batch = observation_rx.recv(), if observations_open => {
                         match batch {
-                            Some(batch) => worker.ingest_observations(batch).await,
+                            Some(batch) => {
+                                let _ = worker.ingest_observations(batch).await;
+                            }
                             None => {
                                 observations_open = false;
                                 if !worker_cancel.is_cancelled() {
@@ -1330,8 +1375,30 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     }
 
     /// Pauses remote scheduling. Observation and durable intent continue.
+    ///
+    /// The pause is authoritative for the round already dispatching: its token
+    /// is cancelled here, so an in-flight upload or conditional `HEAD` write
+    /// stops instead of running to completion. `drive` also re-checks the flag
+    /// under the dispatch gate, so no queued upload or `HEAD` mutation starts
+    /// after this call returns.
     pub fn pause(&self) {
         self.paused.send_replace(true);
+        let active = self
+            .active_round
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+        if let Some(token) = active {
+            token.cancel();
+        }
+    }
+
+    /// Retires the round's published token. `drive` holds the dispatch gate for
+    /// the whole round, so at most one round is ever installed here; a `pause`
+    /// that already took and cancelled it simply finds the slot empty.
+    fn clear_active_round(&self, _cancel: &CancellationToken) {
+        let mut slot = self.active_round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
     }
 
     /// Quiesces dispatch in memory: pauses remote scheduling and waits for the
@@ -1437,57 +1504,65 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
 
     /// Classifies one observation batch and persists generations and intents
     /// before any effect. Watcher overflow voids deletion evidence.
-    pub async fn ingest_observations(&self, batch: crate::sync::observe::ObservationBatch) {
-        if batch.rescan_required {
-            self.scan_requested.store(true, Ordering::Release);
-            let _ = self.state.invalidate_scan(self.config.connection_id).await;
-        }
-        let echo = self.echo.lock().await;
-        for observation in batch.observations {
-            let classification = classify_observation(
-                &self.state,
-                self.config.connection_id,
-                self.config.root_item_id,
-                &self.config.root,
-                &echo,
-                &observation.relative_path,
-                observation.action,
-                now_ms(),
-            )
-            .await;
-            match classification {
-                Classification::Echo { .. }
-                | Classification::Excluded
-                | Classification::Ignored => {}
-                Classification::RescanRequired => {
-                    self.scan_requested.store(true, Ordering::Release);
-                    let _ = self.state.invalidate_scan(self.config.connection_id).await;
-                }
-                Classification::Created {
-                    item_id,
-                    is_directory,
-                    state,
-                } => {
-                    self.persist_change(item_id, &observation.relative_path, Some(is_directory), &state, true)
-                        .await;
-                }
-                Classification::ContentChanged { item_id, state } => {
-                    self.persist_change(item_id, &observation.relative_path, None, &state, false)
-                        .await;
-                }
-                Classification::Moved { item_id, state } => {
-                    self.persist_move(item_id, &observation.relative_path, &state).await;
-                }
-                Classification::Removed { item_id } => {
-                    self.pending_removals.lock().await.park(item_id, observation.relative_path.clone(), now_ms());
-                    self.scan_requested.store(true, Ordering::Release);
-                    let _ = self.state.invalidate_scan(self.config.connection_id).await;
-                }
-                Classification::UntrackedRemoval => {
-                    let _ = self.state.invalidate_scan(self.config.connection_id).await;
+    pub async fn ingest_observations(&self, batch: crate::sync::observe::ObservationBatch) -> Result<(), ()> {
+        let result: Result<(), ()> = async {
+            if batch.rescan_required {
+                self.scan_requested.store(true, Ordering::Release);
+                self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
+            }
+            let echo = self.echo.lock().await;
+            for observation in batch.observations {
+                let classification = classify_observation(
+                    &self.state,
+                    self.config.connection_id,
+                    self.config.root_item_id,
+                    &self.config.root,
+                    &echo,
+                    &observation.relative_path,
+                    observation.action,
+                    now_ms(),
+                )
+                .await;
+                match classification {
+                    Classification::Echo { .. }
+                    | Classification::Excluded
+                    | Classification::Ignored => {}
+                    Classification::RescanRequired => {
+                        self.scan_requested.store(true, Ordering::Release);
+                        self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
+                    }
+                    Classification::Created {
+                        item_id,
+                        is_directory,
+                        state,
+                    } => {
+                        self.persist_change(item_id, &observation.relative_path, Some(is_directory), &state, true)
+                            .await?;
+                    }
+                    Classification::ContentChanged { item_id, state } => {
+                        self.persist_change(item_id, &observation.relative_path, None, &state, false)
+                            .await?;
+                    }
+                    Classification::Moved { item_id, state } => {
+                        self.persist_move(item_id, &observation.relative_path, &state).await?;
+                    }
+                    Classification::Removed { item_id } => {
+                        self.pending_removals.lock().await.park(item_id, observation.relative_path.clone(), now_ms());
+                        self.scan_requested.store(true, Ordering::Release);
+                        self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
+                    }
+                    Classification::UntrackedRemoval => {
+                        self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
+                    }
                 }
             }
+            Ok(())
+        }.await;
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::Release);
+            self.local_failure("Local changes could not be recorded; local files are preserved");
         }
+        result
     }
 
     /// Persists a create/content change with its resolved parent.
@@ -1498,8 +1573,8 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         is_directory: Option<bool>,
         state: &FileState,
         is_create: bool,
-    ) {
-        let Some(parent) = self.resolve_parent(relative_path).await else { return; };
+    ) -> Result<(), ()> {
+        let Some(parent) = self.resolve_parent(relative_path).await else { return Err(()); };
         let name = file_name(relative_path);
         let modified_at = display_timestamp(state.last_write_time_100ns);
         let content = (!is_directory.unwrap_or(false)).then(|| PendingContent {
@@ -1541,18 +1616,18 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             deleted: false,
             metadata_json: serde_json::json!({ "size": state.size, "modified_at": display_timestamp(state.last_write_time_100ns) }),
         }) } else { None };
-        self.persist_intent(intent, item, state.usn.and_then(|usn| u64::try_from(usn).ok())).await;
+        self.persist_intent(intent, item, state.usn.and_then(|usn| u64::try_from(usn).ok())).await
     }
 
     /// Persists a move/rename with its resolved parent.
-    async fn persist_move(&self, item_id: ItemId, relative_path: &std::path::Path, _state: &FileState) {
-        let Some(parent) = self.resolve_parent(relative_path).await else { return; };
+    async fn persist_move(&self, item_id: ItemId, relative_path: &std::path::Path, _state: &FileState) -> Result<(), ()> {
+        let Some(parent) = self.resolve_parent(relative_path).await else { return Err(()); };
         self.persist_intent(SyncIntent::Move {
             item_id: *item_id.as_uuid(),
             parent_id: parent,
             name: file_name(relative_path),
         }, None, _state.usn.and_then(|usn| u64::try_from(usn).ok()))
-        .await;
+        .await
     }
 
     /// Resolves the parent directory of a relative path to its item id
@@ -1587,7 +1662,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         intent: SyncIntent,
         item: Option<hfdrive_state::ItemRecord>,
         usn: Option<u64>,
-    ) {
+    ) -> Result<(), ()> {
         let result = async {
             let base = self.state.baseline(self.config.connection_id).await?.applied_commit;
             let entry = intent_entry(
@@ -1595,11 +1670,12 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 base, None, 0, &intent,
             ).map_err(|_| hfdrive_state::StateError::Io(std::io::Error::other("invalid local intent")))?;
             self.state.record_observed_work(item, entry, usn).await
-        }.await;
+        }.await.map(|_| ()).map_err(|_| ());
         if result.is_err() {
             self.persistence_failed.store(true, Ordering::Release);
             self.local_failure("Local changes could not be recorded; local files are preserved");
         }
+        result
     }
 
     fn local_failure(&self, message: &str) {
@@ -1640,7 +1716,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             }).collect();
             self.ingest_observations(crate::sync::observe::ObservationBatch {
                 observations, rescan_required: false,
-            }).await;
+            }).await.map_err(|()| "Local changes could not be recorded")?;
             if !report.complete || report.overflow || self.persistence_failed.load(Ordering::Acquire) {
                 return Err("Local discovery is incomplete; no deletions were inferred");
             }
@@ -1678,7 +1754,8 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                         if self.observer.lock().await.as_ref().is_none_or(LocalObserver::overflowed) {
                             return Err("Local observation was lost; deletion inference stopped");
                         }
-                        self.persist_intent(SyncIntent::Delete { item_id: *item.item_id.as_uuid() }, None, None).await;
+                        self.persist_intent(SyncIntent::Delete { item_id: *item.item_id.as_uuid() }, None, None)
+                            .await.map_err(|()| "Local changes could not be recorded")?;
                     }
                     Err(_) => return Err("A local item could not be inspected; no deletion was inferred"),
                     Ok(_) => {}
@@ -1730,9 +1807,19 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         }
         self.refresh_health().await;
         let cancel = self.cancel.child_token();
+        // The round's token is published before any dispatch so `pause` can
+        // cancel the work already running, not just the next round.
+        *self.active_round.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(cancel.clone());
         let ctx = self.round_context(&cancel);
         if self.writable() {
             self.upload_pass(&ctx).await;
+        }
+        // A pause that landed while the upload pass ran must not let this
+        // round's conditional `HEAD` write start.
+        if *self.paused.borrow() {
+            self.clear_active_round(&cancel);
+            return;
         }
         match run_round(&ctx, self.writable()).await {
             Ok(outcome) => match self.state.ack_head_refresh(
@@ -1751,6 +1838,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 self.health.send_replace(health);
             }
         }
+        self.clear_active_round(&cancel);
         self.apply_pass(&ctx).await;
         self.refresh_health().await;
     }
@@ -1776,28 +1864,71 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
 
     /// Drives every content-complete entry without a bound payload through
     /// capture and the staged Xet checkpoints.
+    ///
+    /// At most two entries run concurrently: overlapping capture/upload work
+    /// is bounded while independent entries no longer serialize on each
+    /// other. Each entry's failure is best-effort exactly as before — the
+    /// error is recorded by [`upload_entry`] and the pass moves on to the
+    /// next entry — and the staging-admission critical section inside capture
+    /// remains the one capture at a time. Entries are dispatched in the
+    /// durable oldest-first order only while the pass is unpaused: pause is
+    /// authoritative per dispatch, so a pause landing during the pass stops
+    /// the next queued upload from starting (work already dispatched drains).
     async fn upload_pass(&self, ctx: &RoundContext<'_, R>) {
-        let Ok(entries) = self.state.list_outbox(self.config.connection_id, None, u32::MAX).await
+        let Ok(entries) = self
+            .state
+            .list_active_outbox(self.config.connection_id, u32::MAX)
+            .await
         else {
             return;
         };
-        for entry in entries {
-            if !matches!(entry.state, OutboxState::Observed | OutboxState::SnapshotReady) {
-                continue;
+        let eligible = entries
+            .into_iter()
+            .filter(|entry| {
+                matches!(entry.state, OutboxState::Observed | OutboxState::SnapshotReady)
+                    && matches!(next_step(entry, now_ms()), PhaseStep::Capture | PhaseStep::Upload)
+            })
+            .collect::<Vec<_>>();
+        let mut in_flight = FuturesUnordered::new();
+        let mut pending = eligible.into_iter();
+        loop {
+            // Fill the bounded window while unpaused: the check is what makes
+            // a pause land between two dispatches and stop the next upload.
+            while in_flight.len() < 2 && !*self.paused.borrow() {
+                let Some(entry) = pending.next() else { break };
+                // The upload owns its entry row for the whole flight.
+                in_flight.push(async move { upload_entry(ctx, &entry).await });
             }
-            match next_step(&entry, now_ms()) {
-                PhaseStep::Capture | PhaseStep::Upload => {
-                    let _ = upload_entry(ctx, &entry).await;
-                }
-                _ => {}
+            if in_flight.is_empty() {
+                return;
             }
+            // Per-entry errors stay best-effort: upload_entry records them on
+            // its work rows and the pass continues with the next entry.
+            let _ = in_flight.next().await;
         }
     }
 
     /// Executes pending journaled local actions and closes finished entries
     /// with their generation guard.
+    ///
+    /// The blocking-action query runs **once per pass**, before the loop, and
+    /// its result is reused for every entry: an entry whose item still has a
+    /// pending/in-progress journaled action is skipped. A query failure fails
+    /// closed — the pass closes nothing rather than assuming an empty action
+    /// set, which would let a completion race an unfinished local apply.
     async fn apply_pass(&self, ctx: &RoundContext<'_, R>) {
         let _ = crate::sync::publish::execute_pending_actions(ctx).await;
+        let blocking_items = match self
+            .state
+            .pending_local_actions(self.config.connection_id)
+            .await
+        {
+            Ok(actions) => actions
+                .iter()
+                .filter_map(|action| action.item_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            Err(_) => return,
+        };
         let Ok(entries) = self
             .state
             .list_outbox(self.config.connection_id, Some(OutboxState::LocalApplyPending), 256)
@@ -1806,16 +1937,10 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             return;
         };
         for entry in entries {
-            let blocking = self
-                .state
-                .pending_local_actions(self.config.connection_id)
-                .await
-                .map(|actions| {
-                    actions
-                        .iter()
-                        .any(|action| action.item_id.is_some() && action.item_id == entry.item_id)
-                })
-                .unwrap_or(true);
+            let blocking = match entry.item_id {
+                Some(item_id) => blocking_items.contains(&item_id),
+                None => false,
+            };
             if blocking {
                 continue;
             }
@@ -1863,7 +1988,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             .await
             .unwrap_or_else(|| PathBuf::from(&item.name));
         let Ok(state) = query_file_state(&self.config.root.join(&path)) else { return; };
-        self.persist_intent(SyncIntent::Content {
+        let _ = self.persist_intent(SyncIntent::Content {
             item_id: *item_id.as_uuid(),
             content: PendingContent {
                 upload_id: UploadId::new().as_uuid().clone(),
@@ -2010,35 +2135,62 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             .await?;
         let mut requeued = 0;
         for action in actions {
-            let live = action
+            let live = match action
                 .source_path
                 .as_ref()
                 .or(action.target_path.as_ref())
-                .and_then(|path| query_file_state(&self.config.root.join(path)).ok());
-            let target_exists = action
-                .target_path
-                .as_ref()
-                .is_some_and(|path| self.config.root.join(path).symlink_metadata().is_ok());
+            {
+                Some(path) => recovery_live_state(query_file_state(&self.config.root.join(path)))?,
+                None => crate::sync::apply::Probe::Missing,
+            };
             let expected = match (
                 action.expected_file_id.as_deref().and_then(parse_hex_file_id),
                 action.expected_generation,
             ) {
                 (Some(file_id), Some(generation)) => Some(crate::sync::apply::ExpectedLocal {
                     file_id,
-                    volume_serial_number: live
-                        .as_ref()
-                        .map(|live| live.identity.volume_serial_number)
-                        .unwrap_or(0),
+                    volume_serial_number: match &live {
+                        crate::sync::apply::Probe::Present(live) => {
+                            live.identity.volume_serial_number
+                        }
+                        crate::sync::apply::Probe::Missing
+                        | crate::sync::apply::Probe::Unreadable => 0,
+                    },
                     generation,
                     usn: action.expected_usn.and_then(|value| i64::try_from(value).ok()),
                 }),
                 _ => None,
             };
+            let generation = match action.item_id {
+                Some(item_id) => self.state.observation(self.config.connection_id, item_id).await?
+                    .map(|observation| observation.generation),
+                None => None,
+            }.or(action.expected_generation).unwrap_or(0);
+            let identity = action.item_id.map(|item_id| crate::sync::apply::journaled_identity(
+                self.config.workspace,
+                item_id,
+                action.new_version.or(action.old_version),
+            ));
+            let target = match (&action.target_path, action.kind) {
+                (Some(path), hfdrive_state::LocalActionKind::CreatePlaceholder
+                    | hfdrive_state::LocalActionKind::Rename) => {
+                    crate::sync::apply::target_proof(
+                        &self.config.root.join(path),
+                        expected.as_ref(),
+                        generation,
+                        identity.as_ref().map(|_| self.config.workspace),
+                        identity.as_ref(),
+                        action.kind == hfdrive_state::LocalActionKind::CreatePlaceholder,
+                    )
+                }
+                _ => crate::sync::apply::TargetProof::Missing,
+            };
             let decision = crate::sync::apply::classify_recovered(
                 action.kind,
                 expected.as_ref(),
-                live.as_ref(),
-                target_exists,
+                &live,
+                generation,
+                target,
             );
             match decision {
                 crate::sync::apply::RecoveryDecision::Done => {
@@ -2100,6 +2252,22 @@ fn file_name(relative_path: &std::path::Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned()
+}
+
+/// Only a verified absence is an absent recovery source/target. Metadata
+/// failures stay errors so recovery cannot misclassify a live file as gone.
+fn recovery_live_state(
+    queried: Result<FileState, hfdrive_windows::filesystem::FsError>,
+) -> Result<crate::sync::apply::Probe, PublishError> {
+    match queried {
+        Ok(live) => Ok(crate::sync::apply::Probe::Present(live)),
+        Err(hfdrive_windows::filesystem::FsError::NotFound { .. }) => {
+            Ok(crate::sync::apply::Probe::Missing)
+        }
+        Err(_) => Err(PublishError::LocalApply(
+            "recovery action metadata could not be read",
+        )),
+    }
 }
 
 /// Parses a journaled hex file identity.
@@ -2608,6 +2776,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_observation_is_returned_and_marks_persistence_failed() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        let fixture = connection_fixture().await;
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        fixture.state.close().await.unwrap();
+        let observed = <ConnectionRuntime<HeadOnlyRemote> as crate::sync::cfapi_pump::PumpHost<HeadOnlyRemote>>::observe(
+            &*runtime,
+            vec![crate::sync::observe::RawObservation {
+                relative_path: PathBuf::from("missing.txt"),
+                action: hfdrive_windows::filesystem::WatchAction::Removed,
+            }],
+        ).await;
+        assert_eq!(observed, Err(()), "a failed durable observation must reach the ACK path");
+        assert!(runtime.persistence_failed.load(Ordering::Acquire));
+        runtime.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_observation_is_conservatively_dirty() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        let fixture = connection_fixture().await;
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        let item = local_item(&fixture, "unobserved.txt").await;
+        assert!(
+            <ConnectionRuntime<HeadOnlyRemote> as crate::sync::cfapi_pump::PumpHost<HeadOnlyRemote>>::is_dirty(
+                &*runtime,
+                item,
+            )
+            .await,
+            "missing cleanliness evidence requires preservation before deletion"
+        );
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[test]
+    fn dirty_freshness_requires_in_sync_state_and_a_matching_usn() {
+        let observation = hfdrive_state::LocalObservation {
+            connection_id: ConnectionId::new(),
+            item_id: ItemId::new(),
+            generation: 1,
+            observed_usn: Some(41),
+            dirty: false,
+            pin_requested: false,
+            pin_complete: false,
+            excluded: false,
+            scan_epoch: 0,
+        };
+        assert!(!dirty_or_stale(&observation, true, Some(41)));
+        assert!(dirty_or_stale(&observation, false, Some(41)), "out-of-sync content is dirty");
+        assert!(dirty_or_stale(&observation, true, Some(42)), "a stale observed USN is dirty");
+        assert!(dirty_or_stale(&observation, true, None), "missing current USN evidence is dirty");
+        assert!(dirty_or_stale(
+            &hfdrive_state::LocalObservation { observed_usn: None, ..observation.clone() },
+            true,
+            None,
+        ), "missing durable USN evidence is dirty");
+        assert!(dirty_or_stale(
+            &hfdrive_state::LocalObservation { dirty: true, ..observation },
+            true,
+            Some(41),
+        ), "the durable dirty flag remains authoritative");
+    }
+
+    #[test]
+    fn recovery_metadata_errors_are_not_treated_as_missing_files() {
+        let error = recovery_live_state(Err(hfdrive_windows::filesystem::FsError::Win32 {
+            operation: "test metadata query",
+            code: 5,
+        })).unwrap_err();
+        assert!(matches!(error, PublishError::LocalApply("recovery action metadata could not be read")));
+        assert!(matches!(
+            recovery_live_state(Err(hfdrive_windows::filesystem::FsError::NotFound {
+                path: PathBuf::from("already-gone.txt"),
+            })).unwrap(),
+            crate::sync::apply::Probe::Missing
+        ));
+    }
+
+    #[tokio::test]
     async fn delete_suppression_failure_is_visible_and_retryable() {
         use crate::sync::test_support::connection_fixture;
         let fixture = connection_fixture().await;
@@ -2739,6 +2987,676 @@ mod tests {
             registry_path(&fixture.account, fixture.connection, file).await,
             Some(PathBuf::from("folder").join("report.txt"))
         );
+        fixture.state.close().await.unwrap();
+    }
+
+    // ---- F3: one pending-action query per apply pass ------------
+
+    /// A remote-to-local entry whose item still carries a pending journaled
+    /// action is never closed. The pass asks **once** for the blocking set and
+    /// reuses it for every entry, so N entries cost one query, not N.
+    #[tokio::test]
+    async fn apply_pass_queries_pending_actions_once_and_skips_blocked_items() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+
+        // Two entries in `LocalApplyPending`: one blocked by a pending action,
+        // one free to close.
+        let blocked_item = local_item(&fixture, "blocked.txt").await;
+        let free_item = local_item(&fixture, "free.txt").await;
+        let mut operations = Vec::new();
+        for item_id in [blocked_item, free_item] {
+            let entry = intent_entry(
+                fixture.connection,
+                OperationId::new(),
+                Some(item_id),
+                None,
+                None,
+                0,
+                &SyncIntent::Delete { item_id: *item_id.as_uuid() },
+            )
+            .unwrap();
+            let operation = entry.operation_id;
+            fixture.account.record_observed_work(None, entry, None).await.unwrap();
+            for transition in [
+                hfdrive_state::OutboxTransition::MetadataReady {
+                    candidate_commit: hfdrive_core::ids::CommitId::new(),
+                candidate_head_json: serde_json::json!({}),
+                    expected_etag: "\"fixture\"".to_owned(),
+                },
+                hfdrive_state::OutboxTransition::Published,
+                hfdrive_state::OutboxTransition::LocalApplyPending,
+            ] {
+                fixture.account.transition_outbox(fixture.connection, operation, transition).await.unwrap();
+            }
+            operations.push(operation);
+        }
+        // The blocking action is journaled for the first item only.
+        fixture
+            .account
+            .record_local_action(hfdrive_state::LocalAction {
+                connection_id: fixture.connection,
+                action_id: hfdrive_core::ids::ActionId::new(),
+                item_id: Some(blocked_item),
+                kind: hfdrive_state::LocalActionKind::UpdatePlaceholder,
+                expected_file_id: Some("00000000000000000000000000000000".to_owned()),
+                expected_generation: Some(1),
+                expected_usn: None,
+                old_version: None,
+                new_version: None,
+                source_path: None,
+                target_path: Some(PathBuf::from("blocked.txt")),
+                recovery_path: None,
+                state: LocalActionState::Pending,
+            })
+            .await
+            .unwrap();
+
+        let ctx_cancel = CancellationToken::new();
+        let ctx = runtime.round_context(&ctx_cancel);
+        runtime.apply_pass(&ctx).await;
+
+        let state = |operation| fixture.account.outbox_entry(fixture.connection, operation);
+        assert_eq!(
+            state(operations[0]).await.unwrap().unwrap().state,
+            OutboxState::LocalApplyPending,
+            "an item with a pending journaled action is never closed"
+        );
+        assert_eq!(
+            state(operations[1]).await.unwrap().unwrap().state,
+            OutboxState::Complete,
+            "an unblocked entry closes normally"
+        );
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    /// A failed pending-action query fails closed: the pass closes nothing
+    /// rather than assuming an empty action set, which would let a completion
+    /// race an unfinished local apply.
+    #[tokio::test]
+    async fn apply_pass_fails_closed_when_pending_actions_cannot_be_read() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+        let item_id = local_item(&fixture, "unreadable.txt").await;
+        let entry = intent_entry(
+            fixture.connection,
+            OperationId::new(),
+            Some(item_id),
+            None,
+            None,
+            0,
+            &SyncIntent::Delete { item_id: *item_id.as_uuid() },
+        )
+        .unwrap();
+        let operation = entry.operation_id;
+        fixture.account.record_observed_work(None, entry, None).await.unwrap();
+        for transition in [
+            hfdrive_state::OutboxTransition::MetadataReady {
+                candidate_commit: hfdrive_core::ids::CommitId::new(),
+                candidate_head_json: serde_json::json!({}),
+                expected_etag: "\"fixture\"".to_owned(),
+            },
+            hfdrive_state::OutboxTransition::Published,
+            hfdrive_state::OutboxTransition::LocalApplyPending,
+        ] {
+            fixture.account.transition_outbox(fixture.connection, operation, transition).await.unwrap();
+        }
+
+        // Closing the state worker makes the query fail; the entry must stay
+        // exactly where it is instead of being treated as unblocked.
+        fixture.state.close().await.unwrap();
+        let ctx_cancel = CancellationToken::new();
+        let ctx = runtime.round_context(&ctx_cancel);
+        runtime.apply_pass(&ctx).await;
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+    }
+
+    // ---- G10: pause stops the next upload and HEAD write -----
+
+    /// A recording remote: counts every payload-stage and `HEAD` effect so a
+    /// test can prove exactly which external boundaries were reached. Unlike
+    /// `HeadOnlyRemote` it never panics on a payload stage. An attached
+    /// [`UploadWindow`] observes how many payload uploads run at once.
+    struct RecordingRemote {
+        head: Option<crate::sync::remote::RemoteHead>,
+        head_reads: Arc<std::sync::atomic::AtomicUsize>,
+        ingestions: Arc<std::sync::atomic::AtomicUsize>,
+        cas_commits: Arc<std::sync::atomic::AtomicUsize>,
+        bindings: Arc<std::sync::atomic::AtomicUsize>,
+        publishes: Arc<std::sync::atomic::AtomicUsize>,
+        upload_window: Option<Arc<UploadWindow>>,
+    }
+
+    /// Test window observing how many payload uploads overlap. Every span is
+    /// taken inside exactly one `upload_entry` operation (ingestion entry to
+    /// payload binding), so `live` can never exceed the number of
+    /// `upload_entry` operations running concurrently. Spans are keyed by
+    /// upload id, so occupancy survives the separate remote checkpoints.
+    ///
+    /// Uploads are held at the payload-binding boundary until the window
+    /// releases them — that is what makes overlap observable deterministically
+    /// instead of by timing. The test releases exactly the uploads it has
+    /// observed.
+    struct UploadWindow {
+        live: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        peak: std::sync::atomic::AtomicUsize,
+        /// Set when an upload entered while the window was already full.
+        overflow: std::sync::atomic::AtomicBool,
+        /// Payload upload identities that reached the upload stage.
+        started: std::sync::Mutex<Vec<String>>,
+        release: Arc<tokio::sync::Semaphore>,
+        /// Held release permits: consumed permits never return to the pool,
+        /// so a release is exactly one upload allowed to finish.
+        held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
+    }
+
+    impl UploadWindow {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                live: Default::default(),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                overflow: std::sync::atomic::AtomicBool::new(false),
+                started: Default::default(),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                held: Default::default(),
+            })
+        }
+
+        fn enter(&self, upload: &UploadId) {
+            let key = upload.to_string();
+            let live = {
+                let mut live = self.live.lock().unwrap();
+                live.insert(key.clone());
+                live.len()
+            };
+            self.peak.fetch_max(live, Ordering::SeqCst);
+            if live > 2 {
+                self.overflow.store(true, Ordering::SeqCst);
+            }
+            self.started.lock().unwrap().push(key);
+        }
+
+        fn exit(&self, upload: &UploadId) {
+            self.live.lock().unwrap().remove(&upload.to_string());
+        }
+
+        /// Holds this upload's stage until the window releases it.
+        async fn hold(&self) {
+            let permit = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.release.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                // Safety valve: a miscounted window must not deadlock the
+                // test; the window assertions are what the test trusts.
+                _ => return,
+            };
+            self.held.lock().unwrap().push(permit);
+        }
+
+        /// Allows exactly `uploads` held uploads to finish.
+        fn release_uploads(&self, uploads: usize) {
+            self.release.add_permits(uploads);
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.started.lock().unwrap().clone()
+        }
+
+        fn live_now(&self) -> usize {
+            self.live.lock().unwrap().len()
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+
+        fn overflowed(&self) -> bool {
+            self.overflow.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Waits until the window has observed `count` uploads at the payload
+    /// stage. Bounded: a pass that never reaches the count fails the test.
+    async fn wait_for_uploads(window: &UploadWindow, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while window.started().len() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("only {} of {count} uploads reached the payload stage", window.started().len()));
+    }
+
+    impl crate::sync::remote::RemoteOps for RecordingRemote {
+        type Reader = crate::sync::test_support::UnusedReader;
+        type Events = crate::sync::test_support::UnusedEvents;
+
+        fn event_source(&self) -> Result<Self::Events, crate::sync::remote::RemoteError> {
+            Err(crate::sync::remote::RemoteError::Transport)
+        }
+
+        async fn read_head(
+            &self,
+            _: &CancellationToken,
+        ) -> Result<Option<crate::sync::remote::RemoteHead>, crate::sync::remote::RemoteError> {
+            self.head_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.head.clone())
+        }
+
+        async fn initialize(
+            &self,
+            _: hfdrive_publication::coordinator::PublicationCandidate,
+            _: &CancellationToken,
+        ) -> Result<hfdrive_publication::coordinator::InitOutcome, crate::sync::remote::RemoteError> {
+            self.publishes.fetch_add(1, Ordering::Relaxed);
+            Err(crate::sync::remote::RemoteError::Transport)
+        }
+
+        async fn publish(
+            &self,
+            _: &crate::sync::remote::RemoteHead,
+            _: hfdrive_publication::coordinator::PublicationCandidate,
+            _: &CancellationToken,
+        ) -> Result<hfdrive_publication::coordinator::PublishResult, crate::sync::remote::RemoteError> {
+            self.publishes.fetch_add(1, Ordering::Relaxed);
+            Err(crate::sync::remote::RemoteError::Transport)
+        }
+
+        async fn resolve_uncertain(
+            &self,
+            _: &hfdrive_publication::coordinator::PublicationCandidate,
+            _: Option<hfdrive_publication::ancestry::AncestryCursor>,
+            _: &CancellationToken,
+        ) -> Result<hfdrive_publication::coordinator::UncertainResolution, crate::sync::remote::RemoteError> {
+            Err(crate::sync::remote::RemoteError::Transport)
+        }
+
+        async fn find_committed_operation(
+            &self,
+            _: hfdrive_core::ids::CommitId,
+            _: hfdrive_core::ids::OperationId,
+            _: &CancellationToken,
+        ) -> Result<Option<hfdrive_core::ids::CommitId>, crate::sync::remote::RemoteError> {
+            Ok(None)
+        }
+
+        async fn read_metadata(
+            &self,
+            _: hfdrive_publication::MetadataRecord,
+            _: &CancellationToken,
+        ) -> Result<bytes::Bytes, crate::sync::remote::RemoteError> {
+            Err(crate::sync::remote::RemoteError::RemoteContentUnavailable)
+        }
+
+        async fn ingest_payload(
+            &self,
+            snapshot: &hfdrive_core::storage::StableSnapshot,
+            _: &CancellationToken,
+        ) -> Result<hfdrive_hf::IngestionCheckpoint, crate::sync::remote::RemoteError> {
+            self.ingestions.fetch_add(1, Ordering::Relaxed);
+            if let Some(window) = &self.upload_window {
+                // The span opens at the upload stage's first external
+                // boundary and closes at the binding stage below.
+                window.enter(&snapshot.upload_id);
+            }
+            Ok(hfdrive_hf::IngestionCheckpoint {
+                target_key: snapshot.path.to_string_lossy().into_owned(),
+                xet_file_id: hfdrive_core::storage::XetFileId::new(format!("{:064x}", 7u64)).unwrap(),
+                size: snapshot.size,
+                sha256: snapshot.sha256.clone(),
+                sdk_task_id: 1,
+            })
+        }
+
+        async fn commit_payload_cas(
+            &self,
+            _: &hfdrive_core::storage::StableSnapshot,
+            ingested: &hfdrive_hf::IngestionCheckpoint,
+            _: &CancellationToken,
+        ) -> Result<hfdrive_hf::CasCommitCheckpoint, crate::sync::remote::RemoteError> {
+            self.cas_commits.fetch_add(1, Ordering::Relaxed);
+            Ok(hfdrive_hf::CasCommitCheckpoint {
+                target_key: ingested.target_key.clone(),
+                xet_file_id: ingested.xet_file_id.clone(),
+                size: ingested.size,
+                sha256: ingested.sha256.clone(),
+                sdk_task_id: ingested.sdk_task_id,
+            })
+        }
+
+        async fn bind_payload(
+            &self,
+            snapshot: &hfdrive_core::storage::StableSnapshot,
+            committed: &hfdrive_hf::CasCommitCheckpoint,
+                _: &CancellationToken,
+        ) -> Result<hfdrive_core::storage::ObjectRef, crate::sync::remote::RemoteError> {
+            self.bindings.fetch_add(1, Ordering::Relaxed);
+            if let Some(window) = &self.upload_window {
+                // The span closes at the upload stage's last boundary. Held
+                // until the test releases it: while an upload is held here
+                // its `upload_entry` operation cannot finish, so the pass can
+                // never dispatch past its bound.
+                window.hold().await;
+                window.exit(&snapshot.upload_id);
+            }
+            Ok(hfdrive_core::storage::ObjectRef {
+                key: hfdrive_core::storage::PayloadKey::new(snapshot.upload_id),
+                sha256: committed.sha256.clone(),
+                size: committed.size,
+                xet_file_id: committed.xet_file_id.clone(),
+            })
+        }
+
+        async fn open_range(
+            &self,
+            _: &hfdrive_core::storage::ObjectRef,
+            _: hfdrive_core::storage::ByteRange,
+            _: &hfdrive_hf::RangeCache,
+            _: &CancellationToken,
+        ) -> Result<Self::Reader, crate::sync::remote::RemoteError> {
+            Err(crate::sync::remote::RemoteError::Transport)
+        }
+
+        async fn probe_read(&self, _: &CancellationToken) -> Result<(), crate::sync::remote::RemoteError> {
+            Ok(())
+        }
+
+        async fn probe_write(&self, _: &CancellationToken) -> Result<(), crate::sync::remote::RemoteError> {
+            Ok(())
+        }
+    }
+
+    /// Pause cancels the active round's token and is re-checked before every
+    /// dispatch, so a pause landing while the bound window of uploads is in
+    /// flight stops the queued uploads behind them from ever starting — and
+    /// stops the round's `HEAD` write too. In-flight uploads drain.
+    #[tokio::test]
+    async fn pause_during_the_inflight_uploads_stops_the_queued_uploads_and_head_write() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let ingestions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cas_commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bindings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publishes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let head_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let window = UploadWindow::new();
+        let remote = RecordingRemote {
+            head: None,
+            head_reads: head_reads.clone(),
+            ingestions: ingestions.clone(),
+            cas_commits: cas_commits.clone(),
+            bindings: bindings.clone(),
+            publishes: publishes.clone(),
+            upload_window: Some(window.clone()),
+        };
+        let cancel = CancellationToken::new();
+        let (_notifications, receiver) = mpsc::channel(1);
+        let runtime = ConnectionRuntime::start(
+            ConnectionConfig {
+                connection_id: fixture.connection,
+                workspace: fixture.workspace,
+                root_item_id: fixture.root_item,
+                device_id: DeviceId::new(),
+                root: fixture.root.clone(),
+                staging_dir: fixture.directory.path().join("snapshots"),
+                recovery_dir: fixture.directory.path().join("recovery"),
+                mode: hfdrive_state::ConnectionMode::Writable,
+                start_paused: true,
+            },
+            fixture.account.clone(), remote,
+            Arc::new(Scheduler::new(Default::default())),
+            Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            cancel.clone(), receiver,
+        );
+        runtime.resume();
+
+        // Three queued content uploads: two fill the bound window and stay in
+        // flight at the payload stage, the third stays queued behind them.
+        for name in ["first.txt", "second.txt", "third.txt"] {
+            std::fs::write(fixture.root.join(name), b"local bytes").unwrap();
+            let item_id = local_item(&fixture, name).await;
+            let entry = intent_entry(
+                fixture.connection,
+                OperationId::new(),
+                Some(item_id),
+                None,
+                None,
+                0,
+                &SyncIntent::Create {
+                    item_id: *item_id.as_uuid(),
+                    parent_id: *fixture.root_item.as_uuid(),
+                    name: name.to_owned(),
+                    kind: IntentKind::File,
+                    content: Some(PendingContent {
+                        upload_id: *UploadId::new().as_uuid(),
+                        version_id: *VersionId::new().as_uuid(),
+                        modified_at: "2026-11-17T00:00:00Z".to_owned(),
+                    }),
+                },
+            )
+            .unwrap();
+            fixture.account.record_observed_work(None, entry, None).await.unwrap();
+        }
+
+        // The round runs on its own task: the test controls the interleaving
+        // through the held upload window, never through timing.
+        // Durable dispatch order (the pass lists in exactly this order): the
+        // first two rows are the windowed pair, the last row is queued behind.
+        let dispatch_order = fixture
+            .account
+            .list_active_outbox(fixture.connection, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatch_order.len(), 3);
+        let drive = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.drive().await }
+        });
+
+        // The two windowed uploads are in flight at the payload stage when
+        // the pause lands; the third upload is still queued behind them.
+        wait_for_uploads(&window, 2).await;
+        assert_eq!(window.live_now(), 2, "the two uploads overlap in flight");
+        assert_eq!(window.peak(), 2, "the bounded window runs at most two uploads at once");
+        runtime.pause();
+        window.release_uploads(2);
+        drive.await.unwrap();
+
+        // The in-flight uploads drain their durable payload boundary ...
+        for operation in &dispatch_order[..2] {
+            let entry = fixture.account.outbox_entry(fixture.connection, *operation).await.unwrap().unwrap();
+            assert_eq!(entry.state, OutboxState::PayloadReady, "in-flight work drains: {entry:?}");
+        }
+        // ... while the queued third upload never starts, and the paused
+        // round never reaches the `HEAD` write.
+        let third = fixture.account.outbox_entry(fixture.connection, dispatch_order[2]).await.unwrap().unwrap();
+        assert_eq!(third.state, OutboxState::Observed, "the queued third upload never started: {third:?}");
+        assert!(third.object_ref.is_none(), "no payload was bound for the paused entry");
+        assert!(third.candidate_commit.is_none(), "no HEAD mutation was staged for the paused entry");
+        assert_eq!(window.started().len(), 2, "only the two windowed uploads ever ran");
+        assert_eq!(publishes.load(Ordering::Relaxed), 0, "a paused round never reaches the HEAD write");
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    /// The upload pass runs every eligible entry, overlaps at most two
+    /// `upload_entry` operations at once, and never touches completed history.
+    #[tokio::test]
+    async fn upload_pass_bounds_concurrent_uploads_and_excludes_completed_history() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let window = UploadWindow::new();
+        let remote = RecordingRemote {
+            head: None,
+            head_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ingestions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cas_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bindings: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            publishes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            upload_window: Some(window.clone()),
+        };
+        let cancel = CancellationToken::new();
+        let (_notifications, receiver) = mpsc::channel(1);
+        let runtime = ConnectionRuntime::start(
+            ConnectionConfig {
+                connection_id: fixture.connection,
+                workspace: fixture.workspace,
+                root_item_id: fixture.root_item,
+                device_id: DeviceId::new(),
+                root: fixture.root.clone(),
+                staging_dir: fixture.directory.path().join("snapshots"),
+                recovery_dir: fixture.directory.path().join("recovery"),
+                mode: hfdrive_state::ConnectionMode::Writable,
+                start_paused: true,
+            },
+            fixture.account.clone(), remote,
+            Arc::new(Scheduler::new(Default::default())),
+            Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            cancel.clone(), receiver,
+        );
+        runtime.resume();
+
+        // Three eligible content entries in durable creation order.
+        let mut operations = Vec::new();
+        let mut eligible_uploads = Vec::new();
+        for name in ["one.txt", "two.txt", "three.txt"] {
+            std::fs::write(fixture.root.join(name), b"local bytes").unwrap();
+            let item_id = local_item(&fixture, name).await;
+            let pending = PendingContent {
+                upload_id: *UploadId::new().as_uuid(),
+                version_id: *VersionId::new().as_uuid(),
+                modified_at: "2026-11-17T00:00:00Z".to_owned(),
+            };
+            eligible_uploads.push(pending.upload_id.to_string());
+            let entry = intent_entry(
+                fixture.connection,
+                OperationId::new(),
+                Some(item_id),
+                None,
+                None,
+                0,
+                &SyncIntent::Create {
+                    item_id: *item_id.as_uuid(),
+                    parent_id: *fixture.root_item.as_uuid(),
+                    name: name.to_owned(),
+                    kind: IntentKind::File,
+                    content: Some(pending),
+                },
+            )
+            .unwrap();
+            let operation = entry.operation_id;
+            fixture.account.record_observed_work(None, entry, None).await.unwrap();
+            operations.push(operation);
+        }
+
+        // One completed history entry with the same eligible shape: a pass
+        // that scanned history would try to upload it too.
+        let history_item = local_item(&fixture, "history.txt").await;
+        let history_entry = intent_entry(
+            fixture.connection,
+            OperationId::new(),
+            Some(history_item),
+            None,
+            None,
+            0,
+            &SyncIntent::Create {
+                item_id: *history_item.as_uuid(),
+                parent_id: *fixture.root_item.as_uuid(),
+                name: "history.txt".to_owned(),
+                kind: IntentKind::File,
+                content: Some(PendingContent {
+                    upload_id: *UploadId::new().as_uuid(),
+                    version_id: *VersionId::new().as_uuid(),
+                    modified_at: "2026-11-17T00:00:00Z".to_owned(),
+                }),
+            },
+        )
+        .unwrap();
+        let history_operation = history_entry.operation_id;
+        fixture.account.record_observed_work(None, history_entry, None).await.unwrap();
+        for transition in [
+            hfdrive_state::OutboxTransition::MetadataReady {
+                candidate_commit: hfdrive_core::ids::CommitId::new(),
+                candidate_head_json: serde_json::json!({}),
+                expected_etag: "\"fixture\"".to_owned(),
+            },
+            hfdrive_state::OutboxTransition::Published,
+            hfdrive_state::OutboxTransition::LocalApplyPending,
+        ] {
+            fixture.account.transition_outbox(fixture.connection, history_operation, transition).await.unwrap();
+        }
+        fixture.account.complete_outbox(fixture.connection, history_operation).await.unwrap();
+
+        // The pass's own listing sees only the three eligible rows; the
+        // completed row stays durable history.
+        let active = fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap();
+        assert_eq!(active.len(), 3, "completed history is excluded from the active listing");
+        assert_eq!(
+            fixture.account.list_outbox(fixture.connection, None, u32::MAX).await.unwrap().len(),
+            4,
+            "completed history is retained durably"
+        );
+
+        let pass = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let ctx_cancel = CancellationToken::new();
+                let ctx = runtime.round_context(&ctx_cancel);
+                runtime.upload_pass(&ctx).await;
+            }
+        });
+
+        // Two uploads overlap at the payload stage; the pass must not start a
+        // third while its window is full.
+        wait_for_uploads(&window, 2).await;
+        assert_eq!(window.live_now(), 2, "the first two eligible entries overlap");
+        assert_eq!(window.peak(), 2, "the bounded window runs at most two uploads at once");
+        assert!(!window.overflowed(), "no third upload ever overlapped the window");
+        assert_eq!(
+            window.started().len(),
+            2,
+            "a third upload must not start while two upload_entry operations are in flight"
+        );
+        window.release_uploads(2);
+
+        // The pair drains and the last eligible entry runs on its own.
+        wait_for_uploads(&window, 3).await;
+        assert_eq!(window.peak(), 2, "the third upload starts only after a slot frees");
+        window.release_uploads(1);
+        pass.await.unwrap();
+
+        // All eligible entries ran exactly once; history ran never.
+        let mut ran = window.started();
+        ran.sort();
+        let mut expected = eligible_uploads;
+        expected.sort();
+        assert_eq!(ran, expected, "every eligible entry ran exactly once and history ran never");
+        for operation in &operations {
+            let entry = fixture.account.outbox_entry(fixture.connection, *operation).await.unwrap().unwrap();
+            assert_eq!(
+                entry.state,
+                OutboxState::PayloadReady,
+                "every eligible entry reached its durable payload boundary: {entry:?}"
+            );
+        }
+        let history = fixture.account.outbox_entry(fixture.connection, history_operation).await.unwrap().unwrap();
+        assert_eq!(history.state, OutboxState::Complete, "completed history stays completed");
+        assert!(history.object_ref.is_none(), "completed history is never uploaded");
+
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
         fixture.state.close().await.unwrap();
     }
 }
