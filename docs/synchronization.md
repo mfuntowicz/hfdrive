@@ -5,6 +5,27 @@ and the Windows runtime scenarios the integration owner executes against a
 packaged build. Everything here describes implemented behavior or an explicit
 procedure; no scenario below is claimed to have been executed by this slice.
 
+## Hub web UI versus the managed namespace
+
+Managed synchronization does **not** create Explorer-style raw keys in the
+bucket. The Hub web UI lists raw object keys; it does not decode HF Drive's
+catalog or display the Explorer hierarchy. For prefix `hfdrive/<workspace-id>`:
+
+| Raw key | Meaning |
+| --- | --- |
+| `HEAD` | Current managed commit pointer, conditionally replaced through S3. |
+| `objects/<upload-uuid>` | Immutable payload bytes. |
+| `versions/<version-uuid>.json` | Payload key, size, digest, Xet identity and display metadata. |
+| `catalog/<sha256>.json` | B+tree pages containing item names, parents and live-child indexes. |
+| `commits/<commit-uuid>.json` | Commit ancestry, catalog root and operation IDs. |
+
+Consequently, `Documents/report.txt` is recovered from the catalog/version
+records, not expected as that raw key on the Hub. Verify managed uploads through
+native metadata reads and decoded HEAD/catalog/version records. Hub's generic
+raw-key listing may also be eventually indexed and is never the synchronization
+authority. Raw Explorer imports are separate and preserve relative names under
+`hfdrive-imports/<import-id>/`; they are not managed synchronization.
+
 ## Durability contract
 
 Every external effect is preceded by a durable record on the account database
@@ -202,6 +223,36 @@ execution (e.g. an unavailable recovery area); retention failures surface
 during `execute_unlink` with the exact file list. The explicit
 disconnect-keep-registration path keeps the registration and warns that
 online-only bytes cannot open.
+
+Deleted-bucket abandonment uses the same preservation rules but never deletes
+through a path after checking it. `delete_owned_placeholder` opens the final
+object with write/delete sharing denied, then verifies NTFS identity, size,
+mtime, file/directory shape, exact HFDR workspace/item/version and zero
+resident bytes through that handle before setting its delete disposition. A
+replacement object or any query mismatch survives. Dirty-state query failures
+are conservatively dirty. Abandoned local delete intents complete through a
+dedicated generation-guarded state operation only after live existence is
+proven; no fabricated publication evidence or remote tombstone is produced.
+
+Startup recovery is fail-closed: classification/preservation errors cancel the
+new runtime, preserve work and record a durable pause. `Requeued` is a terminal
+classification, not a permanently pending action; it requests a fresh complete
+scan and reconciliation instead of blind replay. Disconnect cancels and joins
+the drive worker even when no CFAPI pump was attached.
+
+Recovery copies use exclusive payload/sidecar reservation, source identity and
+mtime revalidation, digest verification, payload `sync_all` before the sidecar,
+and sidecar `sync_all` before success. Unverified remnants are retained rather
+than deleted by path. Every round `HEAD` read validates the established
+workspace/root identity, and a version record's body ID must equal its
+requested immutable key. Checkpoint-save retries reuse a compatible live Xet
+ingestion session through per-target serialization instead of re-ingesting it.
+
+**Remaining crash limitation:** there is no durable unlink-phase journal. A
+crash during the destructive unlink phase can leave the connection row and a
+partially converted root; ordinary startup restoration may reconnect it.
+Completing that removal requires a fresh reviewed unlink preview. No automatic
+resumption or deletion is claimed for this case.
 
 ## Public API surface (parent integration)
 

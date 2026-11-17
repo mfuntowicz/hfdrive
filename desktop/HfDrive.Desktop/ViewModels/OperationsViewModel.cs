@@ -57,6 +57,20 @@ public sealed class ConflictRow
         values.Count == 0 ? "(none recorded)" : string.Join(", ", values);
 }
 
+/// <summary>One file affected by a removal preview, rendered on the Operations page.</summary>
+public sealed class UnlinkFileRow
+{
+    public UnlinkFileRow(UnlinkFileResult file) => File = file;
+
+    public UnlinkFileResult File { get; }
+
+    public string Display =>
+        $"{File.Path} — {ConnectionViewModel.FormatBytes(File.Size)} ({(File.Partial ? "partially resident" : "not resident")})";
+}
+
+/// <summary>One removal mode offered by the remove-connection section.</summary>
+public sealed record UnlinkModeChoice(UnlinkMode Mode, string Display);
+
 /// <summary>
 /// The Operations page. Every action here is a real provider RPC over the
 /// shared <see cref="ProviderSession"/>; every displayed value comes from the
@@ -96,6 +110,7 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
     public OperationsViewModel(ProviderSession session)
     {
         _session = session;
+        _selectedUnlinkMode = UnlinkModes[0];
         _session.StateChanged += OnSessionChanged;
         SessionStateText = _session.StatusText;
     }
@@ -114,7 +129,8 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
         nameof(ApplySelectiveSyncCommand), nameof(ExportDiagnosticsCommand),
         nameof(LoadHistoryCommand), nameof(LoadMoreHistoryCommand), nameof(RestoreCommand),
         nameof(LoadConflictsCommand), nameof(LoadMoreConflictsCommand),
-        nameof(ResolveKeepLocalCommand), nameof(ResolveKeepRemoteCommand), nameof(ResolveKeepBothCommand))]
+        nameof(ResolveKeepLocalCommand), nameof(ResolveKeepRemoteCommand), nameof(ResolveKeepBothCommand),
+        nameof(ConfirmUnlinkCommand))]
     private bool _isBusy;
 
     [ObservableProperty]
@@ -250,6 +266,108 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _selectiveSyncItemIdsText = string.Empty;
     [ObservableProperty] private string _connectionResultText = string.Empty;
     [ObservableProperty] private string? _connectionErrorText;
+
+    partial void OnConnectionIdTextChanged(string value) => InvalidateUnlinkPreview("The connection ID changed; prepare the removal preview again.");
+
+    // ── Remove connection ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Removal modes the user can choose explicitly. Safe remove is first and
+    /// default; the lossy mode is only ever selected deliberately.
+    /// </summary>
+    public IReadOnlyList<UnlinkModeChoice> UnlinkModes { get; } = new[]
+    {
+        new UnlinkModeChoice(UnlinkMode.SafeRemove,
+            "Safe remove — hydrate or export every file first, then remove the connection"),
+        new UnlinkModeChoice(UnlinkMode.RemoveUnavailable,
+            "Remove unavailable too — discard bytes that cannot be made resident (irreversible local loss)"),
+    };
+
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ConfirmUnlinkCommand))]
+    [NotifyPropertyChangedFor(nameof(UnlinkPreviewVisibility), nameof(HasUnlinkResultText))]
+    private UnlinkModeChoice _selectedUnlinkMode;
+
+    /// <summary>
+    /// Preview returned by the provider for the currently displayed mode. It
+    /// is invalidated whenever the reviewed inputs (connection, mode or
+    /// provider session) change and on <c>PreviewChanged</c>.
+    /// </summary>
+    private PrepareUnlinkResult? _unlinkPreview;
+
+    /// <summary>Session generation the preview was produced under.</summary>
+    private long _unlinkPreviewGeneration = -1;
+
+    /// <summary>Mode the preview was requested under; <see cref="PrepareUnlinkResult"/> carries no mode.</summary>
+    private UnlinkMode _unlinkPreviewMode;
+
+    /// <summary>Connection the preview was requested under; <see cref="PrepareUnlinkResult"/> carries no connection.</summary>
+    private Guid _unlinkPreviewConnectionId;
+
+    /// <summary>Reviewed preview currently on screen, or null (never a stale one).</summary>
+    public PrepareUnlinkResult? UnlinkPreview => _unlinkPreview;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(UnlinkPreviewVisibility), nameof(HasUnlinkResultText))]
+    private string _unlinkResultText = string.Empty;
+
+    /// <summary>True when a removal result message is on screen.</summary>
+    public bool HasUnlinkResultText => UnlinkResultText.Length != 0;
+
+    /// <summary>Provider blocking reasons for the reviewed preview, empty when none.</summary>
+    public string UnlinkBlockingReasonsText =>
+        _unlinkPreview is { } preview && preview.BlockingReasons.Count != 0
+            ? "Blocking reasons:\n" + string.Join("\n", preview.BlockingReasons.Select(reason => $"- {reason}"))
+            : string.Empty;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(UnlinkPreviewVisibility))]
+    private string? _unlinkErrorText;
+
+    /// <summary>Explicit consent to the previewed irreversible loss, shown only when required.</summary>
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ConfirmUnlinkCommand))]
+    private bool _unlinkConsent;
+
+    public ObservableCollection<UnlinkFileRow> UnlinkAffectedFiles { get; } = new();
+
+    /// <summary>Warning text shown whenever the previewed removal discards bytes.</summary>
+    public string UnlinkWarningText
+    {
+        get
+        {
+            if (_unlinkPreview is not { OnlineOnlyDataLoss: true }) return string.Empty;
+            return "This removal permanently discards the unavailable bytes of the affected files "
+                 + "listed below on this device. They cannot be recovered without re-syncing from the "
+                 + "remote content.";
+        }
+    }
+
+    /// <summary>True when the previewed removal discards unavailable bytes.</summary>
+    public bool HasUnlinkWarning => UnlinkWarningText.Length != 0;
+
+    /// <summary>Consent is shown only when the reviewed preview requires it.</summary>
+    public Microsoft.UI.Xaml.Visibility UnlinkConsentVisibility =>
+        _unlinkPreview is { OnlineOnlyDataLoss: true }
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+    public Microsoft.UI.Xaml.Visibility UnlinkPreviewVisibility =>
+        _unlinkPreview is not null || UnlinkErrorText is not null || UnlinkResultText.Length != 0
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+    /// <summary>
+    /// True when the reviewed preview is current: same connection, same mode,
+    /// same provider session. A change of any of these invalidates the preview
+    /// and any consent given for it.
+    /// </summary>
+    private bool HasCurrentUnlinkPreview =>
+        _unlinkPreview is not null
+        && _unlinkPreviewGeneration == _session.Generation
+        && _unlinkPreviewMode == SelectedUnlinkMode.Mode
+        && Guid.TryParseExact(ConnectionIdText.Trim(), "D", out Guid current)
+        && current == _unlinkPreviewConnectionId;
 
     // ── Diagnostics ─────────────────────────────────────────────────────
 
@@ -889,6 +1007,215 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
     private static string JoinIds(IReadOnlyList<Guid> values) =>
         values.Count == 0 ? "(none)" : string.Join(", ", values);
 
+    // ── Remove connection (prepare → review → confirm) ─────────────────
+
+    partial void OnSelectedUnlinkModeChanged(UnlinkModeChoice value) =>
+        InvalidateUnlinkPreview("The removal mode changed; prepare the removal preview again.");
+
+    /// <summary>
+    /// Drops the reviewed preview and any consent given for it. Called whenever
+    /// an input the preview binds (connection, mode, provider session) changes,
+    /// and when the provider reports <c>PreviewChanged</c>.
+    /// </summary>
+    private void InvalidateUnlinkPreview(string? message = null)
+    {
+        bool hadPreview = _unlinkPreview is not null;
+        _unlinkPreview = null;
+        _unlinkPreviewMode = default;
+        _unlinkPreviewConnectionId = default;
+        _unlinkPreviewGeneration = -1;
+        UnlinkAffectedFiles.Clear();
+        UnlinkConsent = false;
+        ConfirmUnlinkCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(UnlinkPreviewVisibility));
+        OnPropertyChanged(nameof(UnlinkWarningText));
+        OnPropertyChanged(nameof(HasUnlinkWarning));
+        OnPropertyChanged(nameof(UnlinkConsentVisibility));
+        OnPropertyChanged(nameof(UnlinkBlockingReasonsText));
+        if (message is not null && (hadPreview || UnlinkResultText.Length != 0 || UnlinkErrorText is not null))
+        {
+            // The generated property setter raises the change notification.
+            UnlinkErrorText = message;
+            OnPropertyChanged(nameof(UnlinkPreviewVisibility));
+        }
+    }
+
+    [RelayCommand]
+    private async Task PrepareUnlinkAsync(CancellationToken cancellationToken)
+    {
+        if (IsBusy) return;
+        if (!TryReadConnectionId(out Guid connectionId, out string? connectionError))
+        {
+            UnlinkErrorText = connectionError;
+            UnlinkResultText = string.Empty;
+            return;
+        }
+        UnlinkMode mode = SelectedUnlinkMode.Mode;
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
+        long scope = BeginScope();
+        IsBusy = true;
+        BusyText = "Preparing removal preview…";
+        UnlinkErrorText = null;
+        UnlinkResultText = string.Empty;
+        try
+        {
+            PrepareUnlinkResult preview = await _session.SendAsync(
+                Commands.PrepareUnlink,
+                new PrepareUnlinkRequest
+                {
+                    OperationId = Guid.NewGuid(),
+                    ConnectionId = connectionId,
+                    Mode = mode,
+                },
+                request.Token).ConfigureAwait(true);
+            if (IsScopeStale(scope)) return;
+            // Only a fresh accepted preview ever becomes the reviewed one.
+            _unlinkPreview = preview;
+            _unlinkPreviewMode = mode;
+            _unlinkPreviewConnectionId = connectionId;
+            _unlinkPreviewGeneration = scope;
+            UnlinkAffectedFiles.Clear();
+            foreach (UnlinkFileResult file in preview.AffectedFiles)
+                UnlinkAffectedFiles.Add(new UnlinkFileRow(file));
+            UnlinkConsent = false;
+            ConfirmUnlinkCommand.NotifyCanExecuteChanged();
+            OnPropertyChanged(nameof(UnlinkPreviewVisibility));
+            OnPropertyChanged(nameof(UnlinkWarningText));
+            OnPropertyChanged(nameof(HasUnlinkWarning));
+            OnPropertyChanged(nameof(UnlinkConsentVisibility));
+            OnPropertyChanged(nameof(UnlinkBlockingReasonsText));
+            UnlinkResultText =
+                $"Preview {preview.PreviewId} (fingerprint {preview.PreviewFingerprint}) — "
+              + $"this is a preview only; the connection has not been removed.\n"
+              + $"Online-only: {preview.OnlineOnlyFiles}, partial: {preview.PartialFiles}, "
+              + $"dirty: {preview.DirtyFiles}, conflicts: {preview.ConflictFiles}, "
+              + $"export bytes: {preview.RequiredExportBytes.ToString(CultureInfo.InvariantCulture)}. "
+              + (preview.SafeToUnlink ? "Safe to proceed under this mode." : "Review the blocking reasons below.")
+              + (preview.AffectedFiles.Count == 0
+                    ? string.Empty
+                    : $"\nAffected files ({preview.AffectedFiles.Count.ToString(CultureInfo.InvariantCulture)}) listed below.");
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            if (!IsScopeStale(scope))
+            {
+                InvalidateUnlinkPreview();
+                UnlinkErrorText = ErrorMessage(ex);
+                UnlinkResultText = string.Empty;
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+            BusyText = string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Confirms the exact reviewed preview. Requires a current preview and —
+    /// when the previewed removal discards unavailable bytes — explicit
+    /// consent. The durable operation id is fresh and distinct from the preview
+    /// id. A <c>PreviewChanged</c> error invalidates the preview and consent.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanConfirmUnlink))]
+    private async Task ConfirmUnlinkAsync(CancellationToken cancellationToken)
+    {
+        if (IsBusy || !HasCurrentUnlinkPreview || _unlinkPreview is not { } preview) return;
+        if (preview.OnlineOnlyDataLoss && !UnlinkConsent) return;
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, cancellationToken);
+        long scope = BeginScope();
+        Guid connectionId = _unlinkPreviewConnectionId;
+        UnlinkMode mode = _unlinkPreviewMode;
+        IsBusy = true;
+        BusyText = mode == UnlinkMode.SafeRemove ? "Removing connection…" : "Removing connection (discarding unavailable bytes)…";
+        UnlinkErrorText = null;
+        UnlinkResultText = string.Empty;
+        try
+        {
+            UnlinkResult result = await _session.SendAsync(
+                Commands.Unlink,
+                new UnlinkRequest
+                {
+                    OperationId = Guid.NewGuid(),
+                    ConnectionId = connectionId,
+                    Mode = mode,
+                    PreviewId = preview.PreviewId,
+                    AcceptOnlineOnlyDataLoss = UnlinkConsent,
+                },
+                request.Token).ConfigureAwait(true);
+            if (IsScopeStale(scope)) return;
+            InvalidateUnlinkPreview();
+            // Removal is only ever claimed from the provider's unlink result.
+            if (result.Unregistered)
+                UnlinkResultText = $"Connection {result.ConnectionId} was removed and its registration unregistered.";
+            else if (result.RetainedForRecovery)
+                UnlinkResultText =
+                    $"Connection {result.ConnectionId} was disconnected, but its binding and registration were "
+                  + "retained for recovery. This is not a completed removal; reconnect to finish it later.";
+            else
+                UnlinkResultText =
+                    $"The provider did not report a completed removal for connection {result.ConnectionId}. "
+                  + "Inspect the connection state below before assuming it is gone.";
+            await RefreshConnectionStateAfterUnlinkAsync(connectionId, scope, request.Token).ConfigureAwait(true);
+        }
+        catch (ProtocolException ex) when (ex.Error.Code == ProtocolErrorCode.PreviewChanged)
+        {
+            if (IsScopeStale(scope)) return;
+            InvalidateUnlinkPreview();
+            UnlinkErrorText =
+                "The removal preview changed since it was prepared; nothing was removed. "
+              + "Prepare the preview again and review the current contents before confirming.";
+            UnlinkResultText = string.Empty;
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            if (!IsScopeStale(scope))
+            {
+                InvalidateUnlinkPreview();
+                UnlinkErrorText = ErrorMessage(ex);
+                UnlinkResultText = string.Empty;
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+            BusyText = string.Empty;
+        }
+    }
+
+    /// <summary>Confirmation needs a current reviewed preview and, for a lossy removal, consent.</summary>
+    private bool CanConfirmUnlink() =>
+        !IsBusy && HasCurrentUnlinkPreview && (!UnlinkPreview!.OnlineOnlyDataLoss || UnlinkConsent);
+
+    partial void OnUnlinkConsentChanged(bool value) => ConfirmUnlinkCommand.NotifyCanExecuteChanged();
+
+    /// <summary>
+    /// Re-reads the provider's real connection state after a confirmed removal
+    /// so the page reports observed state, not the request that was sent.
+    /// </summary>
+    private async Task RefreshConnectionStateAfterUnlinkAsync(Guid connectionId, long scope, CancellationToken cancellationToken)
+    {
+        try
+        {
+            GetStatusResult status = await _session.SendAsync(
+                Commands.GetStatus, new GetStatusRequest(), cancellationToken).ConfigureAwait(true);
+            if (IsScopeStale(scope)) return;
+            ConnectionStatus? connection = status.Connections.FirstOrDefault(c => c.ConnectionId == connectionId);
+            UnlinkResultText += connection is null
+                ? "\nThe provider no longer lists that connection."
+                : $"\nCurrent provider state: {StatusDisplayText.Get(connection.State)}, "
+                  + $"{connection.OnlineOnlyFiles} online-only, {connection.DirtyFiles} dirty files remaining in view.";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            if (!IsScopeStale(scope))
+                UnlinkResultText += $"\nReading the refreshed connection state failed: {ErrorMessage(ex)}";
+        }
+    }
+
     // ── Diagnostics ─────────────────────────────────────────────────────
 
     [RelayCommand]
@@ -1413,6 +1740,9 @@ public sealed partial class OperationsViewModel : ObservableObject, IDisposable
         {
             if (_disposed) return;
             SessionStateText = _session.StatusText;
+            // A provider session change invalidates every reviewed removal
+            // preview and its consent; the new session must re-review.
+            InvalidateUnlinkPreview("The provider session changed; prepare the removal preview again.");
             if (_settingsReadGeneration != _session.Generation)
             {
                 // The provider connection changed underneath the settings

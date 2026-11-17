@@ -68,9 +68,11 @@ function stringFor(name) {
     case "message": case "detail": case "description": case "expected": case "observed": case "phase":
       return "display text";
     case "relative_path": return "docs\\hello.txt";
+    case "path": return "C:\\Users\\Public\\HFDriveTest\\docs\\hello.txt";
     case "item_name": return "hello.txt";
     case "role": return "maintainer";
     case "item_revision": return uuidFor("item_revision");
+    case "preview_fingerprint": return "6b8f2c1d0a9e7f6c5d4b3a291807060504030201000f0e0d0c0b0a0908070605";
     default: return `sample-${name}`;
   }
 }
@@ -419,15 +421,52 @@ gold("connect_response_result", "connect result carrying the new connection stat
     },
   }));
 
-gold("prepare_unlink_response_result", "prepare_unlink result with block counts",
+const UNLINK_PREVIEW_ID = uuidFor("unlink_preview_id");
+const UNLINK_FINGERPRINT = stringFor("preview_fingerprint");
+
+gold("prepare_unlink_response_result", "prepare_unlink result with block counts and the provider-reviewed unlink preview",
   responseEnvelope(REQUEST_ID, "prepare_unlink", {
     result: resultBody("prepare_unlink", {
       safe_to_unlink: false,
       online_only_files: 12, partial_files: 1, dirty_files: 2, conflict_files: 0,
       required_export_bytes: "1048576",
       blocking_reasons: ["2 files retain unsynchronized local changes"],
+      preview_id: UNLINK_PREVIEW_ID,
+      preview_fingerprint: UNLINK_FINGERPRINT,
+      online_only_data_loss: true,
+      affected_files: [
+        { path: "C:\\Users\\Public\\HFDriveTest\\docs\\hello.txt", size: "18", partial: false },
+        { path: "C:\\Users\\Public\\HFDriveTest\\data.bin", size: "18446744073709551615", partial: true },
+      ],
     }),
   }));
+
+gold("prepare_unlink_response_result_remove_unavailable",
+  "prepare_unlink result for the RemoveUnavailable mode: proceeding destroys online-only bytes and requires explicit affirmative consent; affected_files is producer-bounded at 200 entries",
+  responseEnvelope(REQUEST_ID, "prepare_unlink", {
+    result: resultBody("prepare_unlink", {
+      safe_to_unlink: true,
+      online_only_files: 1, partial_files: 0, dirty_files: 0, conflict_files: 0,
+      required_export_bytes: "0",
+      blocking_reasons: [],
+      preview_id: UNLINK_PREVIEW_ID,
+      preview_fingerprint: UNLINK_FINGERPRINT,
+      online_only_data_loss: true,
+      affected_files: [
+        { path: "C:\\Users\\Public\\HFDriveTest\\online-only.bin", size: "4294967296", partial: true },
+      ],
+    }),
+  }));
+
+gold("unlink_request_remove_unavailable",
+  "unlink request selecting RemoveUnavailable with the preview identity and explicit online-only data-loss consent (operation_id stays a fresh mutation id, never the preview id)",
+  requestEnvelope(REQUEST_ID, "unlink", requestBody("unlink", {
+    operation_id: uuidFor("operation_id"),
+    connection_id: uuidFor("connection_id"),
+    mode: "remove_unavailable",
+    preview_id: UNLINK_PREVIEW_ID,
+    accept_online_only_data_loss: true,
+  })));
 
 gold("list_owners_response_result", "list_owners result page with next_cursor",
   responseEnvelope(REQUEST_ID, "list_owners", {
@@ -738,6 +777,82 @@ for (const [name, description, raw] of importInvalids) {
   inv(name, description, "envelope", "malformed_frame", frameHex(toBytes(raw)), description);
 }
 
+// Unlink contract fixtures: the preview identity, the online-only data-loss
+// signal/consent pair, and the affected-file records are enforced by the typed
+// codecs; wrong types, unknown members and unknown enum variants are rejected.
+const unlinkRequestRaw = (bodyRaw) =>
+  "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID +
+  "\",\"kind\":\"request\",\"method\":\"unlink\",\"body\":" + bodyRaw + "}";
+const prepareUnlinkResponseRaw = (resultRaw) =>
+  "{\"protocol_major\":1,\"protocol_minor\":0,\"request_id\":\"" + REQUEST_ID +
+  "\",\"kind\":\"response\",\"method\":\"prepare_unlink\",\"body\":{\"result\":" + resultRaw + "}}";
+const UNLINK_OPERATION_ID = uuidFor("operation_id");
+const UNLINK_CONNECTION_ID = uuidFor("connection_id");
+const unlinkRequestBody = (overridesRaw) =>
+  "{\"accept_online_only_data_loss\":true,\"connection_id\":\"" + UNLINK_CONNECTION_ID +
+  "\",\"mode\":\"remove_unavailable\",\"operation_id\":\"" + UNLINK_OPERATION_ID +
+  "\",\"preview_id\":\"" + UNLINK_PREVIEW_ID + "\"" + (overridesRaw ? "," + overridesRaw : "") + "}";
+const UNLINK_AFFECTED_FILE_RAW =
+  "{\"partial\":false,\"path\":\"C:\\\\Users\\\\Public\\\\HFDriveTest\\\\docs\\\\hello.txt\",\"size\":\"18\"}";
+const prepareUnlinkResultBody = (affectedFilesRaw, previewFingerprintRaw, onlineOnlyDataLossRaw) =>
+  "{\"affected_files\":" + affectedFilesRaw + ",\"blocking_reasons\":[],\"conflict_files\":0," +
+  "\"dirty_files\":0,\"online_only_data_loss\":" + onlineOnlyDataLossRaw + ",\"online_only_files\":1," +
+  "\"partial_files\":0,\"preview_fingerprint\":" + previewFingerprintRaw + ",\"preview_id\":\"" + UNLINK_PREVIEW_ID +
+  "\",\"required_export_bytes\":\"0\",\"safe_to_unlink\":true}";
+const unlinkInvalids = [
+  ["reject_unlink_preview_id_number",
+    "unlink request whose preview_id is a JSON number instead of a UUID string is rejected",
+    unlinkRequestRaw("{\"accept_online_only_data_loss\":true,\"connection_id\":\"" + UNLINK_CONNECTION_ID + "\",\"mode\":\"remove_unavailable\",\"operation_id\":\"" + UNLINK_OPERATION_ID + "\",\"preview_id\":7}")],
+  ["reject_unlink_preview_id_malformed",
+    "unlink request whose preview_id is not a lowercase hyphenated UUID is rejected",
+    unlinkRequestRaw("{\"accept_online_only_data_loss\":true,\"connection_id\":\"" + UNLINK_CONNECTION_ID + "\",\"mode\":\"remove_unavailable\",\"operation_id\":\"" + UNLINK_OPERATION_ID + "\",\"preview_id\":\"not-a-uuid\"}")],
+  ["reject_unlink_accept_consent_string",
+    "unlink request whose accept_online_only_data_loss is a string instead of a bool is rejected",
+    unlinkRequestRaw("{\"accept_online_only_data_loss\":\"true\",\"connection_id\":\"" + UNLINK_CONNECTION_ID + "\",\"mode\":\"remove_unavailable\",\"operation_id\":\"" + UNLINK_OPERATION_ID + "\",\"preview_id\":\"" + UNLINK_PREVIEW_ID + "\"}")],
+  ["reject_unlink_consent_missing",
+    "unlink request without the required accept_online_only_data_loss consent is rejected",
+    unlinkRequestRaw("{\"connection_id\":\"" + UNLINK_CONNECTION_ID + "\",\"mode\":\"remove_unavailable\",\"operation_id\":\"" + UNLINK_OPERATION_ID + "\",\"preview_id\":\"" + UNLINK_PREVIEW_ID + "\"}")],
+  ["reject_unlink_mode_unknown",
+    "unlink request whose mode is an unknown unlink_mode variant is rejected",
+    unlinkRequestRaw(unlinkRequestBody("").replace("\"remove_unavailable\"", "\"remove_all\""))],
+  ["reject_unlink_unknown_body_member",
+    "unlink request body with an unknown member is rejected",
+    unlinkRequestRaw(unlinkRequestBody("\"force\":true"))],
+  ["reject_prepare_unlink_result_fingerprint_number",
+    "prepare_unlink result whose preview_fingerprint is a JSON number instead of a string is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody("[" + UNLINK_AFFECTED_FILE_RAW + "]", "7", "true"))],
+  ["reject_prepare_unlink_result_consent_signal_string",
+    "prepare_unlink result whose online_only_data_loss is a string instead of a bool is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody("[" + UNLINK_AFFECTED_FILE_RAW + "]", "\"" + UNLINK_FINGERPRINT + "\"", "\"true\""))],
+  ["reject_prepare_unlink_result_affected_files_not_array",
+    "prepare_unlink result whose affected_files is not an array is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody("\"x\"", "\"" + UNLINK_FINGERPRINT + "\"", "true"))],
+  ["reject_prepare_unlink_result_affected_file_size_number",
+    "prepare_unlink result whose affected-file size is a JSON number instead of a decimal string is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody(
+      "[{\"partial\":false,\"path\":\"C:\\\\Users\\\\Public\\\\HFDriveTest\\\\docs\\\\hello.txt\",\"size\":18}]",
+      "\"" + UNLINK_FINGERPRINT + "\"", "true"))],
+  ["reject_prepare_unlink_result_affected_file_unknown_member",
+    "prepare_unlink result whose affected-file record carries an unknown member is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody(
+      "[" + UNLINK_AFFECTED_FILE_RAW.replace(/\}$/, ",\"etag\":\"x\"") + "]",
+      "\"" + UNLINK_FINGERPRINT + "\"", "true"))],
+  ["reject_prepare_unlink_result_affected_file_missing_field",
+    "prepare_unlink result whose affected-file record omits partial is rejected",
+    prepareUnlinkResponseRaw(prepareUnlinkResultBody(
+      "[{\"path\":\"C:\\\\Users\\\\Public\\\\HFDriveTest\\\\docs\\\\hello.txt\",\"size\":\"18\"}]",
+      "\"" + UNLINK_FINGERPRINT + "\"", "true"))],
+  ["reject_prepare_unlink_result_preview_id_missing",
+    "prepare_unlink result without the required preview_id is rejected",
+    prepareUnlinkResponseRaw(
+      "{\"affected_files\":[],\"blocking_reasons\":[],\"conflict_files\":0,\"dirty_files\":0," +
+      "\"online_only_data_loss\":true,\"online_only_files\":1,\"partial_files\":0," +
+      "\"preview_fingerprint\":\"" + UNLINK_FINGERPRINT + "\",\"required_export_bytes\":\"0\",\"safe_to_unlink\":true}")],
+];
+for (const [name, description, raw] of unlinkInvalids) {
+  inv(name, description, "envelope", "malformed_frame", frameHex(toBytes(raw)), description);
+}
+
 // ---------------------------------------------------------------------------
 // spec/ipc-v1.schema.json
 // ---------------------------------------------------------------------------
@@ -888,6 +1003,7 @@ const schema = {
     "Protocol version is exactly 1.0; only a hello request with another version is parsed (so the provider can answer with supported versions and close).",
     "List pages return items + next_cursor and accept cursor + limit (<= 200).",
     "Every mutation request carries a unique operation_id (operation UUID); reusing it must not duplicate the durable mutation.",
+    "prepare_unlink returns a persisted preview identity (preview_id + preview_fingerprint) and an affected_files list producer-bounded at 200 entries; online_only_data_loss signals that proceeding destroys managed-storage-only bytes and unlink then requires accept_online_only_data_loss.",
     "set_publication_credentials carries a user-scoped DPAPI ciphertext envelope; raw key/secret bytes never appear on the wire and this envelope is never logged.",
   ].join(" "),
   $defs: defs,

@@ -833,6 +833,8 @@ public sealed partial class TrayWindow : Window
         _pollTimer ??= CreatePollTimer();
         _pollTimer.Interval = PollInterval;
         _pollTimer.Start();
+        if (_pollCts is { IsCancellationRequested: false } cts)
+            _ = _viewModel.PollAsync(cts.Token);
     }
 
     private void StopPolling()

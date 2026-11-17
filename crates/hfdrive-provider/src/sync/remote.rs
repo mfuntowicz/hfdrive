@@ -16,7 +16,7 @@
 //! never by blind replay.
 
 use hfdrive_core::format::HeadV1;
-use hfdrive_core::ids::{CommitId, OperationId};
+use hfdrive_core::ids::{CommitId, ItemId, OperationId, WorkspaceId};
 use hfdrive_core::storage::{ByteRange, ObjectRef, StableSnapshot};
 use hfdrive_hf::{CasCommitCheckpoint, IngestionCheckpoint, NativeError};
 use hfdrive_publication::ancestry::AncestryCursor;
@@ -151,6 +151,30 @@ pub struct RemoteHead {
     pub etag: Option<OpaqueEtag>,
 }
 
+/// The established identity a committed `HEAD` must match before any round
+/// uses it as a baseline: this connection's workspace and its durable root
+/// item. A `HEAD` naming either differently is never this drive's baseline —
+/// it is a different (or foreign) workspace and requires explicit connection,
+/// never a relabel of queued local work.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RemoteIdentity {
+    pub workspace: WorkspaceId,
+    pub root_item: ItemId,
+}
+
+impl RemoteIdentity {
+    /// Refuses a `HEAD` that names another workspace or root item before any
+    /// round can use it as a baseline: such a record belongs to a different
+    /// managed drive (or is foreign) and must never relabel this connection's
+    /// baseline or queued local work.
+    pub fn check_head(self, head: &HeadV1) -> Result<(), RemoteError> {
+        if head.workspace_id != self.workspace || head.root_item_id != self.root_item {
+            return Err(RemoteError::InvalidResponse);
+        }
+        Ok(())
+    }
+}
+
 /// Sequential reader over an immutable object's bytes.
 pub trait RangeSource: Send + 'static {
     /// Next ordered chunk, `None` at end of the requested range.
@@ -180,6 +204,10 @@ pub trait RemoteOps: Send + Sync + 'static {
     /// One bounded read of the managed `HEAD`. `None` means the managed
     /// prefix has no `HEAD` (uninitialized). Read-only connections read
     /// through the native small-record path and never receive an ETag.
+    /// A `HEAD` naming another workspace is refused before it can become a
+    /// baseline; the root-item half of the identity check is
+    /// [`RemoteIdentity::check_head`] at the round level, because the
+    /// connection's root item is not part of this boundary.
     fn read_head(
         &self,
         cancel: &CancellationToken,
@@ -228,7 +256,11 @@ pub trait RemoteOps: Send + Sync + 'static {
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<Bytes, RemoteError>> + Send;
 
-    /// Stage 1: hand the flushed snapshot to native Xet ingestion.
+    /// Stage 1: hand the flushed snapshot to native Xet ingestion. Idempotent
+    /// per snapshot and target: a retry after a failed durable checkpoint save
+    /// finds the compatible live session and returns its checkpoint without
+    /// aborting it or ingesting again; check/ingest/park are one critical
+    /// section so concurrent retries cannot both miss the same session.
     fn ingest_payload(
         &self,
         snapshot: &StableSnapshot,
@@ -294,6 +326,16 @@ pub struct LiveRemote<T: hfdrive_auth::TokenSource, S: hfdrive_publication::coor
     native: NativeBucketStore<T>,
     control: NativeControl<T>,
     publication: Option<PublicationCoordinator<NativeBucketStore<T>, S>>,
+    /// Live sessions bridge ordinary ingestion and CAS commit. A cache miss
+    /// after restart follows the durable-checkpoint recovery path below.
+    pending_ingested: tokio::sync::Mutex<
+        std::collections::HashMap<String, hfdrive_hf::StagedIngested<T>>,
+    >,
+    /// Weak per-target locks serialize check/ingest/insert without blocking
+    /// unrelated uploads. Entries disappear when no attempt holds a lock.
+    ingest_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 use hfdrive_publication::coordinator::PublicationCoordinator;
@@ -312,7 +354,24 @@ where
         control: NativeControl<T>,
         publication: Option<PublicationCoordinator<NativeBucketStore<T>, S>>,
     ) -> Self {
-        Self { native, control, publication }
+        Self {
+            native,
+            control,
+            publication,
+            pending_ingested: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ingest_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    async fn target_ingest_lock(&self, target: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.ingest_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(target).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(target.to_owned(), std::sync::Arc::downgrade(&lock));
+        lock
     }
 
     /// The drive binding this remote serves.
@@ -348,7 +407,14 @@ where
 
     /// Re-derives the staged upload chain for `snapshot` and re-verifies the
     /// durable ingestion checkpoint before returning the ingested stage. The
-    /// redo is content-addressed and idempotent.
+    /// redo is content-addressed and idempotent. It runs only when no live
+    /// staged session reproduces the durable checkpoint: crash recovery
+    /// ([`RemoteOps::commit_payload_cas`] with an empty session cache) and an
+    /// [`RemoteOps::ingest_payload`] retry whose first ingestion has no
+    /// surviving compatible session — never a retry whose session is already
+    /// parked. `expect`'s identity (target key, Xet file id, size, digest)
+    /// must be reproduced exactly; the SDK task id is session-local and never
+    /// compared.
     async fn reingest_verified(
         &self,
         snapshot: &StableSnapshot,
@@ -362,17 +428,27 @@ where
             UploadSource::Snapshot(snapshot.clone()),
         )?;
         let (ingested, checkpoint) = staged.ingest(cancel).await?;
-        if let Some(expect) = expect {
-            if expect.target_key != checkpoint.target_key
-                || expect.xet_file_id != checkpoint.xet_file_id
-                || expect.size != checkpoint.size
-                || expect.sha256 != checkpoint.sha256
-            {
-                return Err(RemoteError::SourceChanged);
-            }
+        if let Some(expect) = expect
+            && !same_ingestion(expect, &checkpoint)
+        {
+            // The recovered checkpoint disagrees with what the snapshot
+            // produced: release the session (a dropped handle alone does not
+            // abort it) and demand recapture, never a bind.
+            let _ = ingested.abort();
+            return Err(RemoteError::SourceChanged);
         }
         Ok((ingested, checkpoint))
     }
+}
+
+/// The two durable ingestion checkpoints describe the same content-addressed
+/// ingestion. The SDK task id is session-local and never part of this
+/// identity: recovery reproduces the binding evidence, not the task handle.
+fn same_ingestion(left: &IngestionCheckpoint, right: &IngestionCheckpoint) -> bool {
+    left.target_key == right.target_key
+        && left.xet_file_id == right.xet_file_id
+        && left.size == right.size
+        && left.sha256 == right.sha256
 }
 
 /// Reader over `hf-hf`'s bounded ordered range stream.
@@ -514,8 +590,47 @@ where
         snapshot: &StableSnapshot,
         cancel: &CancellationToken,
     ) -> Result<IngestionCheckpoint, RemoteError> {
+        let target_key = self
+            .native
+            .binding()
+            .prefix
+            .immutable_key(ImmutableKey::Payload(snapshot.upload_id))
+            .to_string();
+        let target_lock = self.target_ingest_lock(&target_key).await;
+        let _target_guard = target_lock.lock().await;
+        {
+            let mut pending = self.pending_ingested.lock().await;
+            if let Some(stage) = pending.get(&target_key) {
+                let checkpoint = stage.checkpoint();
+                if checkpoint.size == snapshot.size && checkpoint.sha256 == snapshot.sha256 {
+                    // A previous attempt crossed ingestion but failed before
+                    // its checkpoint was saved. The live session is already
+                    // the required evidence; do not ingest it a second time.
+                    return Ok(checkpoint);
+                }
+                let _ = pending.remove(&target_key).expect("present entry").abort();
+            }
+        }
+        // Ordinary ingestion crosses the boundary once and parks the live
+        // StagedIngested for CAS. The per-target guard makes a concurrent
+        // retry observe this session instead of performing another ingest.
         let (ingested, checkpoint) = self.reingest_verified(snapshot, None, cancel).await?;
-        ingested.abort()?;
+        {
+            // Bounded: a session whose commit never runs must not hold SDK
+            // resources open forever (dropping a handle alone does not abort
+            // it). An evicted session is recovered from its durable checkpoint.
+            const MAX_PENDING_INGESTED: usize = 8;
+            let mut pending = self.pending_ingested.lock().await;
+            while pending.len() >= MAX_PENDING_INGESTED {
+                let Some(idle) = pending.keys().next().cloned() else { break };
+                if let Some(evicted) = pending.remove(&idle) {
+                    let _ = evicted.abort();
+                }
+            }
+            if let Some(previous) = pending.insert(checkpoint.target_key.clone(), ingested) {
+                let _ = previous.abort();
+            }
+        }
         Ok(checkpoint)
     }
 
@@ -525,8 +640,32 @@ where
         ingested: &IngestionCheckpoint,
         cancel: &CancellationToken,
     ) -> Result<CasCommitCheckpoint, RemoteError> {
-        let (ingested_stage, _checkpoint) =
-            self.reingest_verified(snapshot, Some(ingested), cancel).await?;
+        // Ordinary path: consume the live session ingest_payload parked under
+        // this exact target key — one ingestion, one CAS commit. No live
+        // session (crash recovery) or a session that does not reproduce the
+        // journal's checkpoint falls back to reingest_verified, which
+        // re-ingests once and re-verifies the checkpoint identity before any
+        // commit; the SDK task id is session-local and never compared.
+        let cached = {
+            let mut pending = self.pending_ingested.lock().await;
+            let parked = pending.get(&ingested.target_key).map(|stage| stage.checkpoint());
+            match parked {
+                Some(live) if same_ingestion(&live, ingested) => pending.remove(&ingested.target_key),
+                Some(_) => {
+                    // Stale session under this key: release it explicitly and
+                    // recover from the durable checkpoint below.
+                    if let Some(evicted) = pending.remove(&ingested.target_key) {
+                        let _ = evicted.abort();
+                    }
+                    None
+                }
+                None => None,
+            }
+        };
+        let ingested_stage = match cached {
+            Some(stage) => stage,
+            None => self.reingest_verified(snapshot, Some(ingested), cancel).await?.0,
+        };
         let (_committed, checkpoint) = ingested_stage.commit_cas(cancel).await?;
         Ok(checkpoint)
     }
@@ -603,10 +742,329 @@ pub async fn version_record<R: RemoteOps>(
         .await?;
     let record = hfdrive_core::format::from_version_bytes(&body)
         .map_err(|_| RemoteError::InvalidResponse)?;
-    if record.workspace_id != workspace {
+    if record.workspace_id != workspace || record.version_id != version {
         return Err(RemoteError::InvalidResponse);
     }
     Ok(record)
 }
 
 // The coordinator types above are re-exported for callers building candidates.
+
+#[cfg(test)]
+mod tests {
+    //! Deterministic regressions for the ordinary ingest -> CAS-commit path:
+    //! exactly one ingestion per snapshot — the live [`hfdrive_hf::StagedIngested`]
+    //! session is reused for the CAS commit, never aborted and re-ingested — and
+    //! crash recovery that re-ingests only when no live staged session exists.
+    //! The Xet CAS is a local fixture (`local://`) and the only HTTP surface is
+    //! the bucket's `xet-write-token` refresh route (one eager refresh per Xet
+    //! session), so refresh hits count real ingestions. No external network.
+
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use hfdrive_auth::{
+        AuthorizationAuthority, AuthorizationError, AuthorizationLease, SecretAccessToken, TokenSource,
+    };
+    use hfdrive_core::ids::{AccountKey, UploadId, WorkspaceId};
+    use hfdrive_core::storage::{
+        BucketBinding, BucketId, BucketName, DriveBinding, Namespace, OwnerId, OwnerKind, PayloadKey, Sha256Digest,
+    };
+    use hfdrive_hf::{NativeApi, NativeConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    const SECRET_MARKER: &str = "SECRET_MARKER_HFDRIVE_REMOTE_TEST";
+
+    struct Stub {
+        lease: AuthorizationLease,
+        account: AccountKey,
+    }
+
+    impl TokenSource for Stub {
+        fn access_token(
+            &self,
+            _account: AccountKey,
+        ) -> impl Future<Output = Result<Arc<SecretAccessToken>, AuthorizationError>> + Send {
+            let account = self.account;
+            async move {
+                Ok(Arc::new(SecretAccessToken::new(
+                    Zeroizing::new(SECRET_MARKER.to_owned()),
+                    account,
+                    1,
+                    u64::MAX,
+                )))
+            }
+        }
+
+        fn refresh_after_unauthorized(
+            &self,
+            _account: AccountKey,
+            _rejected_generation: u64,
+        ) -> impl Future<Output = Result<Arc<SecretAccessToken>, AuthorizationError>> + Send {
+            let account = self.account;
+            async move {
+                Ok(Arc::new(SecretAccessToken::new(
+                    Zeroizing::new(SECRET_MARKER.to_owned()),
+                    account,
+                    2,
+                    u64::MAX,
+                )))
+            }
+        }
+
+        fn authorization_lease(&self, _account: AccountKey) -> Result<AuthorizationLease, AuthorizationError> {
+            Ok(self.lease.clone())
+        }
+    }
+
+    struct Fixture {
+        addr: std::net::SocketAddr,
+        token_refreshes: Arc<AtomicUsize>,
+        batches: Arc<AtomicUsize>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Local HTTP fixture: the bucket's `xet-write-token` refresh route (the
+    /// only HTTP call one ingestion performs) and the exact-key batch bind.
+    async fn fixture(cas_url: String) -> Fixture {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token_refreshes = Arc::new(AtomicUsize::new(0));
+        let batches = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let token_refreshes = token_refreshes.clone();
+            let batches = batches.clone();
+            async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + 4 + content_length {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let mut parts = head.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_uppercase();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let response = if method == "GET" && path.ends_with("/xet-write-token") {
+                        token_refreshes.fetch_add(1, Ordering::SeqCst);
+                        let body = serde_json::json!({
+                            "casUrl": cas_url,
+                            "exp": 4_000_000_000u64,
+                            "accessToken": "fixture-cas-token",
+                        })
+                        .to_string();
+                        format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    } else if method == "POST" && path.ends_with("/batch") {
+                        batches.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"success":true,"processed":1,"succeeded":1,"failed":[]}"#;
+                        format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".to_owned()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
+                }
+            }
+        });
+        Fixture { addr, token_refreshes, batches, _task: task }
+    }
+
+    fn drive_binding(account: AccountKey) -> DriveBinding {
+        DriveBinding {
+            account_key: account,
+            bucket: BucketBinding {
+                bucket_id: BucketId::new("64b000000000000000000003".to_owned()).unwrap(),
+                bucket_name: BucketName::new("single".to_owned()).unwrap(),
+                owner_id: OwnerId::new("subject-1".to_owned()).unwrap(),
+                owner_kind: OwnerKind::Personal,
+                owner_namespace: Namespace::new("ns".to_owned()).unwrap(),
+            },
+            prefix: RemotePrefix::new("hfdrive/test-workspace".to_owned()).unwrap(),
+            workspace_id: WorkspaceId::new(),
+        }
+    }
+
+    fn live_remote(
+        endpoint: String,
+        binding: DriveBinding,
+        cache_dir: std::path::PathBuf,
+    ) -> LiveRemote<Stub, hfdrive_publication::S3Transport> {
+        let config = NativeConfig { endpoint: endpoint.clone(), xet_cache_dir: cache_dir, ..NativeConfig::default() };
+        let account = binding.account_key;
+        let tokens = Arc::new(Stub {
+            lease: AuthorizationAuthority::new(account, 1).activate().expect("fresh authority activates"),
+            account,
+        });
+        let api = NativeApi::new(tokens, account, endpoint).unwrap();
+        let native = NativeBucketStore::new(api.clone(), binding, config.clone()).unwrap();
+        let control = NativeControl::new(api, config);
+        LiveRemote::new(native, control, None)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordinary_upload_ingests_once_and_recovery_reingests_only_without_a_live_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = b"one ingestion per snapshot, never two".to_vec();
+        let source = temp.path().join("source.bin");
+        std::fs::write(&source, &payload).unwrap();
+        let upload_id = UploadId::new();
+        let snapshot = StableSnapshot {
+            snapshot_id: hfdrive_core::ids::SnapshotId::new(),
+            upload_id,
+            path: source,
+            size: payload.len() as u64,
+            sha256: Sha256Digest::of(&payload),
+        };
+        let account = AccountKey::from_subject("https://huggingface.co", "remote-single-ingest");
+        let cas_url = format!("local://{}", temp.path().join("cas").display());
+        let server = fixture(cas_url).await;
+        let endpoint = format!("http://{}", server.addr);
+        let binding = drive_binding(account);
+        let cancel = CancellationToken::new();
+
+        // Ordinary path: ingestion parks the live StagedIngested session and
+        // the CAS commit consumes it. One ingestion, no abort-then-re-ingest.
+        let live = live_remote(endpoint.clone(), binding.clone(), temp.path().join("cache-live"));
+        let checkpoint = live.ingest_payload(&snapshot, &cancel).await.unwrap();
+        assert_eq!(server.token_refreshes.load(Ordering::SeqCst), 1, "ingestion crosses its boundary exactly once");
+        assert_eq!(checkpoint.target_key, format!("hfdrive/test-workspace/objects/{upload_id}"));
+        assert_eq!(checkpoint.size, snapshot.size);
+        assert_eq!(checkpoint.sha256, snapshot.sha256);
+        let retried = live.ingest_payload(&snapshot, &cancel).await.unwrap();
+        assert!(same_ingestion(&checkpoint, &retried));
+        assert_eq!(server.token_refreshes.load(Ordering::SeqCst), 1, "a checkpoint-save retry reuses the live ingestion");
+
+        let committed = live.commit_payload_cas(&snapshot, &checkpoint, &cancel).await.unwrap();
+        assert_eq!(
+            server.token_refreshes.load(Ordering::SeqCst),
+            1,
+            "the CAS commit reuses the live session and never re-ingests the same snapshot"
+        );
+        assert_eq!(committed.target_key, checkpoint.target_key);
+        assert_eq!(committed.xet_file_id, checkpoint.xet_file_id);
+        assert_eq!(committed.size, checkpoint.size);
+        assert_eq!(committed.sha256, checkpoint.sha256);
+
+        let object = live.bind_payload(&snapshot, &committed, &cancel).await.unwrap();
+        assert_eq!(object.key, PayloadKey::new(upload_id));
+        assert_eq!(object.xet_file_id, checkpoint.xet_file_id);
+        assert_eq!(object.size, snapshot.size);
+        assert_eq!(object.sha256, snapshot.sha256);
+        assert_eq!(server.batches.load(Ordering::SeqCst), 1, "binding posts exactly one exact-key batch operation");
+
+        // Crash recovery: a fresh boundary holds no live staged session, so the
+        // durable checkpoint is re-ingested exactly once and re-verified before
+        // its commit. The SDK task id is session-local and never compared.
+        let mut journal = checkpoint.clone();
+        journal.sdk_task_id += 1;
+        let recovered = live_remote(endpoint.clone(), binding.clone(), temp.path().join("cache-recovered"));
+        let resumed = recovered.commit_payload_cas(&snapshot, &journal, &cancel).await.unwrap();
+        assert_eq!(
+            server.token_refreshes.load(Ordering::SeqCst),
+            2,
+            "recovery re-ingests exactly once and only when no live staged session exists"
+        );
+        assert_eq!(resumed.target_key, checkpoint.target_key);
+        assert_eq!(resumed.xet_file_id, checkpoint.xet_file_id);
+        assert_eq!(resumed.size, checkpoint.size);
+        assert_eq!(resumed.sha256, checkpoint.sha256);
+
+        // A checkpoint that does not describe this snapshot is a recapture
+        // demand (SourceChanged), never a commit and never a bind.
+        let mut foreign = checkpoint.clone();
+        foreign.size += 1;
+        let error = recovered
+            .commit_payload_cas(&snapshot, &foreign, &cancel)
+            .await
+            .expect_err("a mismatched recovered checkpoint must not commit");
+        assert!(matches!(error, RemoteError::SourceChanged));
+    }
+
+    #[test]
+    fn head_identity_requires_the_established_workspace_and_root() {
+        let workspace = WorkspaceId::new();
+        let root_item = ItemId::new();
+        let identity = RemoteIdentity { workspace, root_item };
+        let head = HeadV1 {
+            format: "hfdrive".to_owned(),
+            schema_version: 1,
+            workspace_id: workspace,
+            root_item_id: root_item,
+            commit_id: CommitId::new(),
+            generation: hfdrive_core::ids::GenerationId::new(),
+            required_features: Vec::new(),
+        };
+        identity.check_head(&head).unwrap();
+        let mut wrong_workspace = head.clone();
+        wrong_workspace.workspace_id = WorkspaceId::new();
+        assert!(matches!(identity.check_head(&wrong_workspace), Err(RemoteError::InvalidResponse)));
+        let mut wrong_root = head;
+        wrong_root.root_item_id = ItemId::new();
+        assert!(matches!(identity.check_head(&wrong_root), Err(RemoteError::InvalidResponse)));
+    }
+
+    #[tokio::test]
+    async fn version_record_must_match_its_requested_immutable_key() {
+        let workspace = WorkspaceId::new();
+        let requested = hfdrive_core::ids::VersionId::new();
+        let record = hfdrive_core::format::VersionV1 {
+            format: "hfdrive".to_owned(),
+            schema_version: 1,
+            workspace_id: workspace,
+            version_id: hfdrive_core::ids::VersionId::new(),
+            object_key: hfdrive_core::storage::PayloadKey::new(UploadId::new()),
+            size: 7,
+            sha256: Sha256Digest::of(b"payload"),
+            xet_file_id: None,
+            display: hfdrive_core::format::DisplayMetadata {
+                name: "file.txt".to_owned(),
+                modified_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+        };
+        assert_ne!(record.version_id, requested);
+        let bytes = hfdrive_core::format::to_version_bytes(&record).unwrap();
+        let remote = crate::sync::test_support::HeadOnlyRemote {
+            metadata: Some(bytes::Bytes::from(bytes)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            version_record(&remote, workspace, requested, &CancellationToken::new()).await,
+            Err(RemoteError::InvalidResponse)
+        ));
+    }
+}

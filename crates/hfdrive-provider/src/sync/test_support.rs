@@ -22,6 +22,7 @@ use super::remote::{RangeSource, RemoteError, RemoteHead, RemoteOps};
 pub(crate) struct HeadOnlyRemote {
     pub head: Option<RemoteHead>,
     pub head_reads: Arc<AtomicUsize>,
+    pub metadata: Option<Bytes>,
 }
 
 pub(crate) struct UnusedReader;
@@ -101,7 +102,7 @@ impl RemoteOps for HeadOnlyRemote {
         _: MetadataRecord,
         _: &CancellationToken,
     ) -> Result<Bytes, RemoteError> {
-        panic!("unexpected metadata read in a HEAD-only scenario")
+        self.metadata.clone().ok_or(RemoteError::RemoteContentUnavailable)
     }
 
     async fn ingest_payload(

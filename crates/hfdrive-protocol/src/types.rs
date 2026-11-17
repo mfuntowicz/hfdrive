@@ -320,6 +320,9 @@ pub enum UnlinkMode {
     SafeRemove,
     /// Disconnect only, keeping the registration for recovery.
     DisconnectKeepRegistration,
+    /// Remove the connection even where committed bytes cannot be retained
+    /// locally; requires explicit online-only data-loss consent.
+    RemoveUnavailable,
 }
 
 /// Probe check kind.
@@ -1499,6 +1502,19 @@ pub struct ExportDiagnosticsResult {
     pub redacted: bool,
 }
 
+/// One file affected by an unlink preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct UnlinkFileResult {
+    /// Exact local path of the affected file.
+    pub path: String,
+    /// Logical size of the affected file.
+    #[serde(with = "crate::dec_u64")]
+    pub size: u64,
+    /// True when only part of the file is locally resident.
+    pub partial: bool,
+}
+
 /// `prepare_unlink` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -1531,6 +1547,15 @@ pub struct PrepareUnlinkResult {
     pub required_export_bytes: u64,
     /// Blocking reasons (non-secret display text), empty when safe.
     pub blocking_reasons: Vec<String>,
+    /// Persisted preview identifier consumed by `unlink`.
+    pub preview_id: Uuid,
+    /// Opaque fingerprint binding the provider-reviewed identities of this preview.
+    pub preview_fingerprint: String,
+    /// True when proceeding destroys bytes that exist only in managed storage;
+    /// requires explicit affirmative consent on `unlink`.
+    pub online_only_data_loss: bool,
+    /// Files affected by the unlink, bounded to 200 entries by the producer.
+    pub affected_files: Vec<UnlinkFileResult>,
 }
 
 /// `unlink` request.
@@ -1543,6 +1568,11 @@ pub struct UnlinkRequest {
     pub connection_id: Uuid,
     /// Unlink mode actually selected.
     pub mode: UnlinkMode,
+    /// Preview identifier from `prepare_unlink`.
+    pub preview_id: Uuid,
+    /// True when the user explicitly consented to losing bytes that exist only
+    /// in managed storage (required when the preview reported data loss).
+    pub accept_online_only_data_loss: bool,
 }
 request_method!(UnlinkRequest, "unlink");
 

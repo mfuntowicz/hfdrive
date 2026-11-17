@@ -74,6 +74,16 @@ pub enum Command {
         #[command(flatten)] connection: ConnectionArgs,
         #[arg(long)] accept_preview: Option<Uuid>,
         #[arg(long)] export_to: Option<PathBuf>,
+        /// Plan a removal that drops placeholders whose bytes cannot be made
+        /// resident instead of hydrating/exporting them. Their not-resident
+        /// content is then irreversibly lost on this device.
+        #[arg(long)]
+        remove_unavailable: bool,
+        /// Explicit consent to that irreversible local loss. Only meaningful
+        /// together with --accept-preview; the provider rejects a lossy
+        /// removal without it.
+        #[arg(long)]
+        accept_online_only_data_loss: bool,
     },
     Provider {
         #[command(subcommand)] command: ProviderCommand,

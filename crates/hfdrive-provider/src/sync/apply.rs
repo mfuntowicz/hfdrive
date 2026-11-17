@@ -175,15 +175,44 @@ pub fn delete_local(root: &Path, relative: &Path) -> Result<ApplyOutcome, &'stat
 /// Preserves dirty local bytes into the recovery area before a destructive
 /// local replacement or removal. The recovery area lives outside every sync
 /// root, so preserved data survives both sync and uninstall.
+///
+/// The copy goes through the **verified** [`crate::sync::recovery`]
+/// preservation path: unique exclusive reservation, source metadata
+/// re-verification, digest verification and payload -> sidecar -> success
+/// durability. There is no unverified copy fallback here. `Ok(Some(path))`
+/// names the verified recovery copy; `Ok(None)` is the "nothing to lose" skip
+/// (empty file, directory, verifiably gone source), never a preservation
+/// proof; every preservation failure is propagated as `Err` and must block
+/// the destructive work.
 pub fn preserve_dirty(
     source: &Path,
     recovery_dir: &Path,
     action_id: ActionId,
-) -> Result<PathBuf, &'static str> {
+) -> Result<Option<PathBuf>, &'static str> {
     std::fs::create_dir_all(recovery_dir).map_err(|_| "recovery area unavailable")?;
-    let target = recovery_dir.join(format!("{}.recovered", action_id));
-    std::fs::copy(source, &target).map_err(|_| "preserving dirty bytes failed")?;
-    Ok(target)
+    let label = action_id.to_string();
+    let display = source.to_string_lossy().into_owned();
+    let preserved = crate::sync::recovery::preserve_item_bytes(source, recovery_dir, &label, &display)
+        .map_err(|error| match error {
+            crate::sync::recovery::RecoveryError::AreaUnavailable => "recovery area unavailable",
+            crate::sync::recovery::RecoveryError::SourceGone => "the source file is gone",
+            crate::sync::recovery::RecoveryError::SourceChanged => {
+                "the source changed while being preserved"
+            }
+            crate::sync::recovery::RecoveryError::Unreadable => {
+                "the source could not be read for preservation"
+            }
+            crate::sync::recovery::RecoveryError::WriteFailed => {
+                "preserving dirty bytes failed"
+            }
+            crate::sync::recovery::RecoveryError::DigestMismatch => {
+                "the recovery copy does not match the source bytes"
+            }
+        })?;
+    // A skip (empty file, directory, verifiably gone source) has nothing to
+    // preserve: `Ok(None)` is not a preservation proof, and the destructive
+    // caller may proceed knowing there was nothing to lose.
+    Ok(preserved.map(|copy| copy.path))
 }
 
 /// Pin/unpin request with separate requested-vs-resident reporting.

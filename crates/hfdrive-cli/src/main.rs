@@ -35,6 +35,10 @@ enum CliError {
     LoginEnded(hfdrive_protocol::LoginPhase),
     #[error("storage credentials were verified and saved, but the provider has not reconnected the drive")]
     RepairIncomplete,
+    #[error("--accept-online-only-data-loss requires --accept-preview <id> to confirm the exact reviewed preview")]
+    UnlinkConsentWithoutAccept,
+    #[error("--accept-online-only-data-loss is only valid with --remove-unavailable; a safe remove never discards unavailable bytes")]
+    UnlinkConsentWithoutLossyMode,
     #[error(transparent)]
     Import(#[from] import::ImportRequestError),
 }
@@ -65,6 +69,15 @@ async fn main() -> ExitCode {
 async fn run(arguments: Cli) -> Result<(), CliError> {
     if matches!(&arguments.command, Command::Provider { command: ProviderCommand::Exit { confirm: false } }) {
         return Err(CliError::ExitConfirmation);
+    }
+    if let Command::Unlink { accept_preview, remove_unavailable, accept_online_only_data_loss, .. } = &arguments.command {
+        // Invalid flag combinations are rejected before any request is sent.
+        if *accept_online_only_data_loss && accept_preview.is_none() {
+            return Err(CliError::UnlinkConsentWithoutAccept);
+        }
+        if *accept_online_only_data_loss && !*remove_unavailable {
+            return Err(CliError::UnlinkConsentWithoutLossyMode);
+        }
     }
     let import_request = match &arguments.command {
         Command::Import { request } => Some(import::load_request(*request)?),
@@ -125,20 +138,29 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
         Command::Restore { item, version } => Request::Restore(RestoreRequest {
             operation_id: Uuid::new_v4(), connection_id: item.connection, item_id: item.item, version_id: *version,
         }),
-        Command::Unlink { connection, accept_preview, export_to } => {
+        Command::Unlink { connection, accept_preview, export_to, remove_unavailable, accept_online_only_data_loss } => {
             if export_to.is_some() {
                 return Err(CliError::Unavailable);
             }
+            let mode = if *remove_unavailable {
+                hfdrive_protocol::UnlinkMode::RemoveUnavailable
+            } else {
+                hfdrive_protocol::UnlinkMode::SafeRemove
+            };
             match accept_preview {
-                Some(operation) => Request::Unlink(UnlinkRequest {
-                    operation_id: *operation,
+                Some(preview_id) => Request::Unlink(UnlinkRequest {
+                    // Fresh durable operation id: distinct from the reviewed
+                    // preview id, so retrying cannot replay another mutation.
+                    operation_id: Uuid::new_v4(),
                     connection_id: connection.connection,
-                    mode: hfdrive_protocol::UnlinkMode::SafeRemove,
+                    mode,
+                    preview_id: *preview_id,
+                    accept_online_only_data_loss: *accept_online_only_data_loss,
                 }),
                 None => Request::PrepareUnlink(PrepareUnlinkRequest {
                     operation_id: Uuid::new_v4(),
                     connection_id: connection.connection,
-                    mode: hfdrive_protocol::UnlinkMode::SafeRemove,
+                    mode,
                 }),
             }
         }
@@ -357,10 +379,30 @@ async fn run(arguments: Cli) -> Result<(), CliError> {
                 result.safe_to_unlink, result.online_only_files, result.partial_files,
                 result.dirty_files, result.conflict_files, result.required_export_bytes)?;
             for reason in result.blocking_reasons { writeln!(output, "Blocked: {reason}")?; }
+            writeln!(output, "Affected files ({}):", result.affected_files.len())?;
+            for file in &result.affected_files {
+                writeln!(output, "{}\t{}\t{}", file.path, file.size,
+                    if file.partial { "partial" } else { "not-resident" })?;
+            }
+            writeln!(output, "preview_id: {}", result.preview_id)?;
+            writeln!(output, "preview_fingerprint: {}", result.preview_fingerprint)?;
+            if result.online_only_data_loss {
+                writeln!(output, "WARNING: this removal would permanently discard the listed unavailable bytes on this device.")?;
+                writeln!(output, "They cannot be recovered without re-syncing from remote content. Review the affected files above.")?;
+                writeln!(output, "To proceed, accept the exact reviewed preview with --accept-preview {} --accept-online-only-data-loss.",
+                    result.preview_id)?;
+            } else {
+                writeln!(output, "To proceed, accept the exact reviewed preview with --accept-preview {}.", result.preview_id)?;
+            }
+            writeln!(output, "No connection has been removed; this is a preview only.")?;
         }
-        (Command::Unlink { .. }, ResponseResult::Unlink(result)) => {
+        (Command::Unlink { accept_preview: Some(_), .. }, ResponseResult::Unlink(result)) => {
             writeln!(std::io::stdout().lock(), "Connection {} unregistered={} retained-for-recovery={}.",
                 result.connection_id, result.unregistered, result.retained_for_recovery)?;
+            if result.retained_for_recovery {
+                writeln!(std::io::stdout().lock(),
+                    "The binding and registration were retained for recovery; this is not a completed removal.")?;
+            }
         }
         (Command::Diagnostics { .. }, ResponseResult::ExportDiagnostics(result)) => {
             writeln!(std::io::stdout().lock(), "Redacted diagnostics archive: {} (redacted={}).",

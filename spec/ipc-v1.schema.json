@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://huggingface.co/hfdrive/spec/ipc-v1.schema.json",
   "title": "HF Drive IPC 1.0",
-  "description": "Normative wire contract for HF Drive provider IPC. Frame: 4-byte little-endian length (1..=1048576) followed by this envelope as UTF-8 JSON. Canonical bytes: members in UTF-8 byte-lexicographic key order (typed serializers emit declaration order, which matches for ASCII keys), compact separators, minimal string escapes (\\\" \\\\ \\b \\t \\n \\f \\r and \\u00xx lowercase for other C0/DEL controls), u64 fields as canonical decimal strings (no leading zeros, no sign), u32 fields as JSON integers, UUIDs lowercase hyphenated, optional fields omitted (a JSON null for an optional field decodes as absent and is never emitted), duplicate member names, unknown members, unknown enum variants, floats, and NaN/Infinity are rejected. Protocol version is exactly 1.0; only a hello request with another version is parsed (so the provider can answer with supported versions and close). List pages return items + next_cursor and accept cursor + limit (<= 200). Every mutation request carries a unique operation_id (operation UUID); reusing it must not duplicate the durable mutation. set_publication_credentials carries a user-scoped DPAPI ciphertext envelope; raw key/secret bytes never appear on the wire and this envelope is never logged.",
+  "description": "Normative wire contract for HF Drive provider IPC. Frame: 4-byte little-endian length (1..=1048576) followed by this envelope as UTF-8 JSON. Canonical bytes: members in UTF-8 byte-lexicographic key order (typed serializers emit declaration order, which matches for ASCII keys), compact separators, minimal string escapes (\\\" \\\\ \\b \\t \\n \\f \\r and \\u00xx lowercase for other C0/DEL controls), u64 fields as canonical decimal strings (no leading zeros, no sign), u32 fields as JSON integers, UUIDs lowercase hyphenated, optional fields omitted (a JSON null for an optional field decodes as absent and is never emitted), duplicate member names, unknown members, unknown enum variants, floats, and NaN/Infinity are rejected. Protocol version is exactly 1.0; only a hello request with another version is parsed (so the provider can answer with supported versions and close). List pages return items + next_cursor and accept cursor + limit (<= 200). Every mutation request carries a unique operation_id (operation UUID); reusing it must not duplicate the durable mutation. prepare_unlink returns a persisted preview identity (preview_id + preview_fingerprint) and an affected_files list producer-bounded at 200 entries; online_only_data_loss signals that proceeding destroys managed-storage-only bytes and unlink then requires accept_online_only_data_loss. set_publication_credentials carries a user-scoped DPAPI ciphertext envelope; raw key/secret bytes never appear on the wire and this envelope is never logged.",
   "$defs": {
     "error_object": {
       "type": "object",
@@ -767,6 +767,28 @@
         "size",
         "sha256",
         "xet_file_id"
+      ]
+    },
+    "unlink_file_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "description": "canonical decimal u64"
+        },
+        "partial": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "partial"
       ]
     },
     "conflict_record": {
@@ -1549,7 +1571,8 @@
       "type": "string",
       "enum": [
         "safe_remove",
-        "disconnect_keep_registration"
+        "disconnect_keep_registration",
+        "remove_unavailable"
       ]
     },
     "probe_check_kind": {
@@ -3266,7 +3289,8 @@
           "type": "string",
           "enum": [
             "safe_remove",
-            "disconnect_keep_registration"
+            "disconnect_keep_registration",
+            "remove_unavailable"
           ]
         }
       },
@@ -3314,6 +3338,22 @@
           "items": {
             "type": "string"
           }
+        },
+        "preview_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "preview_fingerprint": {
+          "type": "string"
+        },
+        "online_only_data_loss": {
+          "type": "boolean"
+        },
+        "affected_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/unlink_file_result"
+          }
         }
       },
       "required": [
@@ -3323,7 +3363,11 @@
         "dirty_files",
         "conflict_files",
         "required_export_bytes",
-        "blocking_reasons"
+        "blocking_reasons",
+        "preview_id",
+        "preview_fingerprint",
+        "online_only_data_loss",
+        "affected_files"
       ],
       "description": "body.result of a \"prepare_unlink\" response"
     },
@@ -3343,14 +3387,24 @@
           "type": "string",
           "enum": [
             "safe_remove",
-            "disconnect_keep_registration"
+            "disconnect_keep_registration",
+            "remove_unavailable"
           ]
+        },
+        "preview_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "accept_online_only_data_loss": {
+          "type": "boolean"
         }
       },
       "required": [
         "operation_id",
         "connection_id",
-        "mode"
+        "mode",
+        "preview_id",
+        "accept_online_only_data_loss"
       ],
       "description": "body of a \"unlink\" request"
     },

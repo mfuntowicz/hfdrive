@@ -99,14 +99,37 @@ The CLI (`hfdrive unlink --connection <id> [--accept-preview <id>] [--export-to 
 and the typed IPC `PrepareUnlink`/`Unlink` commands implement:
 
 - `PrepareUnlink` counts online-only/partial/dirty/conflict files and required
-  export space; the preview must be reviewed and explicitly accepted
-  (`--accept-preview <id>`).
+  export space, and returns `preview_id`, a fingerprint of the exact reviewed
+  identities and the affected paths. Acceptance uses that preview plus a fresh
+  mutation `operation_id`; it never reuses the preview as the mutation ID.
 - **Safe default**: hydrate/export committed content, preserve every dirty and
   recovered snapshot (recovery area outside sync roots), convert fully resident
   placeholders to normal files, disconnect and unregister
   (`StorageProviderSyncRootManager.Unregister`).
 - If unavailable bytes or unsynchronized content cannot be retained/exported,
   unlink is **blocked** and the affected files are listed — never a silent loss.
+- `RemoveUnavailable` is the explicit deleted-bucket mode. It requires a fresh
+  404/410 resolution of the exact stable bucket, a matching preview fingerprint
+  and `accept_online_only_data_loss` whenever clean zero-residency files will be
+  abandoned. Partial or dirty/conflicted content blocks; identity/version or
+  residency changes invalidate consent. No transport error, timeout, denial or
+  missing HEAD can authorize this mode.
+- Before either removal mode unregisters, preservation/conversion and any
+  explicitly consented guarded deletion must finish, watchers must be quiesced,
+  and a complete live-tree scan must prove no unusable placeholders remain.
+  Windows unregistration itself may delete nonhydrated placeholders and skip
+  failures, so it is never used as the cleanup mechanism. Registration absence
+  is verified afterward, and the account/control connection records are removed.
+- Consented abandonment deletes only through the exact open handle that
+  reverified NTFS identity, HFDR identity, shape and zero residency with
+  write/delete sharing denied. Dirty/query/preservation failures block removal.
+  Recovery copies are exclusive, digest-verified and flushed before success;
+  unverified remnants are retained instead of deleted by path. Disconnect joins
+  the drive worker, including startup paths where no CFAPI pump attached.
+- **Crash limitation**: no unlink-phase journal exists. A crash during the
+  destructive phase can leave a partially converted root and connection row;
+  startup may reconnect it. A fresh reviewed unlink preview is required to
+  finish removal, and no automatic completion is claimed.
 - The only offline alternative is explicitly labeled
   **“Disconnect, keep registration for recovery”**: binding, registration and
   remote references are retained; online-only bytes cannot open until reconnect.

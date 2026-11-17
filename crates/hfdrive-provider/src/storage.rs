@@ -417,7 +417,18 @@ pub(crate) fn engine_failure(error_value: crate::sync::EngineError) -> wire::Pro
         EngineError::Admission(_) => error(wire::ProtocolErrorCode::Conflict, "The connection root or registration conflicts with its persisted identity"),
         EngineError::NeedsSignIn => error(wire::ProtocolErrorCode::NeedsSignIn, "Sign-in is required"),
         EngineError::ReadOnly => error(wire::ProtocolErrorCode::ReadOnly, "The connection is read-only"),
-        EngineError::UnlinkBlocked(_) => error(wire::ProtocolErrorCode::Conflict, "Unlink is blocked until local content is preserved"),
+        EngineError::PreviewChanged => error(wire::ProtocolErrorCode::PreviewChanged,
+            "Preview inputs changed; review the refreshed preview before removing anything"),
+        EngineError::UnlinkBlocked(blocked) => {
+            // Preservation failures name the safe reason and, when known, the
+            // exact files that must be preserved or resolved first; this is a
+            // refusal to lose bytes, not a generic identity conflict.
+            let mut message = format!("Unlink is blocked: {}", blocked.reason);
+            if !blocked.files.is_empty() {
+                message.push_str("; affected files were listed in the unlink preview");
+            }
+            wire::ProtocolError { code: wire::ProtocolErrorCode::Conflict, message, retry_after_ms: None }
+        }
         EngineError::Disconnect(_) => crate::operations::internal(),
         EngineError::Publish(_) => crate::operations::internal(),
     }

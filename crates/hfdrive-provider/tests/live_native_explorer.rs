@@ -145,7 +145,7 @@ async fn native_xet_file_hydrates_through_cfapi() {
     }
     let run_id = uuid::Uuid::new_v4();
     let mut cleanup = Cleanup::new(run_id);
-    let outcome = live_run(&client_id, run_id, &mut cleanup).await;
+    let outcome = live_run(run_id, &mut cleanup).await;
     cleanup.run().await;
     if let Err(failure) = outcome {
         panic!("live native acceptance failed: {failure}");
@@ -368,7 +368,7 @@ impl PublicationStore for ProbeStore {
 // The run
 // ---------------------------------------------------------------------------
 
-async fn live_run(client_id: &str, run_id: uuid::Uuid, cleanup: &mut Cleanup) -> LiveResult<()> {
+async fn live_run(run_id: uuid::Uuid, cleanup: &mut Cleanup) -> LiveResult<()> {
     let cancel = CancellationToken::new();
 
     // ---- 1. real OAuth identity restored by the provider AuthManager ----

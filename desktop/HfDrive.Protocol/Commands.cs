@@ -723,6 +723,19 @@ public sealed record ExportDiagnosticsResult
     public required bool Redacted { get; init; }
 }
 
+/// <summary>One file affected by an unlink preview.</summary>
+public sealed record UnlinkFileResult
+{
+    /// <summary>Exact local path of the affected file.</summary>
+    public required string Path { get; init; }
+
+    /// <summary>Logical size of the affected file (decimal string on the wire).</summary>
+    public required ulong Size { get; init; }
+
+    /// <summary>True when only part of the file is locally resident.</summary>
+    public required bool Partial { get; init; }
+}
+
 /// <summary>prepare_unlink request.</summary>
 public sealed record PrepareUnlinkRequest
 {
@@ -759,6 +772,19 @@ public sealed record PrepareUnlinkResult
 
     /// <summary>Blocking reasons (non-secret display text), empty when safe.</summary>
     public IReadOnlyList<string> BlockingReasons { get; init; } = Array.Empty<string>();
+
+    /// <summary>Persisted preview identifier consumed by unlink.</summary>
+    public required Guid PreviewId { get; init; }
+
+    /// <summary>Opaque fingerprint binding the provider-reviewed identities of this preview.</summary>
+    public required string PreviewFingerprint { get; init; }
+
+    /// <summary>True when proceeding destroys bytes that exist only in managed storage;
+    /// requires explicit affirmative consent on unlink.</summary>
+    public required bool OnlineOnlyDataLoss { get; init; }
+
+    /// <summary>Files affected by the unlink, bounded to 200 entries by the producer.</summary>
+    public required IReadOnlyList<UnlinkFileResult> AffectedFiles { get; init; }
 }
 
 /// <summary>unlink request.</summary>
@@ -772,6 +798,13 @@ public sealed record UnlinkRequest
 
     /// <summary>Unlink mode actually selected.</summary>
     public required UnlinkMode Mode { get; init; }
+
+    /// <summary>Preview identifier from prepare_unlink.</summary>
+    public required Guid PreviewId { get; init; }
+
+    /// <summary>True when the user explicitly consented to losing bytes that exist only in
+    /// managed storage (required when the preview reported data loss).</summary>
+    public required bool AcceptOnlineOnlyDataLoss { get; init; }
 }
 
 /// <summary>unlink result.</summary>

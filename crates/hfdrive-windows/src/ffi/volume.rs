@@ -88,6 +88,51 @@ pub(crate) fn open_query(path: &Path, open_reparse_point: bool) -> Result<OwnedH
     }
 }
 
+/// Open one final file/directory object for guarded deletion. Write and
+/// delete sharing are denied while the object is inspected and marked, so a
+/// path replacement or concurrent writer cannot occur between check/delete.
+pub(crate) fn open_delete(path: &Path) -> Result<OwnedHandle, u32> {
+    use windows::Win32::Storage::FileSystem::DELETE;
+    let w = wide(path);
+    // SAFETY: `w` is NUL-terminated; the returned handle has one RAII owner.
+    unsafe {
+        let raw = CreateFileW(
+            windows::core::PCWSTR(w.as_ptr()),
+            DELETE.0 | GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(
+                FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0,
+            ),
+            None,
+        )
+        .map_err(|e| error_code(&e))?;
+        OwnedHandle::from_raw(raw).ok_or_else(last_error_code)
+    }
+}
+
+/// Mark the exact open object for deletion. The path is never re-opened or
+/// resolved again; nonempty directories and changed/sharing-locked objects
+/// fail without a fallback path deletion.
+pub(crate) fn mark_deleted(handle: &OwnedHandle) -> Result<(), u32> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the input points to a valid disposition value for the exact
+    // generated size and remains alive for the synchronous call.
+    unsafe {
+        SetFileInformationByHandle(
+            handle.as_win(),
+            FileDispositionInfo,
+            &disposition as *const FILE_DISPOSITION_INFO as *const c_void,
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+        .map_err(|e| error_code(&e))
+    }
+}
+
 /// Open an existing regular file for a coherent read: read access with
 /// **write and delete sharing denied** (share mode = `FILE_SHARE_READ`
 /// only), so no other writer can change or remove the file while it is

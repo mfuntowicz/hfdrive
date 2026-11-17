@@ -450,7 +450,17 @@ pub fn resident_bytes(path: &Path, size: u64) -> CfResult<u64> {
         return Ok(0);
     }
     let handle = raw::open_with_oplock(path, false, false).map_err(map_open)?;
-    let ranges = raw::on_disk_ranges(&handle, 0, size as i64).map_err(|code| CfError::Win32 {
+    resident_bytes_on_handle(&handle, size)
+}
+
+fn resident_bytes_on_handle(
+    handle: &crate::ffi::handle::OwnedHandle,
+    size: u64,
+) -> CfResult<u64> {
+    if size == 0 {
+        return Ok(0);
+    }
+    let ranges = raw::on_disk_ranges(handle, 0, size as i64).map_err(|code| CfError::Win32 {
         operation: "CfGetPlaceholderRangeInfo",
         code,
     })?;
@@ -489,6 +499,166 @@ fn is_fully_resident(handle: &crate::ffi::handle::OwnedHandle, size: u64) -> CfR
         }
     }
     Ok(cursor >= size)
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder identity read-back
+// ---------------------------------------------------------------------------
+
+/// Read the HFDR placeholder identity stored at `path`.
+///
+/// Safe read-back used before any unlink conversion/deletion: it only opens
+/// metadata and queries `CfGetPlaceholderInfo`, never mutating the file.
+///
+/// * `Ok(Some(identity))` — the placeholder carries a valid HFDR record
+///   (magic, schema, non-nil ids) that belongs to `expect_workspace` when one
+///   is given. The record's length must be exactly `IDENTITY_LEN`.
+/// * `Ok(None)` — the path is **not** an HFDR placeholder: a plain file or
+///   directory, a placeholder of another sync provider, or a placeholder
+///   with no/foreign/unreadable identity bytes. These are never converted or
+///   deleted by the unlink flow and never decoded leniently.
+/// * `Err` — the query itself failed (open failure, corrupt placeholder
+///   metadata) or the record is HFDR-shaped but invalid: a wrong length,
+///   unsupported schema or a different workspace. A record from another
+///   workspace is [`CfError::IdentityMismatch`], never re-bound.
+///
+/// The metadata handle is a plain query handle (the CFAPI call needs only
+/// `READ_ATTRIBUTES`) owned by RAII for the whole query.
+pub fn read_placeholder_identity(
+    path: &Path,
+    expect_workspace: Option<hfdrive_core::ids::WorkspaceId>,
+) -> Result<Option<PlaceholderIdentity>, CfError> {
+    // 1. Classify the path without touching CFAPI: a plain file, a foreign
+    //    reparse point or the sync root itself is not a placeholder at all
+    //    and yields `None` without an OS placeholder query.
+    let state = crate::filesystem::volume::query_file_state(path).map_err(map_fs)?;
+    if !crate::filesystem::volume::placeholder_state(
+        state.identity.attributes,
+        state.identity.reparse_tag,
+    )
+    .is_placeholder()
+    {
+        return Ok(None);
+    }
+    // 2. Read the inline identity through the generated CFAPI metadata.
+    let handle = raw_volume::open_query(path, true).map_err(map_open)?;
+    let bytes = match raw::placeholder_identity(&handle) {
+        Ok(bytes) => bytes,
+        // Not a cloud placeholder at all (plain file or foreign item), or
+        // the provider stored no identity: distinguishable from an owned
+        // HFDR placeholder without any handwritten ABI.
+        Err(code) if code == raw::ERROR_NOT_A_CLOUD_FILE => return Ok(None),
+        Err(code) => {
+            return Err(CfError::Win32 {
+                operation: "CfGetPlaceholderInfo(FileIdentity)",
+                code,
+            })
+        }
+    };
+    decode_readback(&bytes, expect_workspace)
+}
+
+/// Classify raw `FileIdentity` bytes read back from the OS. Pure and
+/// deterministic — no OS call — so the foreign/owned boundary is testable
+/// without a registered sync root.
+///
+/// * Empty or any length other than the exact HFDR record: foreign/unknown
+///   placeholder or plain item → `Ok(None)`, never decoded leniently.
+/// * Wrong magic: not HFDR at all → `Ok(None)`.
+/// * HFDR-shaped but invalid: unsupported schema or nil identifier →
+///   [`CfError::Identity`]; a record from another workspace →
+///   [`CfError::IdentityMismatch`], never re-bound.
+fn decode_readback(
+    bytes: &[u8],
+    expect_workspace: Option<hfdrive_core::ids::WorkspaceId>,
+) -> Result<Option<PlaceholderIdentity>, CfError> {
+    use super::identity::{IdentityError, IDENTITY_LEN};
+
+    // A foreign provider's identity has whatever length it stored; only the
+    // exact HFDR record continues to the strict decoder.
+    if bytes.is_empty() || bytes.len() != IDENTITY_LEN {
+        return Ok(None);
+    }
+    match PlaceholderIdentity::decode(bytes, expect_workspace) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) => match error {
+            // HFDR-shaped but not ours (or not HFDR at all): no lenient
+            // read-back path, just "not an owned HFDR placeholder".
+            IdentityError::BadLength | IdentityError::BadMagic => Ok(None),
+            // An HFDR record from another workspace is never re-bound; it is
+            // an explicit mismatch the unlink flow must refuse.
+            IdentityError::WorkspaceMismatch => Err(CfError::IdentityMismatch),
+            // A corrupt owned record (bad schema/nil identifier) is an error,
+            // not silence.
+            other => Err(CfError::Identity(other)),
+        },
+    }
+}
+
+/// Delete an owned, clean, zero-resident placeholder through the same handle
+/// used for every verification. Write/delete sharing is denied from open
+/// through disposition, so the checked object cannot be replaced by a path
+/// race. Any mismatch or failed query leaves the object untouched.
+pub fn delete_owned_placeholder(
+    path: &Path,
+    expect: &crate::filesystem::volume::FileState,
+    identity: &PlaceholderIdentity,
+) -> Result<GuardOutcome, CfError> {
+    let handle = raw_volume::open_delete(path).map_err(map_open)?;
+    let id = raw_volume::id_info(&handle).map_err(|code| CfError::Win32 {
+        operation: "GetFileInformationByHandleEx(FileIdInfo)",
+        code,
+    })?;
+    if id.volume_serial_number != expect.identity.volume_serial_number
+        || id.file_id != expect.identity.file_id
+    {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::IdentityChanged));
+    }
+    let standard = raw_volume::standard_info(&handle).map_err(|code| CfError::Win32 {
+        operation: "GetFileInformationByHandleEx(FileStandardInfo)",
+        code,
+    })?;
+    if standard.size != expect.size {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::SizeChanged));
+    }
+    let basic = raw_volume::basic_info(&handle).map_err(|code| CfError::Win32 {
+        operation: "GetFileInformationByHandleEx(FileBasicInfo)",
+        code,
+    })?;
+    if basic.last_write_time_100ns != expect.last_write_time_100ns {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::TimeChanged));
+    }
+    let attrs = raw_volume::attr_tag(&handle).map_err(|code| CfError::Win32 {
+        operation: "GetFileInformationByHandleEx(FileAttributeTagInfo)",
+        code,
+    })?;
+    let is_directory = attrs.attributes & raw_volume::ATTR_DIRECTORY != 0;
+    if is_directory != identity.is_directory() {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::StateChanged));
+    }
+    let bytes = match raw::placeholder_identity(&handle) {
+        Ok(bytes) => bytes,
+        Err(code) if code == raw::ERROR_NOT_A_CLOUD_FILE => {
+            return Ok(GuardOutcome::Mismatch(GuardMismatch::NotPlaceholder));
+        }
+        Err(code) => {
+            return Err(CfError::Win32 {
+                operation: "CfGetPlaceholderInfo(FileIdentity)",
+                code,
+            });
+        }
+    };
+    if decode_readback(&bytes, Some(identity.workspace))? != Some(*identity) {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::IdentityChanged));
+    }
+    if resident_bytes_on_handle(&handle, standard.size)? != 0 {
+        return Ok(GuardOutcome::Mismatch(GuardMismatch::StateChanged));
+    }
+    raw_volume::mark_deleted(&handle).map_err(|code| CfError::Win32 {
+        operation: "SetFileInformationByHandle(FileDispositionInfo)",
+        code,
+    })?;
+    Ok(GuardOutcome::Applied { usn: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +779,7 @@ fn validate_placeholder_name(name: &str) -> CfResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfapi::identity::IdentityError;
     use hfdrive_core::ids::{ItemId, VersionId, WorkspaceId};
 
     #[test]
@@ -631,5 +802,105 @@ mod tests {
             after.identity.attributes,
             after.identity.reparse_tag,
         ).is_placeholder());
+    }
+
+    // -- placeholder identity read-back (no registration required) ------
+
+    #[test]
+    fn readback_of_a_plain_file_is_not_an_hfdr_placeholder() {
+        // End-to-end through the real handle path (no registration or
+        // placeholder needed): a normal file yields `None`, not an error and
+        // not a decoded identity.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("plain.txt");
+        std::fs::write(&path, b"plain bytes").unwrap();
+        assert_eq!(read_placeholder_identity(&path, None).unwrap(), None);
+        assert_eq!(
+            read_placeholder_identity(&path, Some(WorkspaceId::new())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn readback_returns_owned_identity_for_an_exact_hfdr_record() {
+        let workspace = WorkspaceId::new();
+        let id = PlaceholderIdentity::file(workspace, ItemId::new(), VersionId::new());
+        assert_eq!(
+            decode_readback(&id.encode(), Some(workspace)).unwrap(),
+            Some(id)
+        );
+        let dir = PlaceholderIdentity::directory(workspace, ItemId::new());
+        assert_eq!(decode_readback(&dir.encode(), Some(workspace)).unwrap(), Some(dir));
+        // Unknown workspace expectation still validates the record strictly.
+        assert_eq!(decode_readback(&id.encode(), None).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn readback_treats_foreign_and_wrong_length_records_as_not_hfdr() {
+        let workspace = WorkspaceId::new();
+        let id = PlaceholderIdentity::file(workspace, ItemId::new(), VersionId::new());
+        let bytes = id.encode();
+        // No identity at all, or a foreign provider's identity of any other
+        // length: never an HFDR placeholder, never decoded leniently.
+        assert_eq!(decode_readback(&[], Some(workspace)).unwrap(), None);
+        assert_eq!(decode_readback(&bytes[..52], Some(workspace)).unwrap(), None);
+        let mut foreign = bytes.to_vec();
+        foreign.extend_from_slice(&[0xA5; 7]);
+        assert_eq!(decode_readback(&foreign, Some(workspace)).unwrap(), None);
+    }
+
+    #[test]
+    fn readback_distinguishes_foreign_magic_from_invalid_hfdr_records() {
+        let workspace = WorkspaceId::new();
+        let id = PlaceholderIdentity::file(workspace, ItemId::new(), VersionId::new());
+        let bytes = id.encode();
+        // Wrong magic: another provider's record — foreign, not an error.
+        let mut foreign = bytes;
+        foreign[0] = b'X';
+        assert_eq!(decode_readback(&foreign, Some(workspace)).unwrap(), None);
+        // HFDR magic with an unsupported schema is a corrupt owned record.
+        let mut bad_schema = bytes;
+        bad_schema[4] = 2;
+        assert!(matches!(
+            decode_readback(&bad_schema, Some(workspace)),
+            Err(CfError::Identity(IdentityError::UnsupportedSchema { schema: 2 }))
+        ));
+        // HFDR magic with a nil item id is likewise corrupt, not foreign.
+        let mut nil_item = bytes;
+        nil_item[21..37].copy_from_slice(&[0u8; 16]);
+        assert!(matches!(
+            decode_readback(&nil_item, Some(workspace)),
+            Err(CfError::Identity(IdentityError::NilIdentifier))
+        ));
+    }
+
+    #[test]
+    fn readback_rejects_a_foreign_workspace_without_rebinding() {
+        let workspace = WorkspaceId::new();
+        let id = PlaceholderIdentity::file(workspace, ItemId::new(), VersionId::new());
+        // The record is valid HFDR but belongs to another workspace: this is
+        // an identity mismatch the unlink flow must refuse, not "not ours".
+        assert!(matches!(
+            decode_readback(&id.encode(), Some(WorkspaceId::new())),
+            Err(CfError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_replacement_object_survives_a_stale_delete_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.txt");
+        std::fs::write(&path, b"reviewed object").unwrap();
+        let expected = crate::filesystem::volume::query_file_state(&path).unwrap();
+        let identity = PlaceholderIdentity::file(
+            WorkspaceId::new(),
+            ItemId::new(),
+            VersionId::new(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement object must survive").unwrap();
+        let result = delete_owned_placeholder(&path, &expected, &identity).unwrap();
+        assert_eq!(result, GuardOutcome::Mismatch(GuardMismatch::IdentityChanged));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement object must survive");
     }
 }

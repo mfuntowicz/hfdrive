@@ -205,4 +205,19 @@ mod tests {
             Err(IdentityError::NilIdentifier)
         );
     }
+
+    #[test]
+    fn rejects_every_length_other_than_the_exact_record() {
+        let (workspace, item, version) = ids();
+        let bytes = PlaceholderIdentity::file(workspace, item, version).encode();
+        for wrong in [0usize, 1, 4, IDENTITY_LEN - 1, IDENTITY_LEN + 1, IDENTITY_LEN * 2] {
+            let mut buffer = bytes.to_vec();
+            buffer.resize(wrong, 0);
+            assert_eq!(
+                PlaceholderIdentity::decode(&buffer, Some(workspace)),
+                Err(IdentityError::BadLength),
+                "length {wrong} must be rejected"
+            );
+        }
+    }
 }

@@ -329,6 +329,19 @@ impl AccountStore {
             .await
     }
 
+    /// Unlinks one connection from this account. The account-local
+    /// `connections` row (cascading every connection-scoped work table) and
+    /// the abandonment of its setup intent commit in one account transaction;
+    /// the control-side connection mirror and `setup_registry` abandonment
+    /// follow in that order, so a crash leaves control residue that
+    /// [`StateStore::reconcile_connections`] repairs later. Only state rows
+    /// are removed: physical snapshots, recovery files and credential
+    /// envelopes are never touched.
+    pub async fn remove_connection(&self, connection_id: ConnectionId) -> Result<(), StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.remove_connection(account, connection_id)).await
+    }
+
     pub async fn baseline(&self, connection_id: ConnectionId) -> Result<PublicationBaseline, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.baseline(account, connection_id)).await
@@ -437,6 +450,20 @@ impl AccountStore {
         let (account, queue) = (self.account, self.queue.clone());
         queue
             .call(move |db| db.complete_outbox(account, connection_id, operation_id))
+            .await
+    }
+
+    /// Completes a delete intent only after the caller proved its item still
+    /// exists locally. This is convergence without a remote tombstone, not a
+    /// general-purpose shortcut through the publication state machine.
+    pub async fn complete_abandoned_delete(
+        &self,
+        connection_id: ConnectionId,
+        operation_id: OperationId,
+    ) -> Result<CompletionOutcome, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| db.complete_abandoned_delete(account, connection_id, operation_id))
             .await
     }
 
@@ -860,6 +887,17 @@ impl AccountStore {
     ) -> Result<Option<ItemRecord>, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.item(account, connection_id, item_id)).await
+    }
+
+    /// Root-to-item ancestry in one recursive database query. The caller
+    /// validates the root and depth so cycles never become local paths.
+    pub async fn item_ancestry(
+        &self,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+    ) -> Result<Vec<ItemRecord>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.item_ancestry(account, connection_id, item_id)).await
     }
 
     /// Resolves the item currently bound to a content version (live item

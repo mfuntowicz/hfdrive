@@ -146,6 +146,85 @@ public sealed class TypedSerializationTests
     }
 
     [Fact]
+    public void Unlink_Preview_Fields_Use_Snake_Case_And_Decimal_Sizes()
+    {
+        var result = new PrepareUnlinkResult
+        {
+            SafeToUnlink = false,
+            OnlineOnlyFiles = 12,
+            PartialFiles = 1,
+            DirtyFiles = 2,
+            ConflictFiles = 0,
+            RequiredExportBytes = 1048576,
+            BlockingReasons = Array.Empty<string>(),
+            PreviewId = Guid.Parse("99999999-9999-4999-8999-999999999999"),
+            PreviewFingerprint = "opaque-preview-fingerprint",
+            OnlineOnlyDataLoss = true,
+            AffectedFiles = new[]
+            {
+                new UnlinkFileResult { Path = "docs\\a.bin", Size = 1048576, Partial = false },
+                new UnlinkFileResult { Path = "b.txt", Size = 0, Partial = true },
+            },
+        };
+        var text = Encoding.UTF8.GetString(ProtocolJson.SerializeCanonical(result));
+        Assert.Equal(
+            "{\"affected_files\":[{\"partial\":false,\"path\":\"docs\\\\a.bin\",\"size\":\"1048576\"},"
+            + "{\"partial\":true,\"path\":\"b.txt\",\"size\":\"0\"}],"
+            + "\"blocking_reasons\":[],\"conflict_files\":0,\"dirty_files\":2,"
+            + "\"online_only_data_loss\":true,\"online_only_files\":12,\"partial_files\":1,"
+            + "\"preview_fingerprint\":\"opaque-preview-fingerprint\","
+            + "\"preview_id\":\"99999999-9999-4999-8999-999999999999\","
+            + "\"required_export_bytes\":\"1048576\",\"safe_to_unlink\":false}",
+            text);
+
+        // Round-trip: every new field survives the managed codec unchanged.
+        var roundTrip = ProtocolJson.Deserialize<PrepareUnlinkResult>(Encoding.UTF8.GetBytes(text));
+        Assert.Equal(result.PreviewId, roundTrip.PreviewId);
+        Assert.Equal(result.PreviewFingerprint, roundTrip.PreviewFingerprint);
+        Assert.True(roundTrip.OnlineOnlyDataLoss);
+        Assert.Equal(2, roundTrip.AffectedFiles.Count);
+        Assert.Equal("docs\\a.bin", roundTrip.AffectedFiles[0].Path);
+        Assert.Equal(1048576ul, roundTrip.AffectedFiles[0].Size);
+        Assert.False(roundTrip.AffectedFiles[0].Partial);
+        Assert.True(roundTrip.AffectedFiles[1].Partial);
+    }
+
+    [Fact]
+    public void Unlink_Request_Binds_A_Fresh_Operation_To_The_Reviewed_Preview()
+    {
+        var request = new UnlinkRequest
+        {
+            OperationId = Guid.Parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ConnectionId = Guid.Parse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            Mode = UnlinkMode.RemoveUnavailable,
+            PreviewId = Guid.Parse("99999999-9999-4999-8999-999999999999"),
+            AcceptOnlineOnlyDataLoss = true,
+        };
+        var text = Encoding.UTF8.GetString(ProtocolJson.SerializeCanonical(request));
+        Assert.Equal(
+            "{\"accept_online_only_data_loss\":true,"
+            + "\"connection_id\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\","
+            + "\"mode\":\"remove_unavailable\","
+            + "\"operation_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\","
+            + "\"preview_id\":\"99999999-9999-4999-8999-999999999999\"}",
+            text);
+        // The durable operation id is a fresh mutation id, never the preview id.
+        Assert.NotEqual(request.PreviewId, request.OperationId);
+    }
+
+    [Fact]
+    public void UnlinkMode_Wire_Names_Match_The_Contract()
+    {
+        Assert.Equal("\"safe_remove\"", Encoding.UTF8.GetString(ProtocolJson.SerializeCanonical(UnlinkMode.SafeRemove)));
+        Assert.Equal("\"disconnect_keep_registration\"",
+            Encoding.UTF8.GetString(ProtocolJson.SerializeCanonical(UnlinkMode.DisconnectKeepRegistration)));
+        Assert.Equal("\"remove_unavailable\"",
+            Encoding.UTF8.GetString(ProtocolJson.SerializeCanonical(UnlinkMode.RemoveUnavailable)));
+        Assert.Equal(UnlinkMode.RemoveUnavailable,
+            ProtocolJson.Deserialize<UnlinkMode>("\"remove_unavailable\""u8));
+    }
+
+    [Fact]
     public void Error_Code_Wire_Names_Match_The_Contract()
     {
         Assert.Equal("needs_sign_in", ProtocolErrorCodeConverter.CodeToWire(ProtocolErrorCode.NeedsSignIn));

@@ -195,6 +195,9 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     /// in-flight dispatch instead of guessing at pause timing.
     dispatch: tokio::sync::Mutex<()>,
     pump: tokio::sync::Mutex<Option<PumpHandle>>,
+    /// Synchronous only for storing/taking the join handle; never held across
+    /// an await. Disconnect joins this worker after cancelling its token.
+    worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     disconnect_failure: tokio::sync::Mutex<Option<DisconnectError>>,
     observer: tokio::sync::Mutex<Option<LocalObserver>>,
     observation_tx: tokio::sync::Mutex<Option<mpsc::Sender<crate::sync::observe::ObservationBatch>>>,
@@ -232,6 +235,9 @@ pub enum DisconnectError {
     /// The pump task itself did not run to a result.
     #[error("the pump task did not complete")]
     PumpTaskFailed,
+    /// The observation/scan/drive worker did not terminate normally.
+    #[error("the connection drive worker did not complete")]
+    DriveTaskFailed,
 }
 
 /// Why an unlink cannot proceed safely. `files` lists the affected paths so
@@ -246,26 +252,6 @@ pub struct UnlinkBlocked {
 impl UnlinkBlocked {
     pub fn new(reason: &'static str) -> Self {
         Self { reason, files: Vec::new() }
-    }
-}
-
-/// Exports one dirty local file to the durable recovery area outside every
-/// sync root. The source is untouched; the copy is the preservation proof.
-fn export_dirty_file(source: &std::path::Path, recovery_dir: &std::path::Path) -> Result<(), &'static str> {
-    match std::fs::metadata(source) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
-            std::fs::create_dir_all(recovery_dir).map_err(|_| "recovery area unavailable")?;
-            let name = source
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unnamed".to_owned());
-            let target = recovery_dir.join(format!("unlink-{name}"));
-            std::fs::copy(source, &target)
-                .map(|_| ())
-                .map_err(|_| "exporting dirty bytes failed")
-        }
-        // Nothing resident to lose (directory, empty file or gone).
-        _ => Ok(()),
     }
 }
 
@@ -349,23 +335,28 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
     ) -> impl Future<Output = Result<(), &'static str>> + Send {
         let source = self.config.root.join(relative_path);
         let recovery = self.config.recovery_dir.clone();
+        let label = relative_path.to_string_lossy().replace(['\\', '/'], "_");
+        let display = relative_path.to_string_lossy().into_owned();
         async move {
-            match std::fs::metadata(&source) {
-                Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
-                    std::fs::create_dir_all(&recovery)
-                        .map_err(|_| "recovery area unavailable")?;
-                    let target = recovery.join(format!(
-                        "delete-{}.recovered",
-                        relative_path.to_string_lossy().replace(['\\', '/'], "_")
-                    ));
-                    std::fs::copy(&source, &target)
-                        .map(|_| ())
-                        .map_err(|_| "preserving dirty bytes failed")
-                }
-                // Nothing resident to lose (directory, empty file or gone):
-                // preservation is trivially satisfied.
-                _ => Ok(()),
-            }
+            // Unique, metadata-checked, hash-verified recovery copy: a
+            // colliding name never overwrites earlier preserved bytes and a
+            // copy that cannot be verified never counts as preserved.
+            crate::sync::recovery::preserve_item_bytes(&source, &recovery, &label, &display)
+                .map(|_| ())
+                .map_err(|error| match error {
+                    crate::sync::recovery::RecoveryError::AreaUnavailable => {
+                        "recovery area unavailable"
+                    }
+                    crate::sync::recovery::RecoveryError::SourceGone => "the source file is gone",
+                    crate::sync::recovery::RecoveryError::SourceChanged => {
+                        "the source changed while being preserved"
+                    }
+                    crate::sync::recovery::RecoveryError::Unreadable => "preserving dirty bytes failed",
+                    crate::sync::recovery::RecoveryError::WriteFailed => "preserving dirty bytes failed",
+                    crate::sync::recovery::RecoveryError::DigestMismatch => {
+                        "the recovery copy does not match the source bytes"
+                    }
+                })
         }
     }
 
@@ -408,13 +399,12 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
         let state = self.state.clone();
         let connection = self.config.connection_id;
         async move {
-            state
-                .observation(connection, item_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|observation| observation.dirty)
-                .unwrap_or(false)
+            match state.observation(connection, item_id).await {
+                Ok(Some(observation)) => observation.dirty,
+                Ok(None) => false,
+                // A missing cleanliness proof is never proof of clean data.
+                Err(_) => true,
+            }
         }
     }
 
@@ -422,42 +412,55 @@ impl<R: RemoteOps> crate::sync::cfapi_pump::PumpHost<R> for ConnectionRuntime<R>
         let state = self.state.clone();
         let connection = self.config.connection_id;
         let root = self.config.root.clone();
+        let persistence_failed = &self.persistence_failed;
         async move {
-            let Ok(entries) = state.list_outbox(connection, None, u32::MAX).await else {
-                return;
+            let fail = || persistence_failed.store(true, Ordering::Release);
+            let entries = match state.list_outbox(connection, None, u32::MAX).await {
+                Ok(entries) => entries,
+                Err(_) => {
+                    fail();
+                    return;
+                }
             };
             for entry in entries {
-                if !matches!(entry.state, OutboxState::Observed) {
+                if !matches!(
+                    entry.state,
+                    OutboxState::Observed | OutboxState::Published | OutboxState::LocalApplyPending
+                ) {
                     continue;
                 }
-                let Some(intent) = parse_intent(&entry).ok() else { continue; };
+                let intent = match parse_intent(&entry) {
+                    Ok(intent) => intent,
+                    Err(_) => {
+                        fail();
+                        continue;
+                    }
+                };
                 if !matches!(intent, SyncIntent::Delete { .. }) {
                     continue;
                 }
                 let Some(path) = registry_path(&state, connection, intent.item_id()).await else {
+                    fail();
                     continue;
                 };
-                if root.join(&path).symlink_metadata().is_ok() {
-                    // The delete was abandoned: close the intent as converged
-                    // instead of publishing a tombstone for a live file.
-                    let _ = state
-                        .transition_outbox(
-                            connection,
-                            entry.operation_id,
-                            hfdrive_state::OutboxTransition::Published,
-                        )
-                        .await;
-                    let _ = state
-                        .transition_outbox(
-                            connection,
-                            entry.operation_id,
-                            hfdrive_state::OutboxTransition::LocalApplyPending,
-                        )
-                        .await;
-                    let _ = crate::sync::apply::complete_publication(
-                        &state, connection, entry.operation_id,
-                    )
-                    .await;
+                match root.join(&path).symlink_metadata() {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        fail();
+                        continue;
+                    }
+                }
+                // The delete was abandoned: a dedicated state operation
+                // validates the delete intent and closes it with the normal
+                // generation guard. No remote tombstone or fabricated CAS
+                // evidence is produced, and every failure remains retryable.
+                if state
+                    .complete_abandoned_delete(connection, entry.operation_id)
+                    .await
+                    .is_err()
+                {
+                    fail();
                 }
             }
         }
@@ -543,6 +546,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             pending_removals: tokio::sync::Mutex::new(PendingRemovals::default()),
             dispatch: tokio::sync::Mutex::new(()),
             pump: tokio::sync::Mutex::new(None),
+            worker: std::sync::Mutex::new(None),
             disconnect_failure: tokio::sync::Mutex::new(None),
             observer: tokio::sync::Mutex::new(None),
             observation_tx: tokio::sync::Mutex::new(Some(observation_tx)),
@@ -556,7 +560,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         // Worker loop.
         let worker = runtime.clone();
         let worker_cancel = cancel.clone();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut notifications_open = true;
@@ -606,6 +610,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 worker.drive().await;
             }
         });
+        *runtime.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker_task);
         runtime
     }
 
@@ -664,29 +669,45 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     /// continue their remaining cleanup, but must not report a successful
     /// disconnect when this returns an error.
     pub async fn disconnect(&self) -> Result<(), DisconnectError> {
-        if let Some(error) = self.disconnect_failure.lock().await.clone() {
-            return Err(error);
-        }
+        let previous = self.disconnect_failure.lock().await.clone();
+        // This also covers the no-pump recovery path: the drive worker must
+        // not retain an Arc and continue scans or uploads after disconnect.
+        self.cancel.cancel();
         if let Some(observer) = self.observer.lock().await.take() {
             observer.shutdown().await;
         }
-        // Take the handle and release the pump lock before awaiting the
-        // drain: nothing else may hold this mutex across a worker join.
-        let taken = self.pump.lock().await.take();
-        let Some(handle) = taken else {
-            return Ok(());
-        };
-        handle.token.cancel();
-        let result = match handle.task.await {
-            Ok(outcome) => match (outcome.disconnect, outcome.worker_panicked) {
-                (Err(code), _) => Err(DisconnectError::Disconnect { code }),
-                (Ok(()), true) => Err(DisconnectError::WorkerPanicked),
-                (Ok(()), false) => Ok(()),
-            },
-            Err(error) => {
-                tracing::error!(%error, "pump task did not complete");
-                Err(DisconnectError::PumpTaskFailed)
+        // Take handles and release their mutexes before awaiting either join.
+        let pump_result = if let Some(handle) = self.pump.lock().await.take() {
+            handle.token.cancel();
+            match handle.task.await {
+                Ok(outcome) => match (outcome.disconnect, outcome.worker_panicked) {
+                    (Err(code), _) => Err(DisconnectError::Disconnect { code }),
+                    (Ok(()), true) => Err(DisconnectError::WorkerPanicked),
+                    (Ok(()), false) => Ok(()),
+                },
+                Err(error) => {
+                    tracing::error!(%error, "pump task did not complete");
+                    Err(DisconnectError::PumpTaskFailed)
+                }
             }
+        } else {
+            Ok(())
+        };
+        let worker = self.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        let worker_result = if let Some(task) = worker {
+            match task.await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    tracing::error!(%error, "connection drive worker did not complete");
+                    Err(DisconnectError::DriveTaskFailed)
+                }
+            }
+        } else {
+            Ok(())
+        };
+        let result = match previous {
+            Some(error) => Err(error),
+            None => pump_result.and(worker_result),
         };
         if let Err(error) = &result {
             *self.disconnect_failure.lock().await = Some(error.clone());
@@ -697,16 +718,319 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         result
     }
 
-    /// Exports one dirty local file to the durable recovery area before a
-    /// destructive local action. The source is left untouched.
+    /// Preserves one dirty local file to the durable recovery area before a
+    /// destructive local action. The source is left untouched; the copy is
+    /// unique, metadata-checked and hash-verified.
     fn export_dirty_bytes(&self, relative_path: &std::path::Path) -> Result<(), &'static str> {
-        export_dirty_file(&self.config.root.join(relative_path), &self.config.recovery_dir)
+        let source = self.config.root.join(relative_path);
+        let label = relative_path.to_string_lossy().replace(['\\', '/'], "_");
+        let display = relative_path.to_string_lossy().into_owned();
+        crate::sync::recovery::preserve_item_bytes(&source, &self.config.recovery_dir, &label, &display)
+            .map(|_| ())
+            .map_err(|error| match error {
+                crate::sync::recovery::RecoveryError::AreaUnavailable => "recovery area unavailable",
+                crate::sync::recovery::RecoveryError::SourceGone => "the source file is gone",
+                crate::sync::recovery::RecoveryError::SourceChanged => {
+                    "the source changed while being preserved"
+                }
+                crate::sync::recovery::RecoveryError::Unreadable => {
+                    "the source could not be read for preservation"
+                }
+                crate::sync::recovery::RecoveryError::WriteFailed => "exporting dirty bytes failed",
+                crate::sync::recovery::RecoveryError::DigestMismatch => {
+                    "the recovery copy does not match the source bytes"
+                }
+            })
     }
 
     /// True when the recovery area exists or can be created: without it no
     /// dirty content can be preserved before a destructive action.
     pub fn recovery_area_ready(&self) -> bool {
         std::fs::create_dir_all(&self.config.recovery_dir).is_ok()
+    }
+
+    /// Stops live filesystem observation (watcher, USN catch-up and scan
+    /// scheduling) before any provider-driven deletion. Provider deletions
+    /// after this point can never become remote delete intents: the watcher
+    /// that would observe them is already shut down and joined.
+    pub(crate) async fn stop_observation(&self) {
+        if let Some(observer) = self.observer.lock().await.take() {
+            observer.shutdown().await;
+        }
+    }
+
+    /// Preserves dirty local bytes before a lossy removal as unique,
+    /// metadata-checked, hash-verified recovery copies in the recovery area
+    /// outside every sync root. Returns the paths of every file that held
+    /// unsynchronized content (all of them now preserved); a preservation
+    /// failure is a block naming the file, never a silent skip.
+    pub(crate) async fn preserve_dirty_before_removal(&self) -> Result<Vec<String>, UnlinkBlocked> {
+        let mut preserved = Vec::new();
+        let items = self
+            .state
+            .list_all_items(self.config.connection_id, true)
+            .await
+            .map_err(|_| UnlinkBlocked::new("durable state is unavailable"))?;
+        for item in items {
+            if item.deleted {
+                continue;
+            }
+            let Some(path) = registry_path(&self.state, self.config.connection_id, item.item_id).await
+            else {
+                return Err(UnlinkBlocked::new("durable state is unavailable"));
+            };
+            let dirty = match self.state.observation(self.config.connection_id, item.item_id).await {
+                Ok(Some(observation)) => observation.dirty,
+                Ok(None) => false,
+                Err(_) => return Err(UnlinkBlocked::new("durable state is unavailable")),
+            };
+            if !dirty {
+                continue;
+            }
+            if self.export_dirty_bytes(&path).is_err() {
+                return Err(UnlinkBlocked {
+                    reason: "unsynchronized content could not be exported",
+                    files: vec![path.to_string_lossy().into_owned()],
+                });
+            }
+            preserved.push(path.to_string_lossy().into_owned());
+        }
+        // Interrupted local actions may still carry unpreserved source bytes.
+        let actions = self
+            .state
+            .list_local_actions(self.config.connection_id, Some(LocalActionState::Pending))
+            .await
+            .map_err(|_| UnlinkBlocked::new("durable state is unavailable"))?;
+        for action in actions {
+            if let Some(source) = &action.source_path {
+                if self.export_dirty_bytes(source).is_err() {
+                    return Err(UnlinkBlocked {
+                        reason: "unsynchronized content could not be exported",
+                        files: vec![source.to_string_lossy().into_owned()],
+                    });
+                }
+                preserved.push(source.to_string_lossy().into_owned());
+            }
+        }
+        Ok(preserved)
+    }
+
+    /// Abandons the reviewed clean zero-residency placeholders of a lossy
+    /// removal. Every deletion is re-guarded immediately before it runs:
+    ///
+    /// 1. **live inspection**: the entry's current metadata must be readable;
+    /// 2. **execution-time cleanliness**: the pure rule
+    ///    [`crate::sync::engine::abandonable`] is re-applied to the live
+    ///    entry's facts — partial residency, durable dirty state or an
+    ///    unresolved conflict **now** means the entry is preserved untouched;
+    /// 3. **HFDR ownership**: the entry must still be this connection's
+    ///    placeholder — the inline identity must decode for this workspace
+    ///    and agree with the registry item and content version;
+    /// 4. **exact identity**: NTFS volume serial, 128-bit file id, size and
+    ///    last-write time must match the reviewed plan entry exactly;
+    /// 5. **zero residency**: `CfGetPlaceholderRangeInfo` must report
+    ///    `resident_bytes == 0` — a partially hydrated entry is never deleted;
+    /// 6. **shape**: files are removed with `remove_file`, directories with
+    ///    `remove_dir` — deepest first, never `remove_dir_all`.
+    ///
+    /// Any refusal blocks the unlink naming the entry; the plan's
+    /// `partial_files == 0` precondition is additionally re-checked here.
+    pub(crate) async fn abandon_unavailable(
+        &self,
+        plan: &crate::sync::engine::UnlinkPlan,
+        plan_current: bool,
+    ) -> Result<(), UnlinkBlocked> {
+        if plan.partial_files > 0 {
+            return Err(UnlinkBlocked::new(
+                "partially resident files cannot be abandoned; hydrate, export or resolve them first",
+            ));
+        }
+        // Execution-time conflict evidence, collected once: an entry whose
+        // conflict is still unresolved is never deleted.
+        let mut conflicted: std::collections::BTreeSet<ItemId> = std::collections::BTreeSet::new();
+        for conflict in self
+            .state
+            .list_conflicts(self.config.connection_id)
+            .await
+            .map_err(|_| UnlinkBlocked::new("durable state is unavailable"))?
+        {
+            if conflict.resolution_state == hfdrive_state::ConflictResolution::Unresolved {
+                conflicted.insert(conflict.item_id);
+            }
+        }
+        // Deepest entries first: children before their directories.
+        let mut order: Vec<&crate::sync::engine::UnlinkFile> = plan.abandon.iter().collect();
+        order.sort_by(|a, b| {
+            b.path.components()
+                .count()
+                .cmp(&a.path.components().count())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for file in order {
+            let absolute = self.config.root.join(&file.path);
+            let display = file.path.to_string_lossy().into_owned();
+            let blocked = |reason: &'static str| UnlinkBlocked {
+                reason,
+                files: vec![display.clone()],
+            };
+            // 1. Live inspection first; a missing entry is decided by the
+            //    pure rule (idempotent only while the reviewed plan is
+            //    current), never assumed to be success by a failed query.
+            let live = match query_file_state(&absolute) {
+                Ok(live) => live,
+                Err(hfdrive_windows::filesystem::FsError::NotFound { .. }) => {
+                    // Already in its end state: deleted or never present.
+                    match crate::sync::engine::abandon_delete_verdict(None, file, plan_current) {
+                        crate::sync::engine::AbandonVerdict::AlreadyGone => continue,
+                        crate::sync::engine::AbandonVerdict::Proceed => {
+                            return Err(blocked("the entry vanished before deletion; prepare a fresh preview"));
+                        }
+                        crate::sync::engine::AbandonVerdict::Preserve(reason) => {
+                            return Err(blocked(reason));
+                        }
+                    }
+                }
+                Err(_) => return Err(blocked("the entry cannot be inspected")),
+            };
+            // 2. Execution-time state cleanliness, decided before any
+            //    ownership question: dirty or conflicted content is never
+            //    deleted whatever its shape, and partial residency blocks the
+            //    same way. The pure rule decides; the preserve verdict names
+            //    why the entry is kept.
+            let placeholder = hfdrive_windows::filesystem::volume::placeholder_state(
+                live.identity.attributes,
+                live.identity.reparse_tag,
+            );
+            let partial_state = live.size > 0
+                && live.identity.may_not_be_materialized()
+                && placeholder.is_partially_on_disk();
+            let dirty = match self.state.observation(self.config.connection_id, file.item_id).await {
+                Ok(Some(observation)) => observation.dirty,
+                Ok(None) => false,
+                Err(_) => return Err(blocked("durable state is unavailable")),
+            };
+            if !crate::sync::engine::abandonable(partial_state, dirty, conflicted.contains(&file.item_id)) {
+                return Err(blocked("the entry is no longer clean and zero-residency at execution time; it is preserved untouched"));
+            }
+            // 3. HFDR ownership and registry agreement — required before any
+            //    reversion or abandonment; NTFS identity alone is not enough.
+            match hfdrive_windows::cfapi::read_placeholder_identity(
+                &absolute,
+                Some(self.config.workspace),
+            ) {
+                Ok(Some(identity))
+                    if identity.item == file.item_id && identity.version == file.version_id => {}
+                Ok(Some(_)) | Ok(None) => {
+                    return Err(blocked("the entry is no longer this connection's placeholder; it is preserved untouched"));
+                }
+                Err(_) => {
+                    return Err(blocked("the entry cannot be verified as this connection's placeholder; it is preserved untouched"));
+                }
+            }
+            // 4. Real range evidence, never recall attributes alone: zero
+            //    residency is proven by `resident_bytes == 0` inside the rule,
+            //    and partial residency is the same range fact.
+            let resident = hfdrive_windows::cfapi::ops::resident_bytes(&absolute, live.size)
+                .map_err(|_| blocked("the entry's residency cannot be inspected"))?;
+            let partial = live.size > 0 && placeholder.is_placeholder() && resident > 0 && resident < live.size;
+            // 5. The pure guarded-deletion rule: identity/size/mtime match,
+            //    clean (not partial/dirty/conflicted) and `resident == 0`.
+            let facts = crate::sync::engine::AbandonLiveFacts {
+                volume_serial_number: live.identity.volume_serial_number,
+                file_id: live.identity.file_id,
+                size: live.size,
+                last_write_time_100ns: live.last_write_time_100ns,
+                resident_bytes: resident,
+                partial,
+                dirty,
+                conflicted: conflicted.contains(&file.item_id),
+            };
+            match crate::sync::engine::abandon_delete_verdict(Some(facts), file, plan_current) {
+                crate::sync::engine::AbandonVerdict::Proceed => {}
+                crate::sync::engine::AbandonVerdict::AlreadyGone => continue,
+                crate::sync::engine::AbandonVerdict::Preserve(reason) => return Err(blocked(reason)),
+            }
+            // 6. Verify and delete the exact same open object. The handle
+            // denies write/delete sharing, and every identity/HFDR/residency
+            // check above is repeated through it before deletion is marked.
+            let identity = match file.version_id {
+                Some(version) => hfdrive_windows::cfapi::identity::PlaceholderIdentity::file(
+                    self.config.workspace,
+                    file.item_id,
+                    version,
+                ),
+                None => hfdrive_windows::cfapi::identity::PlaceholderIdentity::directory(
+                    self.config.workspace,
+                    file.item_id,
+                ),
+            };
+            match hfdrive_windows::cfapi::ops::delete_owned_placeholder(&absolute, &live, &identity) {
+                Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Applied { .. }) => {}
+                Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Mismatch(_)) => {
+                    return Err(blocked("the entry changed before deletion; it is preserved for inspection"));
+                }
+                Err(_) if matches!(
+                    absolute.symlink_metadata(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ) => {
+                    // The entry vanished before its handle could be opened:
+                    // idempotent only while the reviewed plan is current.
+                    if !plan_current {
+                        return Err(blocked("the entry vanished and the reviewed plan is no longer current; prepare a fresh preview"));
+                    }
+                }
+                Err(_) => {
+                    return Err(blocked("the entry could not be removed; it is preserved for inspection"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete live residue scan run before unregistration: after
+    /// conversion/deletion the on-disk root must contain no provider-managed
+    /// placeholder residue. The scan is a full metadata walk (never content
+    /// reads) and must complete: a denied directory or overflowed budget
+    /// blocks unregistration instead of hiding residue. Every reviewed
+    /// abandoned entry must also be verifiably gone.
+    pub(crate) fn live_residue(
+        &self,
+        abandoned: &[crate::sync::engine::UnlinkFile],
+    ) -> Result<(), UnlinkBlocked> {
+        for file in abandoned {
+            if self.config.root.join(&file.path).symlink_metadata().is_ok() {
+                return Err(UnlinkBlocked {
+                    reason: "an abandoned entry is still present after removal",
+                    files: vec![file.path.to_string_lossy().into_owned()],
+                });
+            }
+        }
+        use hfdrive_windows::filesystem::{MetadataEntry, ScanBudget, VisitFlow, scan_metadata};
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut residue: Vec<String> = Vec::new();
+        let mut visit = |entry: &MetadataEntry| {
+            if entry.placeholder.is_placeholder() || entry.placeholder.is_sync_root() {
+                if residue.len() < 32 {
+                    residue.push(entry.relative_path.to_string_lossy().into_owned());
+                }
+            }
+            VisitFlow::Continue
+        };
+        let report = scan_metadata(&self.config.root, &ScanBudget::default(), &cancel, &mut visit)
+            .map_err(|_| UnlinkBlocked::new("the live residue scan could not walk the root"))?;
+        if !report.complete {
+            return Err(UnlinkBlocked {
+                reason: "the live residue scan could not prove the root is clean; unregistration is withheld",
+                files: report.denied.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
+            });
+        }
+        if !residue.is_empty() {
+            return Err(UnlinkBlocked {
+                reason: "managed placeholder residue remains in the root; unregistration is withheld",
+                files: residue,
+            });
+        }
+        Ok(())
     }
 
     /// Preserves every required item before unlink, then converts fully
@@ -795,21 +1119,25 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 continue;
             };
             let absolute = self.config.root.join(&path);
-            let Ok(live) = query_file_state(&absolute) else {
-                online_only.push(path.to_string_lossy().into_owned());
-                continue;
+            let live = match query_file_state(&absolute) {
+                Ok(live) => live,
+                // Already absent: nothing to hydrate; the entry is in its
+                // desired end state. Idempotent, never a block.
+                Err(hfdrive_windows::filesystem::FsError::NotFound { .. }) => continue,
+                Err(_) => {
+                    online_only.push(path.to_string_lossy().into_owned());
+                    continue;
+                }
             };
             if live.identity.may_not_be_materialized() && live.size > 0 {
                 let range = hfdrive_core::storage::ByteRange::new(0, live.size, live.size)
                     .map_err(|_| UnlinkBlocked::new("placeholder size exceeds the range bound"))?;
                 let hydrated = hfdrive_windows::cfapi::ops::hydrate_range(&absolute, range)
-                    .and_then(|_| query_file_state(&absolute).map_err(|_| {
-                        hfdrive_windows::cfapi::CfError::Precondition("hydrated placeholder became unreadable")
-                    }));
-                let resident = match hydrated {
-                    Ok(after) => !after.identity.may_not_be_materialized(),
-                    Err(_) => false,
-                };
+                    .and_then(|_| hfdrive_windows::cfapi::ops::resident_bytes(&absolute, live.size));
+                // Residency is proven from real on-disk ranges, never recall
+                // attributes: every byte must be resident for the entry to
+                // count as hydrated.
+                let resident = matches!(hydrated, Ok(size) if size >= live.size);
                 if !resident {
                     online_only.push(path.to_string_lossy().into_owned());
                 }
@@ -858,7 +1186,14 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     /// `Applied { usn: Some(_) }` records a conversion that landed just now;
     /// `Applied { usn: None }` is the already-normal fast path or a
     /// conversion on a volume without a journal after the fact.
-    pub async fn revert_placeholders_to_normal(&self) -> Result<(), UnlinkBlocked> {
+    ///
+    /// `skip` names the items a lossy removal will abandon: those stay
+    /// placeholders until the guarded abandonment converts nothing and
+    /// deletes them. Every other managed entry is converted here.
+    pub async fn revert_placeholders_to_normal(
+        &self,
+        skip: &std::collections::BTreeSet<ItemId>,
+    ) -> Result<(), UnlinkBlocked> {
         let mut blocked: Vec<String> = Vec::new();
         let mut no_usn_evidence: Vec<String> = Vec::new();
         let mut unverified: Vec<String> = Vec::new();
@@ -868,7 +1203,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             .await
             .map_err(|_| UnlinkBlocked::new("durable state is unavailable"))?
         {
-            if item.deleted {
+            if item.deleted || skip.contains(&item.item_id) {
                 continue;
             }
             let Some(path) = registry_path(&self.state, self.config.connection_id, item.item_id).await
@@ -877,9 +1212,15 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 continue;
             };
             let absolute = self.config.root.join(&path);
-            let Ok(live) = query_file_state(&absolute) else {
-                unverified.push(path.to_string_lossy().into_owned());
-                continue;
+            let live = match query_file_state(&absolute) {
+                Ok(live) => live,
+                // Already absent: nothing to convert; the entry is in its
+                // desired end state. Idempotent, never a block.
+                Err(hfdrive_windows::filesystem::FsError::NotFound { .. }) => continue,
+                Err(_) => {
+                    unverified.push(path.to_string_lossy().into_owned());
+                    continue;
+                }
             };
             let placeholder = hfdrive_windows::filesystem::volume::placeholder_state(
                 live.identity.attributes,
@@ -889,6 +1230,28 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 // Already a normal file: conversion is idempotent and needs
                 // no OS call (`Applied { usn: None }` fast path).
                 continue;
+            }
+            // HFDR ownership is proven before any reversion: only a
+            // placeholder whose inline identity decodes for this connection's
+            // workspace and agrees with the registry item and content version
+            // is ever converted. A foreign, unknown or unreadable placeholder
+            // is preserved untouched and blocks unregistration — NTFS
+            // identity alone never authorizes a change to it.
+            match hfdrive_windows::cfapi::read_placeholder_identity(
+                &absolute,
+                Some(self.config.workspace),
+            ) {
+                Ok(Some(identity))
+                    if identity.item == item.item_id
+                        && identity.version == item.content_version_id => {}
+                Ok(Some(_)) | Ok(None) => {
+                    blocked.push(path.to_string_lossy().into_owned());
+                    continue;
+                }
+                Err(_) => {
+                    unverified.push(path.to_string_lossy().into_owned());
+                    continue;
+                }
             }
             match hfdrive_windows::cfapi::revert_to_normal(&absolute, &live) {
                 Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Applied { .. }) => {
@@ -1689,13 +2052,15 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 }
                 crate::sync::apply::RecoveryDecision::Retry => {}
                 crate::sync::apply::RecoveryDecision::PreserveFirst => {
-                    if let Some(source) = &action.source_path {
-                        let _ = crate::sync::apply::preserve_dirty(
-                            &self.config.root.join(source),
-                            &self.config.recovery_dir,
-                            action.action_id,
-                        );
-                    }
+                    let source = action.source_path.as_ref().ok_or(
+                        PublishError::LocalApply("recovery action has no source path to preserve"),
+                    )?;
+                    crate::sync::apply::preserve_dirty(
+                        &self.config.root.join(source),
+                        &self.config.recovery_dir,
+                        action.action_id,
+                    )
+                    .map_err(PublishError::LocalApply)?;
                 }
                 crate::sync::apply::RecoveryDecision::Requeue => {
                     self.state
@@ -1705,6 +2070,11 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                             LocalActionState::Requeued,
                         )
                         .await?;
+                    // Requeued is terminal for the interrupted action. Fresh
+                    // local work is derived by a complete scan, not by blind
+                    // replay and not by leaving the old row pending forever.
+                    self.scan_requested.store(true, Ordering::Release);
+                    self.reconcile_requested.store(true, Ordering::Release);
                     requeued += 1;
                 }
             }
@@ -1750,25 +2120,15 @@ pub async fn registry_path(
     connection: ConnectionId,
     item_id: ItemId,
 ) -> Option<PathBuf> {
-    let mut components = Vec::new();
-    let mut current = Some(item_id);
-    let mut depth = 0;
-    while let Some(id) = current {
-        if depth > 512 {
-            return None;
-        }
-        let item = state.item(connection, id).await.ok()??;
-        if item.parent_id.is_none() {
-            break;
-        }
-        components.push(item.name.clone());
-        current = item.parent_id;
-        depth += 1;
+    let ancestry = state.item_ancestry(connection, item_id).await.ok()?;
+    // A valid path starts at a root and remains within the format's depth
+    // bound. Cycles/overflows return no path instead of a partial prefix.
+    if ancestry.is_empty() || ancestry.len() > 513 || ancestry[0].parent_id.is_some() {
+        return None;
     }
-    components.reverse();
     let mut path = PathBuf::new();
-    for component in components {
-        path.push(component);
+    for item in ancestry.iter().skip(1) {
+        path.push(&item.name);
     }
     Some(path)
 }
@@ -1938,5 +2298,447 @@ mod tests {
         connection.cancel();
         assert_eq!(pump_liveness(&connection, Some(&handle)), RuntimeState::Cancelled);
         assert!(!pump_liveness(&connection, Some(&handle)).is_active());
+    }
+
+    // ---- unlink safety regressions ---------------------------
+
+    /// Builds one runtime over the real fixture, paused so no remote work runs.
+    fn unlink_runtime(
+        fixture: &crate::sync::test_support::TestConnection,
+    ) -> (Arc<ConnectionRuntime<crate::sync::test_support::HeadOnlyRemote>>, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let (_notifications, receiver) = mpsc::channel(1);
+        let runtime = ConnectionRuntime::start(
+            ConnectionConfig {
+                connection_id: fixture.connection,
+                workspace: fixture.workspace,
+                root_item_id: fixture.root_item,
+                device_id: DeviceId::new(),
+                root: fixture.root.clone(),
+                staging_dir: fixture.directory.path().join("snapshots"),
+                recovery_dir: fixture.directory.path().join("recovery"),
+                mode: hfdrive_state::ConnectionMode::Writable,
+                start_paused: true,
+            },
+            fixture.account.clone(),
+            crate::sync::test_support::HeadOnlyRemote::default(),
+            Arc::new(Scheduler::new(Default::default())),
+            Arc::new(crate::sync::activity::ActivityRegistry::new()),
+            cancel.clone(),
+            receiver,
+        );
+        (runtime, cancel)
+    }
+
+    /// Registers one registry item with a real local file at `path`.
+    async fn local_item(fixture: &crate::sync::test_support::TestConnection, path: &str) -> ItemId {
+        let item_id = ItemId::new();
+        fixture
+            .account
+            .upsert_item(hfdrive_state::ItemRecord {
+                connection_id: fixture.connection,
+                item_id,
+                parent_id: Some(fixture.root_item),
+                name: path.to_owned(),
+                name_key: path.to_owned(),
+                kind: hfdrive_state::ItemKind::File,
+                revision: OperationId::new(),
+                content_version_id: None,
+                deleted: false,
+                metadata_json: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        item_id
+    }
+
+    /// The reviewed plan identity of one live file: exact NTFS identity, size
+    /// and modification time as `prepare_unlink` would record them.
+    fn unlink_entry(root: &Path, item_id: ItemId, path: &str) -> crate::sync::engine::UnlinkFile {
+        let live = query_file_state(&root.join(path)).unwrap();
+        crate::sync::engine::UnlinkFile {
+            item_id,
+            path: PathBuf::from(path),
+            version_id: Some(VersionId::new()),
+            volume_serial_number: live.identity.volume_serial_number,
+            file_id: live.identity.file_id,
+            size: live.size,
+            last_write_time_100ns: live.last_write_time_100ns,
+            partial: false,
+        }
+    }
+
+    fn abandon_plan(
+        connection: ConnectionId,
+        entry: crate::sync::engine::UnlinkFile,
+    ) -> crate::sync::engine::UnlinkPlan {
+        crate::sync::engine::UnlinkPlan {
+            connection_id: connection,
+            mode: crate::sync::engine::UnlinkMode::RemoveUnavailable,
+            abandon: vec![entry],
+            ..Default::default()
+        }
+    }
+
+    /// The guarded abandonment re-checks cleanliness **at execution time**:
+    /// an entry that is dirty or carries an unresolved conflict is preserved
+    /// untouched and blocks the removal, and a plan with any partial file is
+    /// refused before a single deletion.
+    #[tokio::test]
+    async fn abandon_unavailable_never_deletes_dirty_or_conflicted_entries() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("dirty.txt"), b"unsynchronized local bytes").unwrap();
+        std::fs::write(fixture.root.join("conflicted.txt"), b"competing local bytes").unwrap();
+        let dirty_item = local_item(&fixture, "dirty.txt").await;
+        let conflicted_item = local_item(&fixture, "conflicted.txt").await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+
+        // Dirty evidence: the entry can never be abandoned.
+        fixture
+            .account
+            .bump_observation(fixture.connection, dirty_item, None)
+            .await
+            .unwrap();
+        let error = runtime
+            .abandon_unavailable(
+                &abandon_plan(fixture.connection, unlink_entry(&fixture.root, dirty_item, "dirty.txt")),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.reason.contains("no longer clean and zero-residency"),
+            "a dirty entry is refused at the deletion boundary: {error:?}"
+        );
+        assert_eq!(error.files, vec!["dirty.txt".to_owned()]);
+        assert_eq!(
+            std::fs::read(fixture.root.join("dirty.txt")).unwrap(),
+            b"unsynchronized local bytes",
+            "the dirty entry is preserved untouched"
+        );
+
+        // Unresolved conflict evidence: the entry can never be abandoned.
+        fixture
+            .account
+            .record_conflict(hfdrive_state::ConflictRecord {
+                connection_id: fixture.connection,
+                conflict_id: hfdrive_core::ids::ConflictId::new(),
+                item_id: conflicted_item,
+                competing_ops: vec![OperationId::new(), OperationId::new()],
+                revisions_json: serde_json::json!({}),
+                original_names: vec!["conflicted.txt".to_owned()],
+                resolution_state: hfdrive_state::ConflictResolution::Unresolved,
+                detected_at_ms: None,
+            })
+            .await
+            .unwrap();
+        let error = runtime
+            .abandon_unavailable(
+                &abandon_plan(
+                    fixture.connection,
+                    unlink_entry(&fixture.root, conflicted_item, "conflicted.txt"),
+                ),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.reason.contains("no longer clean and zero-residency"),
+            "a conflicted entry is refused at the deletion boundary: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("conflicted.txt")).unwrap(),
+            b"competing local bytes",
+            "the conflicted entry is preserved untouched"
+        );
+
+        // The plan-level partial-files precondition refuses everything.
+        let mut plan = abandon_plan(fixture.connection, unlink_entry(&fixture.root, dirty_item, "dirty.txt"));
+        plan.partial_files = 1;
+        let error = runtime.abandon_unavailable(&plan, true).await.unwrap_err();
+        assert!(
+            error.reason.contains("partially resident files cannot be abandoned"),
+            "a partially resident file always blocks the lossy removal: {error:?}"
+        );
+
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    /// The HFDR-ownership guard: an entry that is not this connection's
+    /// placeholder is never deleted, even when it is clean and its NTFS
+    /// identity still matches the reviewed plan entry.
+    #[tokio::test]
+    async fn abandon_unavailable_refuses_entries_that_are_no_longer_owned_placeholders() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("foreign.txt"), b"not this connection's placeholder").unwrap();
+        let item = local_item(&fixture, "foreign.txt").await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+
+        let entry = unlink_entry(&fixture.root, item, "foreign.txt");
+        let error = runtime
+            .abandon_unavailable(&abandon_plan(fixture.connection, entry), true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            "the entry is no longer this connection's placeholder; it is preserved untouched"
+        );
+        assert_eq!(error.files, vec!["foreign.txt".to_owned()]);
+        assert_eq!(
+            std::fs::read(fixture.root.join("foreign.txt")).unwrap(),
+            b"not this connection's placeholder",
+            "the foreign entry is preserved untouched"
+        );
+
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    /// The residue scan gate: unregistration is withheld while a reviewed
+    /// abandoned entry is still present; ordinary files are not residue, and
+    /// once the abandoned entry is gone the complete scan may pass.
+    #[tokio::test]
+    async fn live_residue_blocks_until_every_reviewed_entry_is_gone() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("notes.txt"), b"ordinary local content").unwrap();
+        let item = local_item(&fixture, "notes.txt").await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+
+        // Ordinary files are not managed placeholder residue.
+        runtime.live_residue(&[]).expect("a root holding only ordinary files is clean");
+
+        // A reviewed abandoned entry that is still on disk blocks unregistration.
+        let entry = unlink_entry(&fixture.root, item, "notes.txt");
+        let error = runtime
+            .live_residue(std::slice::from_ref(&entry))
+            .expect_err("a live abandoned entry must block unregistration");
+        assert_eq!(error.reason, "an abandoned entry is still present after removal");
+        assert_eq!(error.files, vec!["notes.txt".to_owned()]);
+
+        // Once it is verifiably gone the scan completes and the gate passes.
+        std::fs::remove_file(fixture.root.join("notes.txt")).unwrap();
+        runtime
+            .live_residue(&[entry])
+            .expect("the abandoned entry is gone and the residue scan completes");
+
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    /// Before any lossy work, dirty bytes are preserved as unique,
+    /// metadata-checked, hash-verified recovery copies outside the root, and
+    /// the source file is left untouched. Clean content is not exported.
+    #[tokio::test]
+    async fn dirty_bytes_are_preserved_as_verified_recovery_copies_before_lossy_work() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("dirty.txt"), b"unsynchronized local bytes").unwrap();
+        std::fs::write(fixture.root.join("clean.txt"), b"already synchronized").unwrap();
+        let dirty_item = local_item(&fixture, "dirty.txt").await;
+        local_item(&fixture, "clean.txt").await;
+        fixture
+            .account
+            .bump_observation(fixture.connection, dirty_item, None)
+            .await
+            .unwrap();
+        let (runtime, cancel) = unlink_runtime(&fixture);
+
+        let preserved = runtime.preserve_dirty_before_removal().await.unwrap();
+        assert_eq!(preserved, vec!["dirty.txt".to_owned()], "only unsynchronized content is exported");
+        assert_eq!(
+            std::fs::read(fixture.root.join("dirty.txt")).unwrap(),
+            b"unsynchronized local bytes",
+            "the source is left untouched"
+        );
+
+        // Exactly one recovery copy with its sidecar; the sidecar digest must
+        // hash-verify against the copy's bytes on disk.
+        let recovery_dir = fixture.directory.path().join("recovery");
+        let mut copies = Vec::new();
+        let mut sidecars = Vec::new();
+        for entry in std::fs::read_dir(&recovery_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") {
+                sidecars.push(entry.path());
+            } else {
+                copies.push(entry.path());
+            }
+        }
+        assert_eq!(copies.len(), 1, "exactly one recovery copy: {copies:?}");
+        assert_eq!(sidecars.len(), 1, "exactly one sidecar: {sidecars:?}");
+        let record: crate::sync::recovery::RecoverySource =
+            serde_json::from_slice(&std::fs::read(&sidecars[0]).unwrap()).unwrap();
+        let copied = std::fs::read(&copies[0]).unwrap();
+        assert_eq!(copied, b"unsynchronized local bytes");
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&copied);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&digest);
+        assert_eq!(record.sha256, expected, "the recovery copy is hash-verified against the preserved bytes");
+        assert_eq!(record.size, copied.len() as u64);
+        assert_eq!(record.label, "dirty.txt");
+
+        cancel.cancel();
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_query_failure_is_conservatively_dirty() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        let fixture = connection_fixture().await;
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        fixture.state.close().await.unwrap();
+        assert!(
+            <ConnectionRuntime<HeadOnlyRemote> as crate::sync::cfapi_pump::PumpHost<HeadOnlyRemote>>::is_dirty(
+                &*runtime,
+                ItemId::new(),
+            )
+            .await,
+            "a cleanliness query error must preserve the file"
+        );
+        runtime.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_suppression_failure_is_visible_and_retryable() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        fixture.state.close().await.unwrap();
+        crate::sync::cfapi_pump::PumpHost::void_delete_intents_for_present_items(&*runtime).await;
+        assert!(runtime.persistence_failed.load(Ordering::Acquire));
+        runtime.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_delete_resumes_from_its_durable_completion_stage() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("present.txt"), b"local bytes remain").unwrap();
+        let item_id = local_item(&fixture, "present.txt").await;
+        let entry = intent_entry(
+            fixture.connection,
+            OperationId::new(),
+            Some(item_id),
+            None,
+            None,
+            0,
+            &SyncIntent::Delete { item_id: *item_id.as_uuid() },
+        )
+        .unwrap();
+        let operation = entry.operation_id;
+        fixture.account.record_observed_work(None, entry, None).await.unwrap();
+        for transition in [
+            hfdrive_state::OutboxTransition::MetadataReady {
+                candidate_commit: hfdrive_core::ids::CommitId::new(),
+                candidate_head_json: serde_json::json!({}),
+                expected_etag: "\"fixture\"".to_owned(),
+            },
+            hfdrive_state::OutboxTransition::Published,
+            hfdrive_state::OutboxTransition::LocalApplyPending,
+        ] {
+            fixture.account.transition_outbox(fixture.connection, operation, transition).await.unwrap();
+        }
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        crate::sync::cfapi_pump::PumpHost::void_delete_intents_for_present_items(&*runtime).await;
+        assert_eq!(
+            fixture.account.outbox_entry(fixture.connection, operation).await.unwrap().unwrap().state,
+            OutboxState::Complete
+        );
+        assert!(!runtime.persistence_failed.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(fixture.root.join("present.txt")).unwrap(), b"local bytes remain");
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_a_pump_cancels_and_joins_the_drive_worker() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let (runtime, cancel) = unlink_runtime(&fixture);
+        assert!(runtime.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some());
+        runtime.disconnect().await.unwrap();
+        assert!(cancel.is_cancelled());
+        assert!(runtime.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none());
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requeued_actions_schedule_a_fresh_scan_without_blocking_completion() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        std::fs::write(fixture.root.join("changed.txt"), b"new local bytes").unwrap();
+        let action_id = hfdrive_core::ids::ActionId::new();
+        fixture
+            .account
+            .record_local_action(hfdrive_state::LocalAction {
+                connection_id: fixture.connection,
+                action_id,
+                item_id: Some(ItemId::new()),
+                kind: hfdrive_state::LocalActionKind::UpdatePlaceholder,
+                expected_file_id: Some("00000000000000000000000000000000".to_owned()),
+                expected_generation: Some(1),
+                expected_usn: None,
+                old_version: None,
+                new_version: None,
+                source_path: Some(PathBuf::from("changed.txt")),
+                target_path: None,
+                recovery_path: None,
+                state: LocalActionState::Pending,
+            })
+            .await
+            .unwrap();
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        assert_eq!(runtime.recover_actions().await.unwrap(), 1);
+        assert!(runtime.scan_requested.load(Ordering::Acquire));
+        assert!(runtime.reconcile_requested.load(Ordering::Acquire));
+        assert!(fixture.account.pending_local_actions(fixture.connection).await.unwrap().is_empty());
+        let actions = fixture.account.list_local_actions(fixture.connection, None).await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].state, LocalActionState::Requeued);
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_path_uses_the_complete_root_to_item_ancestry() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let directory = ItemId::new();
+        let file = ItemId::new();
+        for (item_id, parent_id, name) in [
+            (directory, Some(fixture.root_item), "folder"),
+            (file, Some(directory), "report.txt"),
+        ] {
+            fixture
+                .account
+                .upsert_item(hfdrive_state::ItemRecord {
+                    connection_id: fixture.connection,
+                    item_id,
+                    parent_id,
+                    name: name.to_owned(),
+                    name_key: name.to_owned(),
+                    kind: hfdrive_state::ItemKind::File,
+                    revision: OperationId::new(),
+                    content_version_id: None,
+                    deleted: false,
+                    metadata_json: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            registry_path(&fixture.account, fixture.connection, file).await,
+            Some(PathBuf::from("folder").join("report.txt"))
+        );
+        fixture.state.close().await.unwrap();
     }
 }

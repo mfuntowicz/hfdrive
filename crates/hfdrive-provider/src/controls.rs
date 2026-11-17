@@ -2,46 +2,264 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use hfdrive_core::ids::{ConnectionId, ItemId};
+use hfdrive_core::ids::{ConnectionId, ItemId, OperationId};
+use hfdrive_core::storage::{BucketName, Sha256Digest};
+use hfdrive_hf::OwnerLocator;
 use hfdrive_protocol as wire;
+use hfdrive_protocol::RequestMethod;
+use hfdrive_state::OperationState;
 
 use crate::{Provider, operations::error, storage::{engine_failure, invalid}};
 
+/// `affected_files` is producer-bounded: the reviewed preview never grows past
+/// this many entries even when the connection holds more unavailable files.
+const AFFECTED_FILE_LIMIT: usize = 200;
+
 impl Provider {
+    /// Reviews an unlink without mutating anything. The preview id **is** this
+    /// mutation's operation id: its committed operation receipt is the durable
+    /// preview that `unlink` must later accept.
+    ///
+    /// `RemoveUnavailable` is the explicit deleted-bucket mode. It may only
+    /// preview while the connection's exact stable bucket is gone, and it must
+    /// name every byte it would abandon.
     pub(crate) async fn prepare_unlink(
         &self,
         request: wire::PrepareUnlinkRequest,
     ) -> Result<wire::PrepareUnlinkResult, wire::ProtocolError> {
         let connection = ConnectionId::from_uuid(request.connection_id)
             .map_err(|_| invalid("A nonzero connection identifier is required"))?;
+        let preview_id = OperationId::from_uuid(request.operation_id)
+            .map_err(|_| invalid("A nonzero operation identifier is required"))?;
+        let (profile, record) = self.unlink_connection(connection).await?;
+        if request.mode == wire::UnlinkMode::RemoveUnavailable {
+            self.require_bucket_gone(&profile, &record).await?;
+        }
         let engine = self.engine.as_ref().ok_or_else(crate::operations::internal)?;
-        let plan = engine.prepare_unlink(connection).await.map_err(engine_failure)?;
-        let keep_registration = request.mode == wire::UnlinkMode::DisconnectKeepRegistration;
+        let plan = engine.prepare_unlink(connection, engine_mode(request.mode)).await.map_err(engine_failure)?;
+        let mut blocking_reasons = plan.blockers.clone();
+        // `RemoveUnavailable` abandons bytes instead of preserving them, so
+        // everything it cannot abandon cleanly blocks that mode outright.
+        if request.mode == wire::UnlinkMode::RemoveUnavailable {
+            for (count, reason) in [
+                (plan.partial_files, "files are only partially resident"),
+                (plan.dirty_files, "files retain unsynchronized local changes"),
+                (plan.conflict_files, "files have unresolved conflicts"),
+            ] {
+                if count > 0 {
+                    let reason = format!("{count} {reason}");
+                    if !blocking_reasons.contains(&reason) {
+                        blocking_reasons.push(reason);
+                    }
+                }
+            }
+        }
+        let safe_to_unlink = match request.mode {
+            wire::UnlinkMode::DisconnectKeepRegistration => true,
+            wire::UnlinkMode::SafeRemove => plan.blockers.is_empty(),
+            wire::UnlinkMode::RemoveUnavailable => blocking_reasons.is_empty(),
+        };
         Ok(wire::PrepareUnlinkResult {
-            safe_to_unlink: keep_registration || plan.blockers.is_empty(),
+            safe_to_unlink,
             online_only_files: plan.online_only_files,
             partial_files: plan.partial_files,
             dirty_files: plan.dirty_files,
             conflict_files: plan.conflict_files,
             required_export_bytes: plan.required_export_bytes,
-            blocking_reasons: plan.blockers,
+            blocking_reasons,
+            preview_id: *preview_id.as_uuid(),
+            // Engine fingerprint over the full reviewed plan, including the
+            // exact affected identities; any change rotates consent.
+            preview_fingerprint: plan.preview_fingerprint(),
+            // Only abandonment destroys bytes that exist solely in managed
+            // storage; safe removal hydrates/exports them first.
+            online_only_data_loss: request.mode == wire::UnlinkMode::RemoveUnavailable && !plan.abandon.is_empty(),
+            // The reviewed identities the unlink touches as files: managed
+            // directories carry no bytes (`version_id: None` in the engine's
+            // record) and are covered by the counts/reasons above.
+            affected_files: plan.abandon.iter()
+                .filter(|file| file.version_id.is_some())
+                .take(AFFECTED_FILE_LIMIT)
+                .map(|file| wire::UnlinkFileResult {
+                    path: record.root_path.join(&file.path).to_string_lossy().into_owned(),
+                    size: file.size,
+                    partial: file.partial,
+                }).collect(),
         })
     }
 
+    /// Accepts one reviewed preview and executes the unlink. The committed
+    /// `prepare_unlink` receipt binds the connection and the previewed mode;
+    /// the engine fingerprint must still match the current plan and file
+    /// identities before anything is removed. A wrong, stale or missing
+    /// preview is [`wire::ProtocolErrorCode::PreviewChanged`] — the caller
+    /// reviews a fresh preview, never a guess.
     pub(crate) async fn unlink(
         &self,
         request: wire::UnlinkRequest,
     ) -> Result<wire::UnlinkResult, wire::ProtocolError> {
         let connection = ConnectionId::from_uuid(request.connection_id)
             .map_err(|_| invalid("A nonzero connection identifier is required"))?;
-        let keep_registration = request.mode == wire::UnlinkMode::DisconnectKeepRegistration;
+        let operation_id = OperationId::from_uuid(request.operation_id)
+            .map_err(|_| invalid("A nonzero operation identifier is required"))?;
+        let preview_id = OperationId::from_uuid(request.preview_id)
+            .map_err(|_| invalid("A nonzero preview identifier is required"))?;
+        if operation_id == preview_id {
+            return Err(invalid("The unlink mutation needs a fresh operation identifier; the preview identifier cannot become the mutation"));
+        }
+        let (profile, record) = self.unlink_connection(connection).await?;
+        let receipt = self.load_unlink_preview(&profile, connection, preview_id, request.mode).await?;
         let engine = self.engine.as_ref().ok_or_else(crate::operations::internal)?;
-        let plan = engine.prepare_unlink(connection).await.map_err(engine_failure)?;
-        let outcome = engine.execute_unlink(connection, &plan, keep_registration).await.map_err(engine_failure)?;
+        let plan = engine.prepare_unlink(connection, engine_mode(request.mode)).await.map_err(engine_failure)?;
+        if plan.preview_fingerprint() != receipt.preview_fingerprint {
+            return Err(error(wire::ProtocolErrorCode::PreviewChanged,
+                "Preview inputs changed; review the refreshed preview before removing anything"));
+        }
+        // Mode-specific safety decisions are explicit here, not implied by the
+        // engine's internals. `RemoveUnavailable` only abandons clean
+        // zero-residency entries; anything partially resident, dirty or
+        // conflicted is refused up front with the safe reason instead of
+        // surfacing later as a generic engine conflict.
+        if request.mode == wire::UnlinkMode::RemoveUnavailable {
+            let mut reasons = Vec::new();
+            for (count, reason) in [
+                (plan.partial_files, "partially resident files cannot be abandoned; hydrate, export or resolve them first"),
+                (plan.dirty_files, "files with unsynchronized local changes must be preserved before removal"),
+                (plan.conflict_files, "unresolved conflicts must be resolved before removal"),
+            ] {
+                if count > 0 {
+                    reasons.push(format!("{count}: {reason}"));
+                }
+            }
+            if !reasons.is_empty() {
+                let mut message = String::from("This removal would lose unsynchronized content: ");
+                message.push_str(&reasons.join("; "));
+                return Err(wire::ProtocolError {
+                    code: wire::ProtocolErrorCode::Conflict,
+                    message,
+                    retry_after_ms: None,
+                });
+            }
+        }
+        // Consent is required exactly when proceeding would destroy bytes that
+        // exist only in managed storage — judged from both the reviewed
+        // receipt and the current plan (the fingerprint match binds them, but
+        // the requirement is enforced independently of that agreement).
+        if (receipt.online_only_data_loss || plan.requires_abandon_consent()) && !request.accept_online_only_data_loss {
+            return Err(invalid("Accepting this preview discards online-only bytes and requires explicit online-only data-loss consent"));
+        }
+        // Execute re-checks the deleted-bucket gate on the same identities: a
+        // recreated or still-live bucket can never authorize abandonment.
+        if request.mode == wire::UnlinkMode::RemoveUnavailable {
+            self.require_bucket_gone(&profile, &record).await?;
+        }
+        let outcome = engine.execute_unlink(connection, &plan, engine_mode(request.mode)).await.map_err(engine_failure)?;
+        // The engine owns durable removal: it unregisters, verifies
+        // registration absence and drops the connection rows itself (removal
+        // modes only). Disconnect-keep-registration deliberately retains all
+        // state for explicit recovery.
         Ok(wire::UnlinkResult {
             connection_id: request.connection_id,
             unregistered: outcome == crate::sync::UnlinkOutcome::Unlinked,
             retained_for_recovery: outcome == crate::sync::UnlinkOutcome::DisconnectedKeptRegistration,
+        })
+    }
+
+    /// The current account and its connection record on one admitted identity.
+    /// Unlink never acts on a connection record owned by another account.
+    async fn unlink_connection(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<(hfdrive_auth::AccountProfile, hfdrive_state::ConnectionRecord), wire::ProtocolError> {
+        let profile = self.current_account()?;
+        let record = self.state.reconcile_connections().await.map_err(crate::operations::state_error)?
+            .into_iter()
+            .find(|record| record.connection_id == connection && record.account_key == profile.account_key)
+            .ok_or_else(|| error(wire::ProtocolErrorCode::NotFound, "The connection does not exist for this account"))?;
+        Ok((profile, record))
+    }
+
+    /// `RemoveUnavailable` gate: the connection's exact stable bucket must be
+    /// **gone** (`resolve_bucket` yields `None`) before any bytes may be
+    /// abandoned. A live bucket — even a recreated one — is a conflict; every
+    /// other resolution error (sign-in, denial, transport) propagates and can
+    /// never authorize abandonment.
+    async fn require_bucket_gone(
+        &self,
+        profile: &hfdrive_auth::AccountProfile,
+        record: &hfdrive_state::ConnectionRecord,
+    ) -> Result<(), wire::ProtocolError> {
+        let control = self.native_control(profile.account_key);
+        let lease = control.capture_lease().map_err(crate::storage::native_failure)?;
+        let bucket = &record.binding.bucket;
+        let owner = control.verify_owner(&lease, &OwnerLocator {
+            owner_id: bucket.owner_id.clone(),
+            owner_kind: bucket.owner_kind,
+            claimed_namespace: Some(bucket.owner_namespace.clone()),
+        }, &self.operations.cancellation).await.map_err(crate::storage::native_failure)?;
+        let name = BucketName::new(bucket.bucket_name.as_str().to_owned())
+            .map_err(|_| invalid("Invalid bucket name"))?;
+        let live = control.resolve_bucket(
+            &lease,
+            &owner.owner_ref(),
+            &name,
+            Some(&bucket.bucket_id),
+            &self.operations.cancellation,
+        ).await.map_err(crate::storage::native_failure)?;
+        if live.is_some() {
+            return Err(error(wire::ProtocolErrorCode::Conflict,
+                "The exact bucket still exists; this mode only applies to a deleted bucket and never removes live storage"));
+        }
+        Ok(())
+    }
+
+    /// Loads the committed `prepare_unlink` receipt for one reviewed preview.
+    /// The receipt binds the connection **and** the previewed mode through the
+    /// persisted request digest; anything wrong, stale or missing surfaces as
+    /// [`wire::ProtocolErrorCode::PreviewChanged`] so the caller reviews a
+    /// fresh preview instead of guessing.
+    async fn load_unlink_preview(
+        &self,
+        profile: &hfdrive_auth::AccountProfile,
+        connection: ConnectionId,
+        preview_id: OperationId,
+        mode: wire::UnlinkMode,
+    ) -> Result<UnlinkPreviewReceipt, wire::ProtocolError> {
+        let changed = |message: &'static str| error(wire::ProtocolErrorCode::PreviewChanged, message);
+        let record = self.state.get_operation(preview_id).await.map_err(crate::operations::state_error)?
+            .ok_or_else(|| changed("The reviewed preview is missing; prepare and review a fresh one"))?;
+        if record.state != OperationState::Committed
+            || record.kind != wire::PrepareUnlinkRequest::METHOD
+            || record.connection_id != Some(connection)
+            || record.account_key != Some(profile.account_key)
+        {
+            return Err(changed("The preview is stale or belongs to another connection; prepare and review a fresh one"));
+        }
+        // The ledger keeps only the request digest, so re-derive it from the
+        // identity the caller now claims: the same `PrepareUnlinkRequest`
+        // (preview id == operation id, connection, mode) must hash identically.
+        let previewed = wire::PrepareUnlinkRequest {
+            operation_id: *preview_id.as_uuid(),
+            connection_id: *connection.as_uuid(),
+            mode,
+        };
+        let body = serde_json::to_value(&previewed).map_err(|_| crate::operations::internal())?;
+        let mut material = Vec::new();
+        material.extend_from_slice(wire::PrepareUnlinkRequest::METHOD.as_bytes());
+        material.push(0);
+        material.extend_from_slice(body.to_string().as_bytes());
+        if Sha256Digest::of(&material) != record.request_digest {
+            return Err(changed("The preview was prepared for another mode or connection; prepare and review a fresh one"));
+        }
+        let result: wire::PrepareUnlinkResult = serde_json::from_value(
+            record.result_json.ok_or_else(|| changed("The preview receipt carries no reviewed result"))?,
+        ).map_err(|_| changed("The preview receipt is not a reviewed unlink preview"))?;
+        if result.preview_id != *preview_id.as_uuid() {
+            return Err(changed("The preview receipt does not match this preview"));
+        }
+        Ok(UnlinkPreviewReceipt {
+            preview_fingerprint: result.preview_fingerprint,
+            online_only_data_loss: result.online_only_data_loss,
         })
     }
 
@@ -80,6 +298,10 @@ impl Provider {
         let account = self.account_connection(connection).await?;
         let targets = target_items(&account, connection, request.item_id).await?;
         let engine = self.engine.as_ref().ok_or_else(crate::operations::internal)?;
+        // The connection root is resolved once per request: it does not vary by
+        // item, and re-resolving it per item would rerun the whole connection
+        // reconciliation for every dehydrated file.
+        let root = self.connection_root(connection).await?;
         let mut freed_bytes = 0u64;
         let mut dehydrated_files = 0u32;
         for item in targets {
@@ -96,7 +318,6 @@ impl Provider {
             }
             let path = crate::sync::controller::registry_path(&account, connection, item).await
                 .ok_or_else(|| error(wire::ProtocolErrorCode::NotFound, "The item has no local path"))?;
-            let root = self.connection_root(connection).await?;
             let live = hfdrive_windows::filesystem::volume::query_file_state(&root.join(&path))
                 .map_err(|_| error(wire::ProtocolErrorCode::LocalRootInvalid, "The local file state is unavailable"))?;
             engine.free_space(connection, item).await.map_err(engine_failure)?;
@@ -169,6 +390,25 @@ impl Provider {
             .find(|record| record.connection_id == connection)
             .map(|record| record.root_path)
             .ok_or_else(|| error(wire::ProtocolErrorCode::NotFound, "The connection does not exist"))
+    }
+}
+
+/// Committed preview identity re-derived from the `prepare_unlink` receipt.
+struct UnlinkPreviewReceipt {
+    preview_fingerprint: String,
+    online_only_data_loss: bool,
+}
+
+/// The engine's internal removal mode mirrors the wire mode: removal keeps the
+/// selected policy (safe preservation versus explicit abandonment), and only
+/// `DisconnectKeepRegistration` disconnects without unregistering. The accept
+/// path calls `execute_unlink(connection, plan, mode)`, never a
+/// keep-registration boolean.
+fn engine_mode(mode: wire::UnlinkMode) -> crate::sync::UnlinkMode {
+    match mode {
+        wire::UnlinkMode::SafeRemove => crate::sync::UnlinkMode::SafeRemove,
+        wire::UnlinkMode::RemoveUnavailable => crate::sync::UnlinkMode::RemoveUnavailable,
+        wire::UnlinkMode::DisconnectKeepRegistration => crate::sync::UnlinkMode::DisconnectKeepRegistration,
     }
 }
 

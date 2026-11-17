@@ -675,3 +675,88 @@ async fn raw_begin_upload_rechecks_snapshot_without_network() {
     assert!(matches!(error, NativeError::SourceChanged));
     assert_eq!(server.requests.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ordinary_staged_upload_ingests_once_through_one_live_session() {
+    // The ordinary ingest -> CAS-commit chain crosses the ingestion boundary
+    // exactly once: `StagedIngested` carries the live Xet session forward and
+    // its commit reuses it. The Xet CAS is a local fixture (`local://`), so the
+    // only HTTP surface is the bucket's `xet-write-token` refresh route — one
+    // eager refresh per Xet session — plus the exact-key batch bind. The
+    // refresh-route hit count therefore counts ingestions.
+    let upload_id = UploadId::new();
+    let payload = b"single ingestion through one live session".to_vec();
+    let source = std::env::temp_dir().join(format!("hfdrive-single-ingest-{upload_id}.bin"));
+    std::fs::write(&source, &payload).unwrap();
+    let cas_dir = std::env::temp_dir().join(format!("hfdrive-single-ingest-cas-{upload_id}"));
+    let token_hits = Arc::new(AtomicUsize::new(0));
+    let cas_url = format!("local://{}", cas_dir.display());
+    let route: Route = {
+        let token_hits = token_hits.clone();
+        let cas_url = cas_url.clone();
+        Arc::new(move |method: &str, path: &str, _index: usize, _lines: usize| {
+            if method == "GET" && path == "/api/buckets/ns/b/xet-write-token" {
+                token_hits.fetch_add(1, Ordering::SeqCst);
+                return response(
+                    "200 OK",
+                    &[],
+                    &serde_json::json!({
+                        "casUrl": cas_url,
+                        "exp": 4_000_000_000u64,
+                        "accessToken": SECRET_MARKER,
+                    })
+                    .to_string(),
+                );
+            }
+            if method == "POST" && path.ends_with("/batch") {
+                return response("200 OK", &[], r#"{"success":true,"processed":1,"succeeded":1,"failed":[]}"#);
+            }
+            response("404 Not Found", &[], "{}")
+        })
+    };
+    let server = fixture(route).await;
+    let key = account("single-ingest");
+    let api = NativeApi::new(stub(key, key), key, format!("http://{}", server.addr)).unwrap();
+    let mut binding = drive(key);
+    let prefix = format!("hfdrive/{}", binding.workspace_id);
+    binding.prefix = RemotePrefix::new(prefix.clone()).unwrap();
+    let store = NativeBucketStore::new(api, binding, config(format!("http://{}", server.addr))).unwrap();
+    let lease = store.capture_lease().unwrap();
+    let cancel = CancellationToken::new();
+    let snapshot = StableSnapshot {
+        snapshot_id: hfdrive_core::ids::SnapshotId::new(),
+        upload_id,
+        path: source.clone(),
+        size: payload.len() as u64,
+        sha256: Sha256Digest::of(&payload),
+    };
+
+    // Stage 1: ingestion. One live session, one durable checkpoint.
+    let staged = store
+        .begin_upload(&lease, ImmutableKey::Payload(upload_id), hfdrive_hf::UploadSource::Snapshot(snapshot.clone()))
+        .unwrap();
+    let (ingested, checkpoint) = staged.ingest(&cancel).await.unwrap();
+    assert_eq!(checkpoint.target_key, format!("{prefix}/objects/{upload_id}"), "the exact managed payload key");
+    assert_eq!(checkpoint.size, snapshot.size);
+    assert_eq!(checkpoint.sha256, snapshot.sha256);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "ingestion crosses the boundary exactly once");
+
+    // Stage 2: CAS commit on the same live session. Never a second ingestion.
+    let (committed, cas) = ingested.commit_cas(&cancel).await.unwrap();
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "the CAS commit reuses the live session and never re-ingests");
+    assert_eq!(cas.target_key, checkpoint.target_key);
+    assert_eq!(cas.xet_file_id, checkpoint.xet_file_id);
+    assert_eq!(cas.size, checkpoint.size);
+    assert_eq!(cas.sha256, checkpoint.sha256);
+    assert_eq!(cas.sdk_task_id, checkpoint.sdk_task_id, "the commit rides the same SDK session");
+
+    // Stage 3: exact key binding.
+    let bound = committed.bind(&cancel).await.unwrap();
+    assert_eq!(bound.key.as_str(), format!("{prefix}/objects/{upload_id}"));
+    assert_eq!(bound.size, snapshot.size);
+    assert_eq!(bound.sha256, snapshot.sha256);
+    assert_eq!(bound.xet_file_id, checkpoint.xet_file_id);
+
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_dir_all(&cas_dir);
+}

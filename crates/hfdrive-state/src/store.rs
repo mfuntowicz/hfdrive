@@ -975,6 +975,14 @@ impl Db {
     /// restored from an interrupted finalization) work through the normal
     /// open/reconcile path. An existing row is never rewritten: unknown scan
     /// evidence stays unknown and deletion-ineligible.
+    ///
+    /// It also repairs the residue of an interrupted `remove_connection`: the
+    /// account commit (row removal plus setup abandonment) precedes the
+    /// control cleanup, so a crash in between can leave a control-side
+    /// connection mirror and/or an un-abandoned setup registry row behind.
+    /// The account-side journals are authoritative: an abandoned setup gets
+    /// its mirror rewritten, and a control connection row with no account-side
+    /// row is stale and deleted — the account row is never resurrected.
     pub(crate) fn reconcile_connections(&mut self) -> SResult<Vec<ConnectionRecord>> {
         let setups = self.list_setups(None)?;
         for setup in setups {
@@ -982,6 +990,29 @@ impl Db {
                 && (!setup.account_committed || !setup.control_committed)
             {
                 self.finalize_setup(setup.setup_id)?;
+            }
+        }
+        // Stale control residue of an interrupted unlink: for every abandoned
+        // setup the account-side journal is authoritative, so the control
+        // connection mirror is deleted and the setup mirror rewritten to
+        // `abandoned` — idempotently, and without ever resurrecting the
+        // account row.
+        for setup in self.list_setups(None)? {
+            if setup.status != SetupStatus::Abandoned {
+                continue;
+            }
+            self.control.execute(
+                "DELETE FROM connections WHERE connection_id = ?1",
+                params![setup.connection_id.as_bytes().as_slice()],
+            )?;
+            if !setup.control_committed {
+                let mirror = Self::setup_mirror_of(&setup)?;
+                self.write_setup_control_mirror(&mirror)?;
+                let conn = self.account_conn(setup.account_key)?;
+                conn.execute(
+                    "UPDATE setup_intents SET control_committed = 1 WHERE setup_id = ?1",
+                    params![setup.setup_id.as_bytes().as_slice()],
+                )?;
             }
         }
         let mut out = Vec::new();
@@ -1044,6 +1075,89 @@ impl Db {
         )?;
         if changed == 0 {
             return Err(StateError::UnknownConnection(connection_id));
+        }
+        Ok(())
+    }
+
+    /// Unlinks one connection. The account-local `connections` row (cascading
+    /// every connection-scoped work table) and the abandonment of its setup
+    /// intent commit in ONE account transaction, so no intermediate state can
+    /// lose the setup journal entry. The two-database failure order is
+    /// deliberate: the account commit lands first; the control-side connection
+    /// mirror and setup registry follow in their own commits. A crash in
+    /// between leaves control residue that `reconcile_connections` repairs
+    /// without ever resurrecting the account row. Only state rows are removed:
+    /// physical snapshots, recovery files and credential envelopes belong to
+    /// the caller and are never touched here.
+    pub(crate) fn remove_connection(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+    ) -> SResult<()> {
+        // Validate membership first so an unknown id never mutates anything,
+        // and so UnknownConnection stays distinct from UnknownSetup.
+        if self.get_connection(account, connection_id)?.is_none() {
+            return Err(StateError::UnknownConnection(connection_id));
+        }
+        let setup = match self.get_setup_by_connection(connection_id)? {
+            Some(record) if record.account_key == account => Some(record),
+            _ => None,
+        };
+        let now = schema::checked_i64(schema::now_ms())?;
+        let failure_reason = setup
+            .as_ref()
+            .and_then(|record| record.failure_reason.clone())
+            .or_else(|| Some("connection unlinked".to_owned()));
+        // Account-side transaction: the connection row (whose ON DELETE
+        // CASCADE covers items, filesystem identities, common bases, local
+        // observations, outbox, snapshots, transfers, commits, event cursors,
+        // conflicts and local actions) and the setup-intent abandonment land
+        // together. `control_committed = 0` marks the mirror as owed.
+        {
+            let conn = self.account_conn(account)?;
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
+                "DELETE FROM connections WHERE connection_id = ?1",
+                params![connection_id.as_bytes().as_slice()],
+            )?;
+            if changed == 0 {
+                return Err(StateError::UnknownConnection(connection_id));
+            }
+            if let Some(record) = &setup {
+                let updated = tx.execute(
+                    "UPDATE setup_intents
+                        SET status = 'abandoned', failure_reason = ?2, control_committed = 0, updated_at_ms = ?3
+                      WHERE setup_id = ?1",
+                    params![
+                        record.setup_id.as_bytes().as_slice(),
+                        failure_reason,
+                        now,
+                    ],
+                )?;
+                if updated == 0 {
+                    return Err(StateError::UnknownSetup(record.setup_id));
+                }
+            }
+            tx.commit()?;
+        }
+        // Control-side commits follow the account commit. The connection
+        // mirror is deleted first; the setup registry abandonment lands last,
+        // so an interruption leaves only a stale mirror or an un-abandoned
+        // registry row — both repaired by `reconcile_connections`.
+        self.control.execute(
+            "DELETE FROM connections WHERE connection_id = ?1",
+            params![connection_id.as_bytes().as_slice()],
+        )?;
+        if let Some(record) = &setup {
+            let mut mirror = Self::setup_mirror_of(record)?;
+            mirror.status = SetupStatus::Abandoned;
+            mirror.failure_reason = failure_reason;
+            self.write_setup_control_mirror(&mirror)?;
+            let conn = self.account_conn(account)?;
+            conn.execute(
+                "UPDATE setup_intents SET control_committed = 1 WHERE setup_id = ?1",
+                params![record.setup_id.as_bytes().as_slice()],
+            )?;
         }
         Ok(())
     }
@@ -1618,10 +1732,49 @@ impl Db {
         connection_id: ConnectionId,
         operation_id: OperationId,
     ) -> SResult<CompletionOutcome> {
+        self.complete_outbox_impl(account, connection_id, operation_id, false)
+    }
+
+    /// Completes a delete whose local item was proven present by the caller.
+    /// Only Observed/Published/LocalApplyPending delete intents qualify; a
+    /// content/move/create intent can never use this convergence shortcut.
+    pub(crate) fn complete_abandoned_delete(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        operation_id: OperationId,
+    ) -> SResult<CompletionOutcome> {
+        self.complete_outbox_impl(account, connection_id, operation_id, true)
+    }
+
+    fn complete_outbox_impl(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        operation_id: OperationId,
+        abandoned_delete: bool,
+    ) -> SResult<CompletionOutcome> {
         let entry = self
             .outbox_entry(account, connection_id, operation_id)?
             .ok_or_else(|| StateError::not_found("outbox", operation_id))?;
-        if !entry.state.can_transition_to(OutboxState::Complete) {
+        let allowed = if abandoned_delete {
+            matches!(
+                entry.state,
+                OutboxState::Observed | OutboxState::Published | OutboxState::LocalApplyPending
+            ) && entry.item_id.is_some_and(|item_id| {
+                entry.intent_json.get("intent").and_then(serde_json::Value::as_str)
+                    == Some("delete")
+                    && entry
+                        .intent_json
+                        .get("item_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                        == Some(*item_id.as_uuid())
+            })
+        } else {
+            entry.state.can_transition_to(OutboxState::Complete)
+        };
+        if !allowed {
             return Err(StateError::IllegalOutboxTransition {
                 from: entry.state,
                 to: OutboxState::Complete,
@@ -2347,7 +2500,7 @@ impl Db {
         query_many(
             conn,
             &format!("SELECT {LOCAL_ACTION_COLUMNS} FROM local_actions WHERE connection_id = ?1
-             AND state IN ('pending', 'in_progress', 'requeued') ORDER BY created_at_ms"),
+             AND state IN ('pending', 'in_progress') ORDER BY created_at_ms"),
             params![connection_id.as_bytes().as_slice()],
             s::read_local_action,
         )
@@ -2556,6 +2709,39 @@ impl Db {
         query_optional(
             conn,
             &format!("SELECT {ITEM_COLUMNS} FROM items WHERE connection_id = ?1 AND item_id = ?2"),
+            params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+            s::read_item,
+        )
+    }
+
+    /// Returns root-to-item ancestry with one recursive query and a hard
+    /// depth bound. No filesystem or network work occurs in the state worker.
+    pub(crate) fn item_ancestry(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+    ) -> SResult<Vec<ItemRecord>> {
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            &format!(
+                "WITH RECURSIVE ancestry(depth, {ITEM_COLUMNS}) AS (
+                     SELECT 0, {ITEM_COLUMNS} FROM items
+                     WHERE connection_id = ?1 AND item_id = ?2
+                     UNION ALL
+                     SELECT ancestry.depth + 1, parent.connection_id, parent.item_id,
+                            parent.parent_id, parent.name, parent.name_key, parent.kind,
+                            parent.revision, parent.content_version_id, parent.deleted,
+                            parent.metadata_json
+                     FROM items AS parent
+                     JOIN ancestry
+                       ON parent.connection_id = ancestry.connection_id
+                      AND parent.item_id = ancestry.parent_id
+                     WHERE ancestry.depth < 512
+                 )
+                 SELECT {ITEM_COLUMNS} FROM ancestry ORDER BY depth DESC"
+            ),
             params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
             s::read_item,
         )

@@ -904,3 +904,54 @@ verification.
   `artifacts/tests/oauth-fixed-callback-login.log` and
   `artifacts/tests/oauth-fixed-callback-status.log`. No tokens, authorization
   codes, callback queries, or credential envelopes are included in those logs.
+
+## Deleted-bucket security and performance review — 2026-11-17
+
+- **baseline passed** — the full locked Rust workspace suite completed with no
+  failures. It included 129 provider unit tests, 97 Windows unit tests, all
+  protocol fixtures, and the real 100,000-item catalog scale case (1,092.05
+  seconds for that case; 1,402.49 seconds for the suite). The external/live
+  smoke tests remained explicitly ignored. Evidence: `artifact://7091`.
+- **reviewed** — the configured Kimi K3.1 Pro security reviewer produced 14
+  source-to-sink candidate findings (F01–F14). The judge model accepted F01–F09,
+  F11 and F12 from the cited source evidence; F10, F13 and F14 remained
+  uncertain as generalized defect claims and required implementation-specific
+  handling. These are static review verdicts, not claimed runtime reproductions.
+  Evidence: `artifacts/review/kimi-k31-verdicts.json` and the full reviewer
+  output at `agent://KimiK31Review`.
+- **model gates unavailable** — separate gpt-6-astra, Hy4 and Mimo 2.6 Pro RL
+  task overrides were rejected because `task.perCallModel` is disabled; direct
+  completion calls accept only `smol`, `default` or `slow`. No substitute was
+  presented as one of those requested models. The available configured Kimi
+  reviewer and the judge-model verdicts were completed instead.
+- **fixed** — F01–F09, F11 and F12 now have production fixes and focused
+  regressions: recovery failures pause/propagate; abandonment verifies and
+  deletes the exact same open handle; dirty/suppression errors fail closed;
+  recovery copies revalidate sources, reserve exclusively and flush in order;
+  HEAD/workspace/root and version-key identity are checked; requeues terminate
+  into a fresh scan; disconnect joins the drive worker. F14 checkpoint retries
+  reuse compatible live ingestion. F13 gained single-query ancestry and
+  free-space root hoisting, but no provider-wide lock refactor is claimed.
+  F10 remains a documented no-unlink-phase-journal limitation, not a claimed
+  fix. Finding-by-finding resolutions: `artifacts/review/kimi-k31-verdicts.json`.
+- **passed** — final affected Rust suites passed 144 provider unit tests, 98
+  Windows unit tests, all state/protocol/CLI/native-Xet/publication and
+  provider/Windows integration tests. External/live smoke cases remained
+  explicitly ignored. Evidence: `artifacts/tests/final-review-rust-suites.log`
+  and `artifacts/tests/state-abandoned-delete.log`.
+- **passed** — the full locked Debug workspace/managed build succeeded;
+  MSBuild reported 0 warnings and 0 errors, while Cargo emitted only the
+  existing `linker_messages` warnings. All 6 Rust shell tests passed. Managed
+  protocol and view-model tests passed 183/183. Evidence:
+  `artifacts/tests/final-review-build-isolated.log`,
+  `artifacts/tests/final-review-managed.log`, and
+  `artifacts/tests/protocol/final-review-managed.trx`. An earlier default-
+  target build attempt failed with host proc-macro `LNK1104`; rerunning the
+  same pinned locked script in the established isolated artifact target
+  succeeded without changing source, dependencies or toolchain.
+- **not_run** — live application to the former deleted-bucket connection was
+  not possible in this run: the current provider reports `signed_out` and no
+  connections. No OAuth flow, registration change or remote mutation was
+  initiated. Existing live native publication evidence remains in
+  `artifacts/acceptance/fresh-published-file-native-verified.json`; the Hub
+  web UI intentionally exposes raw managed keys, not Explorer-relative paths.

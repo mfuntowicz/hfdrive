@@ -1,5 +1,5 @@
 //! Bounded local observation: watcher events, USN catch-up, complete scans,
-//! provider-echo suppression and 750 ms coalescing.
+//! provider-echo suppression and deadline-driven 750 ms coalescing.
 //!
 //! Invariants enforced here:
 //!
@@ -36,8 +36,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::sync::outbox::display_timestamp;
 
-/// Coalescing window for local saves before intent creation. Generations are
-/// persisted at observation time; only the work is merged.
+/// Per-path quiet period before intent creation: a path is observed only
+/// after its last event plus this window, so continuous writes postpone only
+/// their own path. Generations are persisted at observation time; only the
+/// work is merged.
 pub const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Periodic metadata reconciliation interval.
@@ -316,9 +318,78 @@ pub struct LocalObserver {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Debug)]
 struct PendingRaw {
     observation: RawObservation,
     at: std::time::Instant,
+}
+
+/// Deadline-driven per-path debounce bookkeeping. Each observed path is due
+/// `quiet` after its most recent event, so a continuously written file
+/// postpones only its own deadline while unrelated paths keep their original
+/// windows. Ready entries drain in observation order, the order in which each
+/// path's final event arrived.
+///
+/// Times are injected so tests can drive the schedule deterministically;
+/// the runtime pairs this with one [`tokio::time::Sleep`] pinned to the
+/// earliest deadline instead of a fixed polling tick.
+#[derive(Debug)]
+pub struct PathDebounce {
+    quiet: std::time::Duration,
+    /// Keyed by the caller's normalized key; drain order is established by
+    /// sorting on each entry's last-event time, never by map order.
+    pending: HashMap<String, PendingRaw>,
+}
+
+impl PathDebounce {
+    pub fn new(quiet: std::time::Duration) -> Self {
+        Self { quiet, pending: HashMap::new() }
+    }
+
+    /// Records one event for `key`, moving that path's deadline to
+    /// `at + quiet`. A later event for the same path replaces the earlier
+    /// fact (the classification reads live state) but never merges facts for
+    /// different paths.
+    pub fn record(&mut self, key: String, observation: RawObservation, at: std::time::Instant) {
+        self.pending.insert(key, PendingRaw { observation, at });
+    }
+
+    /// The earliest pending deadline, if any. The runtime sleeps until
+    /// exactly this instant and drains there, so a ready entry never waits
+    /// for a fixed tick boundary.
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.pending.values().map(|entry| entry.at + self.quiet).min()
+    }
+
+    /// Drains every path whose deadline elapsed by `now`, in observation
+    /// order (by each path's most recent event; equal instants break ties by
+    /// key so the order is fully deterministic).
+    pub fn drain_due(&mut self, now: std::time::Instant) -> Vec<RawObservation> {
+        let mut keys = Vec::new();
+        for (key, entry) in &self.pending {
+            if now >= entry.at + self.quiet {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort_by(|a, b| {
+            self.pending[a].at.cmp(&self.pending[b].at).then_with(|| a.cmp(b))
+        });
+        keys.into_iter()
+            .map(|key| self.pending.remove(&key).expect("key collected from pending").observation)
+            .collect()
+    }
+
+    /// Drains everything unconditionally (shutdown/overflow flush), oldest
+    /// first.
+    pub fn drain_all(&mut self) -> Vec<RawObservation> {
+        let mut entries: Vec<_> = self.pending.drain().collect();
+        entries.sort_by(|(a_key, a), (b_key, b)| a.at.cmp(&b.at).then_with(|| a_key.cmp(b_key)));
+        entries.into_iter().map(|(_, entry)| entry.observation).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
 }
 
 impl LocalObserver {
@@ -336,12 +407,13 @@ impl LocalObserver {
         let loop_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             // Keyed by lowercase spelling so case-only renames stay visible
-            // as distinct facts while exact repeats merge.
-            let mut pending: HashMap<String, PendingRaw> = HashMap::new();
+            // as distinct facts while exact repeats merge. Each path debounces
+            // on its own deadline; the loop sleeps only until the earliest one
+            // and wakes immediately whenever a new event moves a deadline.
+            let mut pending = PathDebounce::new(config.coalesce);
             let mut overflowed = false;
-            let mut ticker = tokio::time::interval(config.coalesce);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                let deadline = pending.next_deadline();
                 tokio::select! {
                     _ = loop_cancel.cancelled() => break,
                     event = watch_rx.recv() => {
@@ -349,13 +421,9 @@ impl LocalObserver {
                         match event.action {
                             WatchAction::Overflow => {
                                 overflowed = true;
-                                let drain: Vec<RawObservation> = pending
-                                    .drain()
-                                    .map(|(_, entry)| entry.observation)
-                                    .collect();
                                 let _ = events
                                     .send(ObservationBatch {
-                                        observations: drain,
+                                        observations: pending.drain_all(),
                                         rescan_required: true,
                                     })
                                     .await;
@@ -363,28 +431,25 @@ impl LocalObserver {
                             _ => {
                                 let Some(name) = event.name else { continue; };
                                 let key = name.to_lowercase();
-                                let entry = PendingRaw {
-                                    observation: RawObservation {
+                                pending.record(
+                                    key,
+                                    RawObservation {
                                         relative_path: PathBuf::from(&name),
                                         action: event.action,
                                     },
-                                    at: std::time::Instant::now(),
-                                };
-                                pending.insert(key, entry);
+                                    std::time::Instant::now(),
+                                );
                             }
                         }
                     }
-                    _ = ticker.tick() => {
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
                         let now = std::time::Instant::now();
-                        let mut ready = Vec::new();
-                        pending.retain(|_, entry| {
-                            if now.duration_since(entry.at) >= config.coalesce {
-                                ready.push(entry.observation.clone());
-                                false
-                            } else {
-                                true
-                            }
-                        });
+                        let ready = pending.drain_due(now);
                         let rescan_required = std::mem::take(&mut overflowed);
                         if !ready.is_empty() || rescan_required {
                             let _ = events
@@ -769,6 +834,97 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.release(true).len(), 1);
         assert!(pending.is_empty());
+    }
+
+    fn raw(name: &str, action: WatchAction) -> RawObservation {
+        RawObservation { relative_path: PathBuf::from(name), action }
+    }
+
+    #[test]
+    fn deadline_is_per_path_last_event_plus_quiet_window() {
+        let quiet = COALESCE_WINDOW;
+        let t0 = std::time::Instant::now();
+        let mut debounce = PathDebounce::new(quiet);
+        debounce.record("a.txt".into(), raw("a.txt", WatchAction::Modified), t0);
+        debounce.record("b.txt".into(), raw("b.txt", WatchAction::Modified), t0);
+        assert_eq!(debounce.next_deadline(), Some(t0 + quiet));
+
+        // A later event for `a.txt` postpones only that path's deadline.
+        let t1 = t0 + quiet / 4;
+        debounce.record("a.txt".into(), raw("a.txt", WatchAction::Modified), t1);
+        assert_eq!(debounce.next_deadline(), Some(t0 + quiet), "b.txt still owns the earliest deadline");
+        let due = debounce.drain_due(t0 + quiet);
+        assert_eq!(due.len(), 1, "only b.txt is due");
+        assert_eq!(due[0].relative_path, PathBuf::from("b.txt"));
+        assert_eq!(debounce.next_deadline(), Some(t1 + quiet));
+    }
+
+    #[test]
+    fn continuous_writes_postpone_only_the_written_path() {
+        let quiet = COALESCE_WINDOW;
+        let t0 = std::time::Instant::now();
+        let mut debounce = PathDebounce::new(quiet);
+        debounce.record("busy.bin".into(), raw("busy.bin", WatchAction::Modified), t0);
+        debounce.record("idle.txt".into(), raw("idle.txt", WatchAction::Modified), t0);
+
+        // Continuous writes keep moving busy.bin's deadline forward.
+        for step in 1..=5 {
+            let at = t0 + quiet / 8 * step;
+            debounce.record("busy.bin".into(), raw("busy.bin", WatchAction::Modified), at);
+        }
+        let t_end = t0 + quiet / 8 * 5;
+        assert_eq!(debounce.next_deadline(), Some(t0 + quiet), "idle.txt is still due first");
+
+        let due = debounce.drain_due(t0 + quiet);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].relative_path, PathBuf::from("idle.txt"));
+
+        // busy.bin is due exactly one quiet window after its last event — not
+        // later, and without a full extra tick of slack.
+        assert!(debounce.drain_due(t_end + quiet - std::time::Duration::from_millis(1)).is_empty());
+        let due = debounce.drain_due(t_end + quiet);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].relative_path, PathBuf::from("busy.bin"));
+    }
+
+    #[test]
+    fn a_ready_path_drains_at_its_deadline_without_extra_tick_delay() {
+        let quiet = COALESCE_WINDOW;
+        let t0 = std::time::Instant::now();
+        let mut debounce = PathDebounce::new(quiet);
+        debounce.record("a.txt".into(), raw("a.txt", WatchAction::Modified), t0);
+
+        // The runtime sleeps until exactly this deadline: one quiet window
+        // after the last event, with no fixed-tick quantization.
+        assert_eq!(debounce.next_deadline(), Some(t0 + quiet));
+        assert!(debounce.drain_due(t0 + quiet - std::time::Duration::from_nanos(1)).is_empty());
+        let due = debounce.drain_due(t0 + quiet);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].relative_path, PathBuf::from("a.txt"));
+        assert!(debounce.is_empty());
+        assert_eq!(debounce.next_deadline(), None);
+    }
+
+    #[test]
+    fn drain_order_is_observation_order_across_mixed_deadlines() {
+        let quiet = COALESCE_WINDOW;
+        let t0 = std::time::Instant::now();
+        let mut debounce = PathDebounce::new(quiet);
+        debounce.record("z.txt".into(), raw("z.txt", WatchAction::Modified), t0);
+        debounce.record("m.txt".into(), raw("m.txt", WatchAction::Modified), t0 + quiet / 8);
+        debounce.record("a.txt".into(), raw("a.txt", WatchAction::Added), t0 + quiet / 4);
+        let due = debounce.drain_due(t0 + quiet * 2);
+        let names: Vec<_> =
+            due.iter().map(|o| o.relative_path.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["z.txt", "m.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn empty_debounce_has_no_deadline() {
+        let mut debounce = PathDebounce::new(COALESCE_WINDOW);
+        assert_eq!(debounce.next_deadline(), None);
+        assert!(debounce.drain_due(std::time::Instant::now()).is_empty());
+        assert!(debounce.is_empty());
     }
 
     #[test]

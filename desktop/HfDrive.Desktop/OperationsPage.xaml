@@ -2,7 +2,14 @@
     x:Class="HfDrive.Desktop.OperationsPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:vm="using:HfDrive.Desktop.ViewModels">
+    xmlns:vm="using:HfDrive.Desktop.ViewModels"
+    xmlns:local="using:HfDrive.Desktop">
+
+    <Page.Resources>
+        <!-- The app's shared converter (same one SettingsPage.xaml uses); WinUI
+             has no BooleanToVisibilityConverter in the presentation namespace. -->
+        <local:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+    </Page.Resources>
 
     <!-- Advanced / activity and recovery surface. Cards, section titles,
          descriptions and primary buttons come from the shared keys the shell
@@ -130,6 +137,87 @@
                     <TextBlock Text="{x:Bind ViewModel.ConnectionErrorText, Mode=OneWay}"
                                TextWrapping="Wrap"
                                Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+                </StackPanel>
+            </Border>
+
+            <!-- Remove connection: prepare → review → confirm. Nothing is
+                 removed by preparing; confirmation always names the exact
+                 reviewed preview and is disabled until it is current. -->
+            <Border Style="{StaticResource HfSettingsCardStyle}">
+                <StackPanel Spacing="12">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Remove connection"
+                                   Style="{StaticResource HfSettingsSectionTitleStyle}" />
+                        <TextBlock Style="{StaticResource HfSettingsDescriptionStyle}"
+                                   Text="Scoped to the connection ID entered at the top of this page. Preparing shows exactly what a removal would do and never removes anything; confirmation names the reviewed preview so a changed connection can never be removed from a stale review." />
+                    </StackPanel>
+
+                    <ComboBox Header="Removal mode"
+                              ItemsSource="{x:Bind ViewModel.UnlinkModes, Mode=OneTime}"
+                              SelectedItem="{x:Bind ViewModel.SelectedUnlinkMode, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch"
+                              AutomationProperties.Name="Removal mode">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:UnlinkModeChoice">
+                                <TextBlock Text="{x:Bind Display, Mode=OneTime}" TextWrapping="Wrap" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+
+                    <Button Content="Prepare removal preview"
+                            HorizontalAlignment="Stretch"
+                            Command="{x:Bind ViewModel.PrepareUnlinkCommand}" />
+
+                    <StackPanel Spacing="8"
+                                Visibility="{x:Bind ViewModel.UnlinkPreviewVisibility, Mode=OneWay}">
+                        <TextBlock Text="{x:Bind ViewModel.UnlinkResultText, Mode=OneWay}"
+                                   TextWrapping="Wrap" IsTextSelectionEnabled="True"
+                                   AutomationProperties.LiveSetting="Polite" />
+                        <TextBlock Text="{x:Bind ViewModel.UnlinkBlockingReasonsText, Mode=OneWay}"
+                                   TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+
+                        <TextBlock Text="{x:Bind ViewModel.UnlinkWarningText, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   Style="{StaticResource BodyStrongTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind ViewModel.HasUnlinkWarning, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+
+                        <TextBlock Text="Files the reviewed preview is affected by (review before confirming):"
+                                   Style="{StaticResource HfSettingsDescriptionStyle}" />
+                        <ListView ItemsSource="{x:Bind ViewModel.UnlinkAffectedFiles, Mode=OneWay}"
+                                  SelectionMode="None"
+                                  MaxHeight="220"
+                                  AutomationProperties.Name="Files affected by the removal preview">
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="vm:UnlinkFileRow">
+                                    <TextBlock Text="{x:Bind Display, Mode=OneTime}"
+                                               TextWrapping="Wrap"
+                                               FontFamily="Consolas"
+                                               FontSize="12"
+                                               IsTextSelectionEnabled="True"
+                                               Margin="0,2" />
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+
+                        <!-- Explicit consent is requested only when the reviewed
+                             preview discards unavailable bytes. -->
+                        <CheckBox IsChecked="{x:Bind ViewModel.UnlinkConsent, Mode=TwoWay}"
+                                  HorizontalAlignment="Stretch"
+                                  Visibility="{x:Bind ViewModel.UnlinkConsentVisibility, Mode=OneWay}">
+                            <TextBlock TextWrapping="Wrap"
+                                       Text="I understand this removal permanently discards the unavailable bytes listed above on this device, and that they cannot be recovered without re-syncing from the remote content." />
+                        </CheckBox>
+
+                        <Button Content="Confirm removal"
+                                HorizontalAlignment="Stretch"
+                                Style="{StaticResource AccentButtonStyle}"
+                                Command="{x:Bind ViewModel.ConfirmUnlinkCommand}" />
+
+                        <TextBlock Text="{x:Bind ViewModel.UnlinkErrorText, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+                    </StackPanel>
                 </StackPanel>
             </Border>
 

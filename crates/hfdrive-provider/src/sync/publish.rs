@@ -57,9 +57,20 @@ use crate::sync::plan::{
     build_base_view, build_local_intents, build_remote_view, record_common_bases, registry_digest,
     registry_item,
 };
-use crate::sync::remote::{RemoteError, RemoteHead, RemoteOps};
+use crate::sync::remote::{RemoteError, RemoteHead, RemoteIdentity, RemoteOps};
 
 /// Everything one round needs about the connection.
+async fn read_valid_head<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+) -> Result<Option<RemoteHead>, RemoteError> {
+    let head = ctx.remote.read_head(ctx.cancel).await?;
+    if let Some(head) = &head {
+        RemoteIdentity { workspace: ctx.workspace, root_item: ctx.root_item_id }
+            .check_head(&head.head)?;
+    }
+    Ok(head)
+}
+
 pub struct RoundContext<'a, R: RemoteOps> {
     pub state: &'a hfdrive_state::AccountStore,
     pub remote: &'a R,
@@ -259,7 +270,7 @@ async fn run_round_inner<R: RemoteOps>(
     driven: &mut Vec<OperationId>,
 ) -> Result<RoundOutcome, PublishError> {
     let mut outcome = RoundOutcome::default();
-    let now_ms = now_ms();
+    let round_started_ms = now_ms();
     let all = ctx.state.list_outbox(ctx.connection, None, u32::MAX).await?;
 
     // 1. Crash-safe resume: dispatched candidates are resolved by identity
@@ -283,7 +294,7 @@ async fn run_round_inner<R: RemoteOps>(
                 }
             }
             _ => {
-                if next_step(&entry, now_ms) != PhaseStep::Wait {
+                if next_step(&entry, round_started_ms) != PhaseStep::Wait {
                     driven.push(entry.operation_id);
                     planning.push(entry);
                 }
@@ -308,7 +319,7 @@ async fn run_round_inner<R: RemoteOps>(
     // 2. Remote head. Read-only connections never initialize; a writable
     //    connection without a head needs an explicit initialization intent.
     let baseline = ctx.state.baseline(ctx.connection).await?;
-    let head = match ctx.remote.read_head(ctx.cancel).await? {
+    let head = match read_valid_head(ctx).await? {
         Some(head) => head,
         None if baseline.applied_commit.is_some()
             || baseline.observed_commit.is_some()
@@ -448,7 +459,9 @@ async fn run_round_inner<R: RemoteOps>(
             // The conditional write may or may not have landed; the entry is
             // parked for identity-based resolution. Recorded as the actual
             // uncertainty it is, never as a fabricated failure.
-            park_for_rebase(ctx, &round_entries, RetryClass::Backoff, Some(500)).await?;
+            // A future retry deadline: an absolute 500 would be in the past
+            // and the parked entry would spin instead of backing off.
+            park_for_rebase(ctx, &round_entries, RetryClass::Backoff, Some(now_ms() + 500)).await?;
             for entry in &round_entries {
                 ctx.record_outbox_error(
                     entry.operation_id,
@@ -510,7 +523,7 @@ async fn classify_parked<R: RemoteOps>(
     let bundle: CandidateBundle =
         serde_json::from_value(bundle_json).map_err(|_| PublishError::UnsupportedFormat)?;
     let commit = bundle.commit_v1()?;
-    let Some(head) = ctx.remote.read_head(ctx.cancel).await? else {
+    let Some(head) = read_valid_head(ctx).await? else {
         return Ok(None);
     };
     if head.head.commit_id == commit.commit_id {
@@ -537,7 +550,7 @@ async fn resume_group<R: RemoteOps>(
             let bundle: CandidateBundle = serde_json::from_value(bundle_json.clone())
                 .map_err(|_| PublishError::UnsupportedFormat)?;
             let commit = bundle.commit_v1()?;
-            match ctx.remote.read_head(ctx.cancel).await? {
+            match read_valid_head(ctx).await? {
                 Some(head) if head.head.commit_id == commit.commit_id => Some(commit.commit_id),
                 _ => None,
             }
@@ -548,7 +561,7 @@ async fn resume_group<R: RemoteOps>(
         let committed = match committed_head {
             Some(commit_id) => Some(commit_id),
             None => {
-                let head = ctx.remote.read_head(ctx.cancel).await?;
+                let head = read_valid_head(ctx).await?;
                 match head {
                     Some(head) => {
                         ctx.remote

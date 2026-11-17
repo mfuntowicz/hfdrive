@@ -36,10 +36,10 @@ pub use events::{
 };
 pub use identity::{IdentityError, PlaceholderIdentity, IDENTITY_LEN};
 pub use ops::{
-    convert_published, create_placeholders, dehydrate, hydrate_range, revert_to_normal,
-    set_in_sync, set_pin_state, update_placeholder, FreeSpaceEvidence, GuardMismatch, GuardOutcome,
-    MetadataSpec, PinOutcome, PinRequest, PlaceholderCreate, PlaceholderOutcome,
-    PlaceholderRequestOutcome, UpdateSpec,
+    convert_published, create_placeholders, dehydrate, hydrate_range, read_placeholder_identity,
+    revert_to_normal, set_in_sync, set_pin_state, update_placeholder, FreeSpaceEvidence,
+    GuardMismatch, GuardOutcome, MetadataSpec, PinOutcome, PinRequest, PlaceholderCreate,
+    PlaceholderOutcome, PlaceholderRequestOutcome, UpdateSpec,
 };
 pub use registration::{
     register_sync_root, registered_sync_roots, sync_root_id, unregister_sync_root,

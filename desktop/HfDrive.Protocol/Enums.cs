@@ -265,6 +265,9 @@ public enum UnlinkMode
     SafeRemove,
     /// <summary>Disconnect only, keeping the registration for recovery.</summary>
     DisconnectKeepRegistration,
+    /// <summary>Remove the connection even where committed bytes cannot be retained locally;
+    /// requires explicit online-only data-loss consent.</summary>
+    RemoveUnavailable,
 }
 
 /// <summary>Probe check kind.</summary>

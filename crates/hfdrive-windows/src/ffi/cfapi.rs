@@ -36,7 +36,8 @@ use windows::Win32::Storage::CloudFilters::{
     CF_OPERATION_TYPE, CF_OPERATION_TYPE_ACK_DELETE, CF_OPERATION_TYPE_ACK_RENAME,
     CF_OPERATION_TYPE_TRANSFER_DATA, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
     CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAGS, CF_PLACEHOLDER_CREATE_INFO,
-    CF_PLACEHOLDER_INFO_BASIC, CF_PLACEHOLDER_RANGE_INFO_ONDISK, CF_PIN_STATE_PINNED,
+    CF_PLACEHOLDER_INFO_BASIC, CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH,
+    CF_PLACEHOLDER_RANGE_INFO_ONDISK, CF_PIN_STATE_PINNED,
     CF_PIN_STATE_EXCLUDED, CF_PIN_STATE_UNPINNED, CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE,
     CF_SET_PIN_FLAG_NONE, CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
 };
@@ -1605,6 +1606,83 @@ pub(crate) fn placeholder_info(handle: &OwnedHandle) -> Result<PlaceholderInfoBi
     }
 }
 
+/// `ERROR_INVALID_DATA` (13): the placeholder metadata the OS returned is
+/// not a well-formed `CF_PLACEHOLDER_BASIC_INFO` buffer.
+const ERROR_INVALID_DATA: u32 = 13;
+
+/// Byte offset of the inline `FileIdentity` flexible array inside the
+/// generated `CF_PLACEHOLDER_BASIC_INFO`: the fixed prefix the OS writes
+/// before the identity bytes. Derived from the generated struct, never from
+/// a handwritten layout.
+const IDENTITY_INFO_OFFSET: usize = offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+
+/// `ERROR_NOT_A_CLOUD_FILE` (376): the path is not a cloud placeholder at
+/// all — a plain file, a foreign provider's item, or no placeholder.
+pub(crate) const ERROR_NOT_A_CLOUD_FILE: u32 = 376;
+
+/// Read a placeholder's inline identity bytes through
+/// `CfGetPlaceholderInfo(CF_PLACEHOLDER_BASIC_INFO)`.
+///
+/// The result is exactly the `FileIdentityLength` bytes the OS stored with
+/// the placeholder; a placeholder without an identity yields an empty
+/// vector. The output buffer is sized from `IDENTITY_INFO_OFFSET` plus the
+/// generated `CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH`, so any identity the
+/// API can hold fits in one call, and a reported length that overruns the
+/// buffer is `ERROR_INVALID_DATA`, never an over-read.
+pub(crate) fn placeholder_identity(handle: &OwnedHandle) -> Result<Vec<u8>, u32> {
+    let mut buffer =
+        vec![0u8; IDENTITY_INFO_OFFSET + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize];
+    let mut returned = 0u32;
+    // SAFETY: `buffer` is a valid output buffer for the basic info class and
+    // is large enough for the fixed prefix plus the maximum identity length
+    // the generated API defines.
+    unsafe {
+        CfGetPlaceholderInfo(
+            super::volume::as_handle(handle),
+            CF_PLACEHOLDER_INFO_BASIC,
+            buffer.as_mut_ptr() as *mut c_void,
+            buffer.len() as u32,
+            Some(&mut returned),
+        )
+        .map_err(|e| super::error_code(&e))?;
+    }
+    // `FileIdentityLength` is the authoritative identity bound; `returned`
+    // is only the API's byte count and never widens the buffer.
+    identity_from_info_buffer(&buffer)
+}
+
+/// Extract the inline identity from one `CF_PLACEHOLDER_BASIC_INFO` output
+/// buffer. Pure and deterministic — no OS call — so the exact-length and
+/// bounds contract is testable without a registered sync root.
+fn identity_from_info_buffer(buffer: &[u8]) -> Result<Vec<u8>, u32> {
+    if buffer.len() < IDENTITY_INFO_OFFSET {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let mut info = CF_PLACEHOLDER_BASIC_INFO::default();
+    // SAFETY: `info` is a valid `CF_PLACEHOLDER_BASIC_INFO` whose fixed
+    // prefix (everything before the inline `FileIdentity` array) is exactly
+    // `IDENTITY_INFO_OFFSET` bytes; copying that prefix out of a buffer of
+    // at least that length is in bounds on both sides.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buffer.as_ptr(),
+            &mut info as *mut CF_PLACEHOLDER_BASIC_INFO as *mut u8,
+            IDENTITY_INFO_OFFSET,
+        );
+    }
+    let identity_len = info.FileIdentityLength as usize;
+    if identity_len > CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize {
+        return Err(ERROR_INVALID_DATA);
+    }
+    let end = IDENTITY_INFO_OFFSET
+        .checked_add(identity_len)
+        .ok_or(ERROR_INVALID_DATA)?;
+    buffer
+        .get(IDENTITY_INFO_OFFSET..end)
+        .map(|identity| identity.to_vec())
+        .ok_or(ERROR_INVALID_DATA)
+}
+
 /// On-disk (resident) ranges of a placeholder as `(offset, length)` pairs.
 pub(crate) fn on_disk_ranges(
     handle: &OwnedHandle,
@@ -1683,7 +1761,7 @@ mod tests {
         CF_CALLBACK_PARAMETERS_0_10, CF_CALLBACK_PARAMETERS_0_3,
         CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY, CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE,
         CF_OPERATION_PARAMETERS_0_0, CF_OPERATION_PARAMETERS_0_4, CF_OPERATION_PARAMETERS_0_6,
-        CF_OPERATION_PARAMETERS_0_7, CF_PLACEHOLDER_CREATE_INFO,
+        CF_OPERATION_PARAMETERS_0_7, CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_INFO,
     };
     use windows::core::HRESULT;
 
@@ -2001,6 +2079,77 @@ mod tests {
             entry(0),
             entry(0xC000_0035u32 as i32),
         ]));
+    }
+
+    // -- placeholder identity buffer contract --------------------------
+
+    /// Build a synthetic `CF_PLACEHOLDER_BASIC_INFO` output buffer: the
+    /// generated fixed prefix carrying `claimed_length`, followed by exactly
+    /// `identity` bytes (they may disagree, as a corrupt OS report would).
+    fn info_buffer(claimed_length: u32, identity: &[u8]) -> Vec<u8> {
+        let info = CF_PLACEHOLDER_BASIC_INFO {
+            FileIdentityLength: claimed_length,
+            ..Default::default()
+        };
+        let mut buffer = vec![0u8; super::IDENTITY_INFO_OFFSET + identity.len()];
+        // SAFETY: the fixed prefix occupies exactly `IDENTITY_INFO_OFFSET`
+        // bytes at the front of `info`, which is larger than that prefix.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &info as *const CF_PLACEHOLDER_BASIC_INFO as *const u8,
+                buffer.as_mut_ptr(),
+                super::IDENTITY_INFO_OFFSET,
+            );
+        }
+        buffer[super::IDENTITY_INFO_OFFSET..].copy_from_slice(identity);
+        buffer
+    }
+
+    #[test]
+    fn identity_buffer_extracts_exactly_the_reported_bytes() {
+        let identity = [0xABu8; 53];
+        assert_eq!(
+            super::identity_from_info_buffer(&info_buffer(53, &identity)),
+            Ok(identity.to_vec())
+        );
+        // A placeholder with no stored identity is an empty vector, not an
+        // error: it is simply not an HFDR placeholder.
+        assert_eq!(
+            super::identity_from_info_buffer(&info_buffer(0, &[])),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn identity_buffer_rejects_truncated_fixed_prefix() {
+        let identity = [1u8; 53];
+        let buffer = info_buffer(53, &identity);
+        for len in 0..super::IDENTITY_INFO_OFFSET {
+            assert_eq!(
+                super::identity_from_info_buffer(&buffer[..len]),
+                Err(super::ERROR_INVALID_DATA),
+                "prefix truncated to {len} bytes must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_buffer_rejects_length_overruns_without_overreading() {
+        let identity = [2u8; 53];
+        // Claimed identity longer than the bytes present after the prefix:
+        // rejected, never over-read.
+        assert_eq!(
+            super::identity_from_info_buffer(&info_buffer(54, &identity)),
+            Err(super::ERROR_INVALID_DATA)
+        );
+        // A claimed length beyond the generated API maximum is never trusted.
+        assert_eq!(
+            super::identity_from_info_buffer(&info_buffer(
+                super::CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH + 1,
+                &identity
+            )),
+            Err(super::ERROR_INVALID_DATA)
+        );
     }
 
     // -- production handlers with fabricated callback structs -----------

@@ -18,6 +18,8 @@
 //! * [`remote`] — the remote effect boundary (native Xet + conditional HEAD);
 //! * [`activity`] — live in-flight hydration/population spans for the
 //!   read-only `list_activity` projection;
+//! * [`recovery`] — unique, metadata-bound, hash-verified preservation copies
+//!   of dirty local bytes, taken before any destructive unlink work;
 //! * [`work_errors`] — classified durable failure recording for that
 //!   projection (safe codes/details, never tokens or payloads).
 //!
@@ -34,6 +36,7 @@ pub mod observe;
 pub mod outbox;
 pub mod plan;
 pub mod publish;
+pub mod recovery;
 pub mod registry;
 pub mod remote;
 pub mod work_errors;
@@ -45,7 +48,10 @@ pub use cfapi_pump::{PumpChild, PumpHost, PumpOutcome, run_pump};
 pub use controller::{
     ConnectionConfig, ConnectionHealth, ConnectionRuntime, RuntimeState, WatchFailure, WatchUpdate,
 };
-pub use engine::{ConnectionServices, EngineConfig, EngineError, SyncEngine, UnlinkOutcome, UnlinkPlan};
+pub use engine::{
+    ConnectionServices, EngineConfig, EngineError, SyncEngine, UnlinkFile, UnlinkMode,
+    UnlinkOutcome, UnlinkPlan,
+};
 pub use outbox::{PhaseStep, SyncIntent};
 pub use publish::{PublishError, RoundContext, RoundOutcome};
 pub use remote::{RemoteError, RemoteHead, RemoteOps};

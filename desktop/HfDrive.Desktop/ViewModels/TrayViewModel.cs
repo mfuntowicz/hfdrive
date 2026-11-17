@@ -186,6 +186,13 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     private bool _isPolling;
     private bool _selectionDirty;
 
+    /// <summary>
+    /// Connection id behind the current <see cref="SelectedConnection"/>, so a
+    /// status revision that rebuilds the same connection's row is never
+    /// mistaken for the user changing selection.
+    /// </summary>
+    private Guid? _selectedConnectionId;
+
     public TrayViewModel(ProviderSession session)
     {
         _session = session;
@@ -442,10 +449,17 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     private void ApplyStatus(long generation, StatusChangedEvent status)
     {
         if (generation != _session.Generation) return;
-        if (_statusGeneration != generation)
+        bool generationChanged = _statusGeneration != generation;
+        Guid? previousSelectedId = SelectedConnection?.Status.ConnectionId;
+        ConnectionStatus? previousSelectedStatus = previousSelectedId is { } previousId
+            && _connectionRecords.TryGetValue(previousId, out ConnectionStatus? previous)
+                ? previous
+                : null;
+        if (generationChanged)
         {
             _statusGeneration = generation;
             _haveStatus = false;
+            _selectedConnectionId = null;
         }
         if (_haveStatus && status.Sequence < _statusSequence) return;
         _haveStatus = true;
@@ -501,11 +515,34 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
         ApplySessionState();
         RebuildIssues();
 
-        // Status events refresh rows/summary/issues only. Per-connection list
-        // loads restart on an actual selection change (partial property hook)
-        // and while visible the panel's bounded poll keeps them fresh; a
-        // routine status delta must not restart paged history.
+        // Rows/summary/issues still update above. Only an activity-relevant
+        // revision prompts the same bounded poll as the timer; routine status
+        // deltas and connection-row rebuilds never restart paged history.
+        if (!generationChanged
+            && previousSelectedStatus is not null
+            && SelectedConnection is { } selected
+            && previousSelectedId == selected.Status.ConnectionId
+            && HasActivityRevisionChanged(previousSelectedStatus, selected.Status)
+            && IsPanelVisible)
+        {
+            _ = PollAsync(_lifetime.Token);
+        }
     }
+
+    private static bool HasActivityRevisionChanged(ConnectionStatus previous, ConnectionStatus current) =>
+        previous.Mode != current.Mode
+        || previous.Capability != current.Capability
+        || previous.State != current.State
+        || previous.Hydration != current.Hydration
+        || previous.ObservedCommit != current.ObservedCommit
+        || previous.PublishedCommit != current.PublishedCommit
+        || previous.AppliedCommit != current.AppliedCommit
+        || previous.ObservedGeneration != current.ObservedGeneration
+        || previous.PendingFiles != current.PendingFiles
+        || previous.DirtyFiles != current.DirtyFiles
+        || previous.ConflictFiles != current.ConflictFiles
+        || previous.PendingUploadBytes != current.PendingUploadBytes
+        || !Equals(previous.LastError, current.LastError);
 
     /// <summary>
     /// Publishes the current account's validated avatar URI. A missing/invalid
@@ -1089,8 +1126,11 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     /// so a hidden panel performs no background refresh.</summary>
     partial void OnSelectedConnectionChanged(TrayConnectionRow? value)
     {
+        Guid? connectionId = value?.Status.ConnectionId;
+        bool selectionChanged = _selectedConnectionId != connectionId;
+        _selectedConnectionId = connectionId;
         OnPropertyChanged(nameof(HasConnectionSelector));
-        if (value is null) return;
+        if (!selectionChanged || value is null) return;
         if (IsPanelVisible) _ = ReloadSelectionAsync(_lifetime.Token);
         else _selectionDirty = true;
     }
@@ -1100,7 +1140,7 @@ public sealed partial class TrayViewModel : ObservableObject, IDisposable
     public void EnsureSelectionLoaded()
     {
         if (_disposed) return;
-        if (_selectionDirty || HistoryItems.Count == 0)
+        if (_selectionDirty || !_historyLoaded)
         {
             _selectionDirty = false;
             _ = ReloadSelectionAsync(_lifetime.Token);

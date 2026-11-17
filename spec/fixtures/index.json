@@ -191,7 +191,23 @@
     {
       "name": "prepare_unlink_response_result",
       "file": "golden/prepare_unlink_response_result.json",
-      "description": "prepare_unlink result with block counts",
+      "description": "prepare_unlink result with block counts and the provider-reviewed unlink preview",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "prepare_unlink_response_result_remove_unavailable",
+      "file": "golden/prepare_unlink_response_result_remove_unavailable.json",
+      "description": "prepare_unlink result for the RemoveUnavailable mode: proceeding destroys online-only bytes and requires explicit affirmative consent; affected_files is producer-bounded at 200 entries",
+      "expectation": {
+        "parse": "accept"
+      }
+    },
+    {
+      "name": "unlink_request_remove_unavailable",
+      "file": "golden/unlink_request_remove_unavailable.json",
+      "description": "unlink request selecting RemoveUnavailable with the preview identity and explicit online-only data-loss consent (operation_id stays a fresh mutation id, never the preview id)",
       "expectation": {
         "parse": "accept"
       }
@@ -586,6 +602,97 @@
       "stage": "envelope",
       "error_code": "malformed_frame",
       "description": "import result empty_directory_count sent as a decimal string instead of a u32 JSON number is rejected"
+    },
+    {
+      "name": "reject_unlink_preview_id_number",
+      "file": "invalid/reject_unlink_preview_id_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request whose preview_id is a JSON number instead of a UUID string is rejected"
+    },
+    {
+      "name": "reject_unlink_preview_id_malformed",
+      "file": "invalid/reject_unlink_preview_id_malformed.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request whose preview_id is not a lowercase hyphenated UUID is rejected"
+    },
+    {
+      "name": "reject_unlink_accept_consent_string",
+      "file": "invalid/reject_unlink_accept_consent_string.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request whose accept_online_only_data_loss is a string instead of a bool is rejected"
+    },
+    {
+      "name": "reject_unlink_consent_missing",
+      "file": "invalid/reject_unlink_consent_missing.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request without the required accept_online_only_data_loss consent is rejected"
+    },
+    {
+      "name": "reject_unlink_mode_unknown",
+      "file": "invalid/reject_unlink_mode_unknown.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request whose mode is an unknown unlink_mode variant is rejected"
+    },
+    {
+      "name": "reject_unlink_unknown_body_member",
+      "file": "invalid/reject_unlink_unknown_body_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "unlink request body with an unknown member is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_fingerprint_number",
+      "file": "invalid/reject_prepare_unlink_result_fingerprint_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose preview_fingerprint is a JSON number instead of a string is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_consent_signal_string",
+      "file": "invalid/reject_prepare_unlink_result_consent_signal_string.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose online_only_data_loss is a string instead of a bool is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_affected_files_not_array",
+      "file": "invalid/reject_prepare_unlink_result_affected_files_not_array.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose affected_files is not an array is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_affected_file_size_number",
+      "file": "invalid/reject_prepare_unlink_result_affected_file_size_number.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose affected-file size is a JSON number instead of a decimal string is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_affected_file_unknown_member",
+      "file": "invalid/reject_prepare_unlink_result_affected_file_unknown_member.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose affected-file record carries an unknown member is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_affected_file_missing_field",
+      "file": "invalid/reject_prepare_unlink_result_affected_file_missing_field.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result whose affected-file record omits partial is rejected"
+    },
+    {
+      "name": "reject_prepare_unlink_result_preview_id_missing",
+      "file": "invalid/reject_prepare_unlink_result_preview_id_missing.json",
+      "stage": "envelope",
+      "error_code": "malformed_frame",
+      "description": "prepare_unlink result without the required preview_id is rejected"
     }
   ]
 }
