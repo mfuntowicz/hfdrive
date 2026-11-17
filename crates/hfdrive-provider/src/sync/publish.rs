@@ -56,9 +56,8 @@ use crate::sync::outbox::{
     intent_entry, next_step, parse_intent, staged_payload, transfer_id_for,
 };
 use crate::sync::plan::{
-    self, ActionFacts, DigestResolver, PlanError, PlanSources, PlannedRound, RemoteDigests,
-    build_base_view, build_local_intents, build_remote_view, record_common_bases, registry_digest,
-    registry_item,
+    self, ActionFacts, PlanCache, PlanError, PlanSources, PlannedRound, RemoteViewKey,
+    build_local_intents, record_common_bases, registry_digest, registry_item,
 };
 use crate::sync::remote::{RemoteError, RemoteHead, RemoteIdentity, RemoteOps};
 
@@ -87,6 +86,7 @@ pub struct RoundContext<'a, R: RemoteOps> {
     pub recovery_dir: &'a std::path::Path,
     pub scheduler: &'a crate::scheduler::Scheduler,
     pub echo: &'a tokio::sync::Mutex<crate::sync::observe::EchoTable>,
+    pub plan_cache: &'a PlanCache,
     pub cancel: &'a CancellationToken,
 }
 
@@ -361,30 +361,25 @@ async fn run_round_inner<R: RemoteOps>(
     };
     let remote_moved = baseline.applied_commit != Some(head.head.commit_id);
     let missing_materializations = plan::missing_materializations(ctx.state, ctx.connection, ctx.root).await?;
-    if planning.is_empty() && !remote_moved && missing_materializations.is_empty() {
-        // A successful quiet poll still proves which commit is observable.
-        // Do not leave initialized drives permanently without that evidence.
-        if baseline.observed_commit != Some(head.head.commit_id) {
-            ctx.state
-                .set_baseline(ctx.connection, BaselineKind::Observed, Some(head.head.commit_id))
-                .await?;
-        }
-        return Ok(outcome);
-    }
 
     ctx.state.set_baseline(ctx.connection, BaselineKind::Observed, Some(head.head.commit_id)).await?;
     // 3. Complete views and the pure merge. Read-only rounds reconcile in
     //    read-only mode: zero remote ops, local intents deferred, remote
     //    changes materialized through guarded local actions.
     let catalog_root = catalog_root_of(ctx, &head).await?;
-    let digests_source = RemoteDigests::new(ctx.remote, ctx.workspace);
-    let mut digests = DigestResolver::new(&digests_source, ctx.cancel);
-    let base = build_base_view(ctx.state, ctx.connection, baseline.applied_commit, &mut digests).await?;
+    let (base, remote) = ctx.plan_cache.load(
+        ctx.state,
+        ctx.remote,
+        RemoteViewKey {
+            connection: ctx.connection, workspace: ctx.workspace,
+            commit: head.head.commit_id, catalog_root,
+        },
+        baseline.applied_commit,
+        ctx.cancel,
+    ).await?;
     let base = plan::materialization_base(base, missing_materializations)?;
-    let remote = build_remote_view(ctx.remote, catalog_root, &mut digests, ctx.cancel).await?;
-    let names = collect_names(&base, &remote);
-    let intents = build_local_intents(&planning, &names);
-    let sources = PlanSources { base, remote, intents, names };
+    let intents = build_local_intents(&planning, &base, &remote);
+    let sources = PlanSources { base, remote, intents };
 
     let mut planned =
         plan::plan_round(ctx.state, ctx.connection, ctx.workspace, ctx.mode, &sources).await?;
@@ -396,6 +391,15 @@ async fn run_round_inner<R: RemoteOps>(
         }
     }
     planned.plan.local_actions = included_actions;
+    if planning.is_empty() && !remote_moved
+        && planned.plan.local_actions.is_empty()
+        && planned.plan.remote_ops.is_empty()
+        && planned.plan.conflicts.is_empty()
+    {
+        // Even a quiet round rechecks local evidence and reconciles. Avoid
+        // copying/resealing an unchanged namespace after that proof.
+        return Ok(outcome);
+    }
     let facts = bind_action_facts(ctx, &planned.plan, &sources).await?;
     plan::persist_plan_records(ctx.state, ctx.connection, &planned.plan, &facts).await?;
 
@@ -2145,18 +2149,6 @@ async fn item_path<R: RemoteOps>(
     Some(path)
 }
 
-fn collect_names(
-    base: &hfdrive_core::reconcile::CatalogView,
-    remote: &hfdrive_core::reconcile::CatalogView,
-) -> HashMap<ItemId, String> {
-    let mut names = HashMap::new();
-    for view in [base, remote] {
-        for item in view.iter() {
-            names.insert(item.item_id, item.name.clone());
-        }
-    }
-    names
-}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -2178,6 +2170,7 @@ pub use plan::ready_to_plan;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
 
@@ -2349,6 +2342,7 @@ mod tests {
             recovery_dir: fixture.directory.path(),
             scheduler,
             echo,
+            plan_cache: &fixture.plan_cache,
             cancel,
         }
     }
@@ -2366,21 +2360,13 @@ mod tests {
         let prior_publication = CommitId::new();
         account.set_baseline(connection, BaselineKind::Applied, Some(applied)).await.unwrap();
         account.set_baseline(connection, BaselineKind::Published, Some(prior_publication)).await.unwrap();
-        let remote = HeadOnlyRemote {
-            head: Some(RemoteHead {
-                head: HeadV1 {
-                    format: format::FORMAT_NAME.to_owned(),
-                    schema_version: format::SCHEMA_VERSION,
-                    workspace_id: workspace,
-                    root_item_id: root_item,
-                    commit_id: applied,
-                    generation: GenerationId::new(),
-                    required_features: Vec::new(),
-                },
-                etag: None,
-            }),
-            ..Default::default()
-        };
+        let revision = OperationId::new();
+        let records = [
+            item_record(root_item, None, "", ItemKind::Directory, None, revision),
+            item_record(ItemId::new(), Some(root_item), "file.bin", ItemKind::File, Some(VersionId::new()), revision),
+        ];
+        record_common_bases(account, connection, applied, &records).await.unwrap();
+        let (remote, catalog_root) = HeadOnlyRemote::catalog(workspace, applied, &records).await;
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();
         for (mode, writable) in [(ReconcileMode::ReadOnly, false), (ReconcileMode::Writable, true)] {
@@ -2399,6 +2385,7 @@ mod tests {
                 recovery_dir: directory.path(),
                 scheduler: &scheduler,
                 echo: &echo,
+                plan_cache: &fixture.plan_cache,
                 cancel: &cancel,
             };
             run_round(&context, writable).await.unwrap();
@@ -2407,6 +2394,54 @@ mod tests {
             assert_eq!(baseline.applied_commit, Some(applied));
             assert_eq!(baseline.published_commit, Some(prior_publication));
         }
+        use hfdrive_publication::MetadataRecord;
+        assert_eq!(remote.head_reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Commit(applied)), 2, "each round verifies the current commit binding");
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(records[1].content_version_id.unwrap())), 1);
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_edit_replans_with_cached_views_and_fresh_head() {
+        use hfdrive_publication::MetadataRecord;
+        let fixture = connection_fixture().await;
+        let applied = CommitId::new();
+        let revision = OperationId::new();
+        let records = [
+            item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision),
+            item_record(ItemId::new(), Some(fixture.root_item), "file.bin", ItemKind::File, Some(VersionId::new()), revision),
+        ];
+        record_common_bases(&fixture.account, fixture.connection, applied, &records).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, BaselineKind::Applied, Some(applied)).await.unwrap();
+        let (remote, catalog_root) = HeadOnlyRemote::catalog(fixture.workspace, applied, &records).await;
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let echo = tokio::sync::Mutex::new(crate::sync::observe::EchoTable::default());
+        let context = read_only_context(&fixture, &remote, &scheduler, &cancel, &echo);
+        let first = run_round(&context, false).await.unwrap();
+        assert!(first.deferred_operations.is_empty());
+
+        let created = ItemId::new();
+        let operation = OperationId::new();
+        std::fs::create_dir(fixture.root.join("local-folder")).unwrap();
+        let entry = intent_entry(
+            fixture.connection, operation, Some(created), Some(applied), None, 1,
+            &SyncIntent::Create {
+                item_id: *created.as_uuid(), parent_id: *fixture.root_item.as_uuid(),
+                name: "local-folder".to_owned(), kind: crate::sync::outbox::IntentKind::Directory,
+                content: None,
+            },
+        ).unwrap();
+        fixture.account.record_outbox(entry).await.unwrap();
+        let second = run_round(&context, false).await.unwrap();
+        assert_eq!(second.deferred_operations, vec![operation], "fresh outbox inputs must reach a fresh plan");
+        assert!(fixture.root.join("local-folder").is_dir());
+        assert_eq!(fixture.account.outbox_entry(fixture.connection, operation).await.unwrap().unwrap().state, OutboxState::Observed);
+        assert_eq!(remote.head_reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Commit(applied)), 2);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(records[1].content_version_id.unwrap())), 1);
         fixture.state.close().await.unwrap();
     }
 
@@ -2424,6 +2459,7 @@ mod tests {
             root: &fixture.root, staging_dir: fixture.directory.path(),
             recovery_dir: fixture.directory.path(), scheduler, cancel,
             echo,
+            plan_cache: &fixture.plan_cache,
         }
     }
 
@@ -2573,8 +2609,7 @@ mod tests {
         };
         let base = CatalogView::new(vec![item_state(&root), item_state(&file)]).unwrap();
         let remote_view = CatalogView::new(vec![item_state(&root), item_state(&changed)]).unwrap();
-        let names = collect_names(&base, &remote_view);
-        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let sources = PlanSources { base: Arc::new(base), remote: Arc::new(remote_view), intents: Vec::new() };
         let previous = CommitId::new();
         let target = CommitId::new();
         record_common_bases(
@@ -2756,10 +2791,9 @@ mod tests {
             item_state(&format::from_item_record_bytes(row.item_json.as_bytes()).unwrap())
         }).collect()).unwrap();
         assert!(!base.get(file.item_id).unwrap().deleted);
-        let names = collect_names(&base, &sources.remote);
         let second_sources = PlanSources {
-            intents: build_local_intents(std::slice::from_ref(&ready), &names),
-            base, remote: sources.remote, names,
+            intents: build_local_intents(std::slice::from_ref(&ready), &base, &sources.remote),
+            base: Arc::new(base), remote: sources.remote,
         };
         assert_eq!(second_sources.intents.len(), 1);
         let second = plan::plan_round(
@@ -2841,10 +2875,9 @@ mod tests {
         let first = item_record(ItemId::new(), Some(fixture.root_item), "beta.bin", ItemKind::File, Some(VersionId::new()), revision);
         let second = item_record(ItemId::new(), Some(fixture.root_item), "gamma.bin", ItemKind::File, Some(VersionId::new()), revision);
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let planned = planned_round(
             fixture.workspace,
@@ -2897,10 +2930,9 @@ mod tests {
             ));
         }
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&records[0])]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&records[0])]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![item_state(&records[0])]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&records[0])]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let planned =
             planned_round(fixture.workspace, records[1..].iter().cloned().map(create_op).collect());
@@ -2954,10 +2986,9 @@ mod tests {
             Some(VersionId::new()), revision,
         );
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&root), item_state(&remote_only)]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&root), item_state(&remote_only)]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         // The plan is empty of remote ops: the round published nothing.
         let planned = planned_round(fixture.workspace, Vec::new());
@@ -3001,10 +3032,9 @@ mod tests {
             Some(VersionId::new()), revision,
         );
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let planned = planned_round(
             fixture.workspace,
@@ -3142,10 +3172,9 @@ mod tests {
             Some(version), revision,
         );
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let digest = Sha256Digest::of(b"bound payload");
         let object = ObjectRef {
@@ -3241,10 +3270,9 @@ mod tests {
         let old_state =
             ItemState::from_record(&published_old, Some(Sha256Digest::of(b"stale")), Some(1)).unwrap();
         let sources = PlanSources {
-            base: CatalogView::new(vec![root_state.clone()]).unwrap(),
-            remote: CatalogView::new(vec![root_state.clone(), remote_state.clone(), old_state]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![root_state.clone()]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![root_state.clone(), remote_state.clone(), old_state]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let object = ObjectRef {
             key: PayloadKey::new(UploadId::new()),
@@ -3339,10 +3367,9 @@ mod tests {
         let published_kept =
             ItemState::from_record(&published_new, Some(new_digest), Some(new_size)).unwrap();
         let later_sources = PlanSources {
-            base: CatalogView::new(vec![root_state.clone()]).unwrap(),
-            remote: CatalogView::new(vec![root_state, remote_state, published_kept]).unwrap(),
+            base: Arc::new(CatalogView::new(vec![root_state.clone()]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![root_state, remote_state, published_kept]).unwrap()),
             intents: Vec::new(),
-            names: HashMap::new(),
         };
         let later_planned = planned_round(fixture.workspace, Vec::new());
         let second_commit = CommitId::new();
@@ -3695,9 +3722,9 @@ mod tests {
         fixture.account.set_subtree_excluded(fixture.connection, child.item_id, true).await.unwrap();
         fixture.account.set_subtree_excluded(fixture.connection, child.item_id, false).await.unwrap();
         let sources = PlanSources {
-            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
-            remote: CatalogView::new(vec![item_state(&root), item_state(&child)]).unwrap(),
-            intents: Vec::new(), names: HashMap::new(),
+            base: Arc::new(CatalogView::new(vec![item_state(&root)]).unwrap()),
+            remote: Arc::new(CatalogView::new(vec![item_state(&root), item_state(&child)]).unwrap()),
+            intents: Vec::new(),
         };
         let planned = plan::plan_round(
             &fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources,
@@ -3837,8 +3864,7 @@ mod tests {
             item_state(&case_renamed),
         ])
         .unwrap();
-        let names = collect_names(&base, &remote_view);
-        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let sources = PlanSources { base: Arc::new(base), remote: Arc::new(remote_view), intents: Vec::new() };
         let planned =
             plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
                 .await
@@ -3918,8 +3944,7 @@ mod tests {
         let base = CatalogView::new(vec![item_state(&root), item_state(&old_parent), item_state(&notes)]).unwrap();
         let remote_view =
             CatalogView::new(vec![item_state(&root), item_state(&new_parent), item_state(&updated)]).unwrap();
-        let names = collect_names(&base, &remote_view);
-        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let sources = PlanSources { base: Arc::new(base), remote: Arc::new(remote_view), intents: Vec::new() };
         let planned =
             plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
                 .await
@@ -3997,8 +4022,7 @@ mod tests {
             item_state(&updated),
         ])
         .unwrap();
-        let names = collect_names(&base, &remote_view);
-        let sources = PlanSources { base, remote: remote_view, intents, names };
+        let sources = PlanSources { base: Arc::new(base), remote: Arc::new(remote_view), intents };
         let planned =
             plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
                 .await
@@ -4078,8 +4102,7 @@ mod tests {
         };
         let base = CatalogView::new(vec![item_state(&root), item_state(&report)]).unwrap();
         let remote_view = CatalogView::new(vec![item_state(&root), item_state(&report)]).unwrap();
-        let names = collect_names(&base, &remote_view);
-        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let sources = PlanSources { base: Arc::new(base), remote: Arc::new(remote_view), intents: Vec::new() };
         let plan = ReconcilePlan {
             workspace_id: fixture.workspace,
             mode: ReconcileMode::Writable,

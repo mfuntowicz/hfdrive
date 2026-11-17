@@ -2423,6 +2423,7 @@ mod tests {
                 connection,
                 workspace,
                 root_item,
+                ..
             } = fixture;
             let cancel = CancellationToken::new();
             let (_notifications, receiver) = tokio::sync::mpsc::channel(1);

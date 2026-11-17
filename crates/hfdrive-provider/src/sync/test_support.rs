@@ -17,12 +17,89 @@ use crate::remote_watch::{EventFeed, RemoteEvents};
 
 use super::remote::{RangeSource, RemoteError, RemoteHead, RemoteOps};
 
-/// A HEAD-only boundary: unexpected effects fail the test, never pretend success.
+/// A read-only boundary: unexpected effects fail the test, never pretend success.
 #[derive(Default)]
 pub(crate) struct HeadOnlyRemote {
     pub head: Option<RemoteHead>,
     pub head_reads: Arc<AtomicUsize>,
     pub metadata: Option<Bytes>,
+    pub records: Vec<(MetadataRecord, Bytes)>,
+    pub metadata_reads: std::sync::Mutex<Vec<MetadataRecord>>,
+}
+
+impl HeadOnlyRemote {
+    pub fn metadata_read_count(&self, record: MetadataRecord) -> usize {
+        self.metadata_reads.lock().unwrap().iter().filter(|read| **read == record).count()
+    }
+
+    /// Canonical committed metadata for deterministic planning/cache tests.
+    pub async fn catalog(
+        workspace: hfdrive_core::ids::WorkspaceId,
+        commit: CommitId,
+        items: &[hfdrive_core::format::ItemRecord],
+    ) -> (Self, hfdrive_core::catalog::CatalogRoot) {
+        use hfdrive_core::catalog::{CatalogWriter, InMemoryPageStore, PageSink};
+        use hfdrive_core::format::{self, CommitV1, HeadV1};
+        use hfdrive_core::ids::{DeviceId, GenerationId};
+        let root_item = items.iter().find(|item| item.parent_id.is_none()).unwrap();
+        let (root, initial) = hfdrive_core::catalog::initialize(root_item.item_id, root_item.item_revision).unwrap();
+        let mut store = InMemoryPageStore::new();
+        for (hash, page) in &initial.pages {
+            store.store(*hash, page).await.unwrap();
+        }
+        let mut writer = CatalogWriter::new(&mut store, root);
+        for item in items {
+            writer.insert_item(item).await.unwrap();
+        }
+        let catalog = writer.commit().unwrap();
+        let mut remote = Self::default();
+        for (hash, page) in initial.pages.into_iter().chain(catalog.pages) {
+            remote.records.push((MetadataRecord::Catalog(hash), format::to_page_bytes(&page).unwrap().into()));
+        }
+        for item in items {
+            if let Some(version) = item.content_version_id {
+                remote.records.push((MetadataRecord::Version(version), version_metadata(workspace, version)));
+            }
+        }
+        let commit_record = CommitV1 {
+            format: format::FORMAT_NAME.to_owned(), schema_version: format::SCHEMA_VERSION,
+            workspace_id: workspace, commit_id: commit, parent_commit_id: None,
+            catalog_root: catalog.root.digest(), operation_ids: vec![root_item.item_revision],
+            changes: Vec::new(), device_id: DeviceId::new(),
+            created_at: "2026-11-17T00:00:00Z".to_owned(),
+        };
+        remote.records.push((MetadataRecord::Commit(commit), format::to_commit_bytes(&commit_record).unwrap().into()));
+        remote.head = Some(RemoteHead {
+            head: HeadV1 {
+                format: format::FORMAT_NAME.to_owned(), schema_version: format::SCHEMA_VERSION,
+                workspace_id: workspace, root_item_id: root_item.item_id, commit_id: commit,
+                generation: GenerationId::new(), required_features: Vec::new(),
+            },
+            etag: None,
+        });
+        (remote, catalog.root)
+    }
+}
+
+pub(crate) fn version_metadata(
+    workspace: hfdrive_core::ids::WorkspaceId,
+    version: hfdrive_core::ids::VersionId,
+) -> Bytes {
+    use hfdrive_core::format::{self, DisplayMetadata, VersionV1};
+    use hfdrive_core::ids::UploadId;
+    use hfdrive_core::storage::{PayloadKey, Sha256Digest, XetFileId};
+    format::to_version_bytes(&VersionV1 {
+        format: format::FORMAT_NAME.to_owned(), schema_version: format::SCHEMA_VERSION,
+        workspace_id: workspace, version_id: version,
+        object_key: PayloadKey::new(UploadId::new()), size: 4,
+        sha256: Sha256Digest::of(version.as_bytes()),
+        xet_file_id: Some(XetFileId::new(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+        ).unwrap()),
+        display: DisplayMetadata {
+            name: "file.bin".to_owned(), modified_at: "2026-11-17T00:00:00Z".to_owned(),
+        },
+    }).unwrap().into()
 }
 
 pub(crate) struct UnusedReader;
@@ -99,10 +176,12 @@ impl RemoteOps for HeadOnlyRemote {
 
     async fn read_metadata(
         &self,
-        _: MetadataRecord,
+        record: MetadataRecord,
         _: &CancellationToken,
     ) -> Result<Bytes, RemoteError> {
-        self.metadata.clone().ok_or(RemoteError::RemoteContentUnavailable)
+        self.metadata_reads.lock().unwrap().push(record);
+        self.records.iter().find(|(key, _)| *key == record).map(|(_, body)| body.clone())
+            .or_else(|| self.metadata.clone()).ok_or(RemoteError::RemoteContentUnavailable)
     }
 
     async fn ingest_payload(
@@ -158,6 +237,7 @@ pub(crate) struct TestConnection {
     pub connection: hfdrive_core::ids::ConnectionId,
     pub workspace: hfdrive_core::ids::WorkspaceId,
     pub root_item: hfdrive_core::ids::ItemId,
+    pub plan_cache: super::plan::PlanCache,
 }
 
 pub(crate) async fn connection_fixture() -> TestConnection {
@@ -204,5 +284,8 @@ pub(crate) async fn connection_fixture() -> TestConnection {
         revision: OperationId::new(), content_version_id: None, deleted: false,
         metadata_json: serde_json::json!({}),
     }).await.unwrap();
-    TestConnection { directory, root, state, account, connection: setup.connection_id, workspace, root_item }
+    TestConnection {
+        directory, root, state, account, connection: setup.connection_id, workspace, root_item,
+        plan_cache: super::plan::PlanCache::default(),
+    }
 }

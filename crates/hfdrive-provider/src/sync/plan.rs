@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hfdrive_core::catalog::{CatalogReader, CatalogRoot, PageSource};
 use hfdrive_core::format::{self, ItemRecord};
@@ -74,6 +75,90 @@ impl From<ReconcileError> for PlanError {
 // ---------------------------------------------------------------------------
 // Catalog sources
 // ---------------------------------------------------------------------------
+/// One immutable remote namespace. The commit and its verified catalog root
+/// both participate, so neither another connection nor another workspace can
+/// reuse a view merely because it names the same commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteViewKey {
+    pub connection: ConnectionId,
+    pub workspace: WorkspaceId,
+    pub commit: CommitId,
+    pub catalog_root: CatalogRoot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BaseViewKey {
+    connection: ConnectionId,
+    workspace: WorkspaceId,
+    applied_commit: CommitId,
+}
+
+#[derive(Default)]
+struct CachedViews {
+    base: Option<(BaseViewKey, Arc<CatalogView>)>,
+    remote: Option<(RemoteViewKey, Arc<CatalogView>)>,
+}
+
+/// Runtime-owned, two-slot cache: one full sealed base and one remote view.
+/// Replacement evicts the previous slot; no commit history accumulates here.
+/// The async lock covers misses as well as hits, so concurrent callers cannot
+/// duplicate a load. Only successful complete views enter the cache.
+///
+/// HEAD/commit verification, local intent loading, materialization evidence
+/// and reconciliation remain per-round work. In particular, the K16 planning
+/// overlay must never replace the full base retained here.
+#[derive(Default)]
+pub struct PlanCache {
+    views: tokio::sync::Mutex<CachedViews>,
+}
+
+impl PlanCache {
+    pub(crate) async fn load<R: RemoteOps>(
+        &self,
+        state: &AccountStore,
+        remote: &R,
+        key: RemoteViewKey,
+        applied_commit: Option<CommitId>,
+        cancel: &CancellationToken,
+    ) -> Result<(Arc<CatalogView>, Arc<CatalogView>), PlanError> {
+        let applied_commit = applied_commit
+            .ok_or_else(|| PlanError::MissingContext("applied common-base commit".to_owned()))?;
+        let base_key = BaseViewKey {
+            connection: key.connection, workspace: key.workspace, applied_commit,
+        };
+        let mut views = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(RemoteError::Cancelled.into()),
+            views = self.views.lock() => views,
+        };
+        let source = RemoteDigests::new(remote, key.workspace);
+        let mut digests = DigestResolver::new(&source, cancel);
+        let base = match &views.base {
+            Some((cached_key, view)) if *cached_key == base_key => Arc::clone(view),
+            _ => {
+                views.base = None;
+                let view = Arc::new(build_base_view(
+                    state, key.connection, Some(applied_commit), &mut digests,
+                ).await?);
+                views.base = Some((base_key, Arc::clone(&view)));
+                view
+            }
+        };
+        let remote = match &views.remote {
+            Some((cached_key, view)) if *cached_key == key => Arc::clone(view),
+            _ => {
+                views.remote = None;
+                let view = Arc::new(build_remote_view(
+                    remote, key.catalog_root, &mut digests, cancel,
+                ).await?);
+                views.remote = Some((key, Arc::clone(&view)));
+                view
+            }
+        };
+        Ok((base, remote))
+    }
+}
+
 
 /// Page source backed by bounded remote metadata reads with a per-cycle
 /// content-hash cache. A page whose bytes do not hash to their address is
@@ -126,11 +211,9 @@ impl<R: RemoteOps> PageSource for RemotePages<'_, R> {
 
 /// The prepared merge inputs.
 pub struct PlanSources {
-    pub base: CatalogView,
-    pub remote: CatalogView,
+    pub base: Arc<CatalogView>,
+    pub remote: Arc<CatalogView>,
     pub intents: Vec<LocalIntent>,
-    /// Item names by id for display metadata (base + remote).
-    pub names: HashMap<ItemId, String>,
 }
 
 /// A planning round's result, already persisted where durability matters.
@@ -168,7 +251,11 @@ impl From<hfdrive_core::reconcile::IntentOutcomeKind> for IntentOutcomeKind {
 /// metadata-only intents always join. Origin is always `LocalEdit`: intents
 /// created from provider-applied materialization never exist (echo
 /// suppression), and `Materialized` bookkeeping never publishes.
-pub fn build_local_intents(entries: &[OutboxEntry], names: &HashMap<ItemId, String>) -> Vec<LocalIntent> {
+pub fn build_local_intents(
+    entries: &[OutboxEntry],
+    base: &CatalogView,
+    remote: &CatalogView,
+) -> Vec<LocalIntent> {
     let mut intents = Vec::new();
     for entry in entries {
         if entry.state == OutboxState::Complete {
@@ -180,12 +267,15 @@ pub fn build_local_intents(entries: &[OutboxEntry], names: &HashMap<ItemId, Stri
             // Payload not bound yet; this entry joins a later round.
             continue;
         }
-        let name = names.get(&intent.item_id()).cloned().unwrap_or_default();
+        let name = remote.get(intent.item_id())
+            .or_else(|| base.get(intent.item_id()))
+            .map(|item| item.name.as_str())
+            .unwrap_or_default();
         if let Some(local) = intent.to_local_intent(
             entry.operation_id,
             LocalOrigin::LocalEdit,
             entry.observed_generation,
-            &name,
+            name,
             entry.object_ref.as_ref(),
         ) {
             intents.push(local);
@@ -246,9 +336,12 @@ pub(crate) async fn missing_materializations(
 /// a descendant still has older observation evidence. The sealed common-base
 /// rows are untouched; the unchanged remote view then plans guarded creates.
 pub(crate) fn materialization_base(
-    base: CatalogView,
+    base: Arc<CatalogView>,
     mut missing: HashSet<ItemId>,
-) -> Result<CatalogView, PlanError> {
+) -> Result<Arc<CatalogView>, PlanError> {
+    if missing.is_empty() {
+        return Ok(base);
+    }
     if let Some(root) = base.root_id() {
         missing.remove(&root);
     }
@@ -272,7 +365,7 @@ pub(crate) fn materialization_base(
             }
         }
     }
-    Ok(CatalogView::new(base.iter().filter(|item| !missing.contains(&item.item_id)).cloned().collect())?)
+    Ok(Arc::new(CatalogView::new(base.iter().filter(|item| !missing.contains(&item.item_id)).cloned().collect())?))
 }
 
 /// Walks the committed remote catalog into a complete namespace view.
@@ -721,6 +814,239 @@ impl<R: RemoteOps> DigestSource for RemoteDigests<'_, R> {
 mod tests {
     use super::*;
 
+    fn cache_records(root_item: ItemId) -> [ItemRecord; 2] {
+        let revision = OperationId::new();
+        let root = ItemRecord {
+            item_id: root_item, parent_id: None, name: String::new(),
+            kind: format::ItemKind::Directory, item_revision: revision,
+            content_version_id: None, deleted: false, content_operation: revision,
+            location_operation: revision, deletion_operation: None,
+        };
+        let file = ItemRecord {
+            item_id: ItemId::new(), parent_id: Some(root_item), name: "file.bin".to_owned(),
+            kind: format::ItemKind::File, content_version_id: Some(hfdrive_core::ids::VersionId::new()),
+            ..root.clone()
+        };
+        [root, file]
+    }
+
+    #[tokio::test]
+    async fn plan_cache_coalesces_loads_and_shares_complete_views() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture, version_metadata};
+        use hfdrive_publication::MetadataRecord;
+        let fixture = connection_fixture().await;
+        let base_records = cache_records(fixture.root_item);
+        let applied = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, applied, &base_records).await.unwrap();
+        let mut current = base_records.clone();
+        current[1].content_version_id = Some(hfdrive_core::ids::VersionId::new());
+        current[1].content_operation = OperationId::new();
+        current[1].item_revision = current[1].content_operation;
+        let commit = CommitId::new();
+        let (mut remote, catalog_root) = HeadOnlyRemote::catalog(fixture.workspace, commit, &current).await;
+        let base_version = base_records[1].content_version_id.unwrap();
+        let remote_version = current[1].content_version_id.unwrap();
+        remote.records.push((MetadataRecord::Version(base_version), version_metadata(fixture.workspace, base_version)));
+        let key = RemoteViewKey {
+            connection: fixture.connection, workspace: fixture.workspace, commit, catalog_root,
+        };
+        let cancel = CancellationToken::new();
+        let cache = &fixture.plan_cache;
+        let (first, second) = tokio::join!(
+            cache.load(&fixture.account, &remote, key, Some(applied), &cancel),
+            cache.load(&fixture.account, &remote, key, Some(applied), &cancel),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert!(Arc::ptr_eq(&first.1, &second.1));
+        assert_eq!(first.0.get(base_records[1].item_id).unwrap().content_version_id, Some(base_version));
+        assert_eq!(first.1.get(base_records[1].item_id).unwrap().content_version_id, Some(remote_version));
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(base_version)), 1, "one base load");
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(remote_version)), 1, "one remote load");
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+
+        // A hit needs neither a SQL namespace read nor any immutable metadata:
+        // closing the real worker makes an accidental base reload fail.
+        fixture.state.close().await.unwrap();
+        let hit = cache.load(&fixture.account, &remote, key, Some(applied), &cancel).await.unwrap();
+        assert!(Arc::ptr_eq(&hit.0, &first.0));
+        assert!(Arc::ptr_eq(&hit.1, &first.1));
+        assert_eq!(remote.metadata_reads.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn plan_cache_rebuilds_changed_keys_and_evicts_previous_views() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        use hfdrive_publication::MetadataRecord;
+        let fixture = connection_fixture().await;
+        let records = cache_records(fixture.root_item);
+        let applied = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, applied, &records).await.unwrap();
+        let (remote, catalog_root) = HeadOnlyRemote::catalog(fixture.workspace, applied, &records).await;
+        let key = RemoteViewKey {
+            connection: fixture.connection, workspace: fixture.workspace, commit: applied, catalog_root,
+        };
+        let cache = PlanCache::default();
+        let cancel = CancellationToken::new();
+        let first = cache.load(&fixture.account, &remote, key, Some(applied), &cancel).await.unwrap();
+        let old_base = Arc::downgrade(&first.0);
+        let old_remote = Arc::downgrade(&first.1);
+
+        // A new HEAD commit misses even if its tree is byte-identical.
+        let new_commit = CommitId::new();
+        let (same_tree, same_root) = HeadOnlyRemote::catalog(fixture.workspace, new_commit, &records).await;
+        assert_eq!(catalog_root, same_root);
+        let changed_head = RemoteViewKey { commit: new_commit, ..key };
+        let second = cache.load(&fixture.account, &same_tree, changed_head, Some(applied), &cancel).await.unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert!(!Arc::ptr_eq(&first.1, &second.1));
+        assert_eq!(same_tree.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+
+        // The root is independently load-bearing in the key.
+        let mut renamed = records.clone();
+        renamed[1].name = "remote-name.bin".to_owned();
+        let (changed_tree, new_root) = HeadOnlyRemote::catalog(fixture.workspace, new_commit, &renamed).await;
+        assert_ne!(catalog_root, new_root);
+        let changed_root = RemoteViewKey { catalog_root: new_root, ..changed_head };
+        let third = cache.load(&fixture.account, &changed_tree, changed_root, Some(applied), &cancel).await.unwrap();
+        assert!(Arc::ptr_eq(&second.0, &third.0));
+        assert!(!Arc::ptr_eq(&second.1, &third.1));
+        assert_eq!(third.1.get(records[1].item_id).unwrap().name, "remote-name.bin");
+        assert_eq!(changed_tree.metadata_read_count(MetadataRecord::Catalog(new_root.digest())), 1);
+
+        let next_applied = CommitId::new();
+        let mut next_base = records.clone();
+        next_base[1].name = "applied-name.bin".to_owned();
+        record_common_bases(&fixture.account, fixture.connection, next_applied, &next_base).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(next_applied)).await.unwrap();
+        let baseline = fixture.account.baseline(fixture.connection).await.unwrap();
+        let fourth = cache.load(&fixture.account, &changed_tree, changed_root, baseline.applied_commit, &cancel).await.unwrap();
+        assert!(!Arc::ptr_eq(&third.0, &fourth.0));
+        assert!(Arc::ptr_eq(&third.1, &fourth.1));
+        assert_eq!(fourth.0.get(records[1].item_id).unwrap().name, "applied-name.bin");
+        assert_eq!(changed_tree.metadata_read_count(MetadataRecord::Version(records[1].content_version_id.unwrap())), 2);
+        assert_eq!(changed_tree.metadata_read_count(MetadataRecord::Catalog(new_root.digest())), 1);
+
+        drop((first, second, third));
+        assert!(old_base.upgrade().is_none(), "only the current base is retained");
+        assert!(old_remote.upgrade().is_none(), "only the current remote is retained");
+        let current_base = Arc::downgrade(&fourth.0);
+        let current_remote = Arc::downgrade(&fourth.1);
+        drop(fourth);
+        drop(cache);
+        assert!(current_base.upgrade().is_none());
+        assert!(current_remote.upgrade().is_none(), "runtime cache disposal retains no namespace");
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_cache_never_shares_across_connection_or_workspace() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        use hfdrive_publication::MetadataRecord;
+        let first_fixture = connection_fixture().await;
+        let second_fixture = connection_fixture().await;
+        let records = cache_records(first_fixture.root_item);
+        let applied = CommitId::new();
+        for fixture in [&first_fixture, &second_fixture] {
+            record_common_bases(&fixture.account, fixture.connection, applied, &records).await.unwrap();
+        }
+        let (remote, catalog_root) = HeadOnlyRemote::catalog(first_fixture.workspace, applied, &records).await;
+        let key = RemoteViewKey {
+            connection: first_fixture.connection, workspace: first_fixture.workspace,
+            commit: applied, catalog_root,
+        };
+        let cache = PlanCache::default();
+        let cancel = CancellationToken::new();
+        let first = cache.load(&first_fixture.account, &remote, key, Some(applied), &cancel).await.unwrap();
+        let other_connection = RemoteViewKey { connection: second_fixture.connection, ..key };
+        let second = cache.load(&second_fixture.account, &remote, other_connection, Some(applied), &cancel).await.unwrap();
+        assert!(!Arc::ptr_eq(&first.0, &second.0));
+        assert!(!Arc::ptr_eq(&first.1, &second.1));
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 2);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(records[1].content_version_id.unwrap())), 2);
+
+        let (foreign_remote, foreign_root) = HeadOnlyRemote::catalog(second_fixture.workspace, applied, &records).await;
+        assert_eq!(catalog_root, foreign_root, "catalog bytes deliberately coincide");
+        let other_workspace = RemoteViewKey { workspace: second_fixture.workspace, ..other_connection };
+        let third = cache.load(&second_fixture.account, &foreign_remote, other_workspace, Some(applied), &cancel).await.unwrap();
+        assert!(!Arc::ptr_eq(&second.0, &third.0));
+        assert!(!Arc::ptr_eq(&second.1, &third.1));
+        assert_eq!(foreign_remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+        assert_eq!(foreign_remote.metadata_read_count(MetadataRecord::Version(records[1].content_version_id.unwrap())), 1);
+        first_fixture.state.close().await.unwrap();
+        second_fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_base_rechecks_generation_zero_materialization() {
+        use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+        use hfdrive_publication::MetadataRecord;
+        let fixture = connection_fixture().await;
+        let records = cache_records(fixture.root_item);
+        let child = &records[1];
+        let version = child.content_version_id.unwrap();
+        let applied = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, applied, &records).await.unwrap();
+        fixture.account.upsert_item(registry_item(
+            fixture.connection, child, Some(Sha256Digest::of(version.as_bytes())), Some(4), None,
+        )).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, child.item_id, true).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, child.item_id, false).await.unwrap();
+        assert_eq!(fixture.account.observation(fixture.connection, child.item_id).await.unwrap().unwrap().generation, 0);
+        let (remote, catalog_root) = HeadOnlyRemote::catalog(fixture.workspace, applied, &records).await;
+        let key = RemoteViewKey {
+            connection: fixture.connection, workspace: fixture.workspace, commit: applied, catalog_root,
+        };
+        let cancel = CancellationToken::new();
+        let path = fixture.root.join(&child.name);
+        std::fs::write(&path, b"data").unwrap();
+        let (full_base, remote_view) = fixture.plan_cache.load(
+            &fixture.account, &remote, key, Some(applied), &cancel,
+        ).await.unwrap();
+        let missing = missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+        assert!(missing.is_empty());
+        assert!(Arc::ptr_eq(&materialization_base(Arc::clone(&full_base), missing).unwrap(), &full_base));
+
+        std::fs::remove_file(&path).unwrap();
+        let (hit, hit_remote) = fixture.plan_cache.load(
+            &fixture.account, &remote, key, Some(applied), &cancel,
+        ).await.unwrap();
+        assert!(Arc::ptr_eq(&hit, &full_base));
+        assert!(Arc::ptr_eq(&hit_remote, &remote_view));
+        let missing = missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+        assert_eq!(missing, HashSet::from([child.item_id]));
+        let sources = PlanSources {
+            base: materialization_base(hit, missing).unwrap(), remote: hit_remote, intents: Vec::new(),
+        };
+        assert!(!sources.base.contains(child.item_id));
+        assert!(full_base.contains(child.item_id), "the cached base must remain complete");
+        let planned = plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources).await.unwrap();
+        assert!(planned.plan.remote_ops.is_empty());
+        assert_eq!(planned.plan.local_actions.len(), 1);
+        assert_eq!(planned.plan.local_actions[0].action, hfdrive_core::reconcile::LocalActionKind::CreatePlaceholder);
+        assert!(planned.plan.local_actions[0].expected.is_none());
+        assert_eq!(planned.plan.local_actions[0].target.as_ref().unwrap().content_version_id, Some(version));
+
+        // Presence changes again with no HEAD or base change. An overlay
+        // accidentally stored in the cache would keep proposing a create.
+        std::fs::write(&path, b"data").unwrap();
+        let (base, remote_view) = fixture.plan_cache.load(
+            &fixture.account, &remote, key, Some(applied), &cancel,
+        ).await.unwrap();
+        let missing = missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+        let base = materialization_base(base, missing).unwrap();
+        assert!(Arc::ptr_eq(&base, &full_base));
+        let sources = PlanSources { base, remote: remote_view, intents: Vec::new() };
+        let planned = plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources).await.unwrap();
+        assert!(planned.plan.local_actions.is_empty());
+        assert!(planned.plan.remote_ops.is_empty());
+        assert_eq!(fixture.account.list_common_bases(fixture.connection, applied).await.unwrap().len(), records.len());
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Catalog(catalog_root.digest())), 1);
+        assert_eq!(remote.metadata_read_count(MetadataRecord::Version(version)), 1);
+        fixture.state.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn materialization_base_keeps_present_items_and_removes_missing_parent_descendants() {
         let fixture = crate::sync::test_support::connection_fixture().await;
@@ -756,12 +1082,12 @@ mod tests {
 
         let missing = missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
         assert_eq!(missing, HashSet::from([missing_parent]));
-        let remote = CatalogView::new(records.iter().map(|record| ItemState::from_record(record, None, None).unwrap()).collect()).unwrap();
-        let base = materialization_base(remote.clone(), missing).unwrap();
+        let remote = Arc::new(CatalogView::new(records.iter().map(|record| ItemState::from_record(record, None, None).unwrap()).collect()).unwrap());
+        let base = materialization_base(Arc::clone(&remote), missing).unwrap();
         assert!(base.contains(present), "a present generation-zero item must retain its base");
         assert!(!base.contains(missing_parent));
         assert!(!base.contains(descendant), "omission must preserve parent closure");
-        let sources = PlanSources { base, remote, intents: Vec::new(), names: HashMap::new() };
+        let sources = PlanSources { base, remote, intents: Vec::new() };
         let planned = plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources).await.unwrap();
         assert!(planned.plan.remote_ops.is_empty());
         assert_eq!(planned.plan.local_actions.len(), 2);

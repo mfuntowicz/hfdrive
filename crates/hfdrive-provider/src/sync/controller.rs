@@ -42,6 +42,7 @@ use crate::sync::outbox::{
     IntentKind, PendingContent, PhaseStep, SyncIntent, display_timestamp, intent_entry,
     next_step, parse_intent,
 };
+use crate::sync::plan::PlanCache;
 use crate::sync::publish::{PublishError, RoundContext, RoundOutcome, run_round, upload_entry};
 use crate::sync::remote::RemoteOps;
 
@@ -192,6 +193,8 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     paused: watch::Sender<bool>,
     health: watch::Sender<ConnectionHealth>,
     echo: tokio::sync::Mutex<EchoTable>,
+    /// Immutable planning views belong only to this runtime, never its replacement.
+    plan_cache: PlanCache,
     pending_removals: tokio::sync::Mutex<PendingRemovals>,
     /// Serializes selective-sync transitions with observation classification
     /// and deletion inference. Acquired before the echo/pending-removal locks.
@@ -600,6 +603,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             paused: paused_tx,
             health: health_tx,
             echo: tokio::sync::Mutex::new(EchoTable::default()),
+            plan_cache: PlanCache::default(),
             pending_removals: tokio::sync::Mutex::new(PendingRemovals::default()),
             selection: tokio::sync::Mutex::new(()),
             #[cfg(test)]
@@ -1513,6 +1517,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             recovery_dir: &self.config.recovery_dir,
             scheduler: &self.scheduler,
             echo: &self.echo,
+            plan_cache: &self.plan_cache,
             cancel,
         }
     }
@@ -2869,16 +2874,15 @@ mod tests {
         assert!(fixture.account.scan_state(fixture.connection).await.unwrap().unwrap().may_infer_deletion());
         assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
 
-        let remote = CatalogView::new(sealed.iter().map(|row| {
+        let remote = Arc::new(CatalogView::new(sealed.iter().map(|row| {
             let record = hfdrive_core::format::from_item_record_bytes(row.item_json.as_bytes()).unwrap();
             let content = record.content_version_id.map(|_| (digest, bytes.len() as u64));
             ItemState::from_record(&record, content.map(|value| value.0), content.map(|value| value.1)).unwrap()
-        }).collect()).unwrap();
+        }).collect()).unwrap());
         let missing = plan::missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
         let base = plan::materialization_base(remote.clone(), missing).unwrap();
         let sources = plan::PlanSources {
             base, remote, intents: Vec::new(),
-            names: records.iter().map(|item| (item.item_id, item.name.clone())).collect(),
         };
         let planned = plan::plan_round(
             &fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources,
