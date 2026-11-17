@@ -75,6 +75,11 @@ impl Provider {
         let baseline = account.baseline(connection).await.map_err(crate::operations::state_error)?;
         let scan = account.scan_state(connection).await.map_err(crate::operations::state_error)?;
         let disk = residency(&record.root_path).await?;
+        let root_available = disk.is_some();
+        // A missing root has no accessible entries. These zero counts are not
+        // a completed scan or a claim about recoverable data elsewhere; the
+        // explicit offline error below is the availability signal.
+        let disk = disk.unwrap_or_default();
         let visibility = match record.config_json.get("visibility").and_then(serde_json::Value::as_str) {
             Some("private") => wire::Visibility::Private,
             Some("public") => wire::Visibility::Public,
@@ -86,19 +91,26 @@ impl Provider {
         // outcome. A stale snapshot is never projected as zeroed work and a
         // missing, cancelled or finished runtime is never projected as
         // synchronized.
-        let projection = decide_projection(
-            health.as_ref().map_or(RuntimeState::Missing, |health| health.runtime),
-            paused,
-            capability,
-            &baseline,
-            WorkCounts {
-                pending_files: counts.pending_files,
-                dirty_files: counts.dirty_files,
-                conflict_files: counts.conflict_files,
-            },
-            health.as_ref().and_then(|health| health.watch_error),
-            health.as_ref().and_then(|health| health.last_error.as_deref()),
-        );
+        let projection = if root_available {
+            decide_projection(
+                health.as_ref().map_or(RuntimeState::Missing, |health| health.runtime),
+                paused,
+                capability,
+                &baseline,
+                WorkCounts {
+                    pending_files: counts.pending_files,
+                    dirty_files: counts.dirty_files,
+                    conflict_files: counts.conflict_files,
+                },
+                health.as_ref().and_then(|health| health.watch_error),
+                health.as_ref().and_then(|health| health.last_error.as_deref()),
+            )
+        } else {
+            Projection::offline(
+                wire::ProtocolErrorCode::LocalRootInvalid,
+                "The local folder or volume is unavailable; restore it to resume synchronization",
+            )
+        };
         let Projection { state, last_error } = projection;
         let pin = if storage.pin_requests == 0 {
             wire::PinState::Unpinned
@@ -107,7 +119,9 @@ impl Provider {
         } else {
             wire::PinState::Pinned
         };
-        let hydration = if disk.partial_files > 0 {
+        let hydration = if !root_available {
+            wire::HydrationState::OnlineOnly
+        } else if disk.partial_files > 0 {
             wire::HydrationState::Partial
         } else if disk.online_only_files > 0 {
             wire::HydrationState::OnlineOnly
@@ -328,13 +342,13 @@ struct Residency {
     local_bytes: u64,
 }
 
-async fn residency(root: &std::path::Path) -> Result<Residency, wire::ProtocolError> {
+async fn residency(root: &std::path::Path) -> Result<Option<Residency>, wire::ProtocolError> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut result = Residency::default();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut failed = false;
-        let report = hfdrive_windows::filesystem::scan_metadata(
+        let report = match hfdrive_windows::filesystem::scan_metadata(
             &root,
             &hfdrive_windows::filesystem::ScanBudget::default(),
             &cancel,
@@ -365,11 +379,22 @@ async fn residency(root: &std::path::Path) -> Result<Residency, wire::ProtocolEr
                 }
                 hfdrive_windows::filesystem::VisitFlow::Continue
             },
-        ).map_err(|_| error(wire::ProtocolErrorCode::LocalRootInvalid, "The local root could not be scanned"))?;
+        ) {
+            Ok(report) => report,
+            Err(hfdrive_windows::filesystem::FsError::NotFound { .. }) => return Ok(None),
+            Err(_) => {
+                return Err(error(wire::ProtocolErrorCode::LocalRootInvalid, "The local root could not be scanned"));
+            }
+        };
+        if !report.complete
+            && matches!(std::fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(None);
+        }
         if failed || !report.complete {
             return Err(error(wire::ProtocolErrorCode::LocalRootInvalid, "The local residency scan is incomplete"));
         }
-        Ok(result)
+        Ok(Some(result))
     }).await.map_err(|_| crate::operations::internal())?
 }
 
@@ -412,6 +437,13 @@ mod tests {
 
     fn clean() -> WorkCounts {
         WorkCounts { pending_files: 0, dirty_files: 0, conflict_files: 0 }
+    }
+
+    #[tokio::test]
+    async fn missing_root_returns_no_residency_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        assert!(residency(&missing).await.unwrap().is_none());
     }
 
     fn active(

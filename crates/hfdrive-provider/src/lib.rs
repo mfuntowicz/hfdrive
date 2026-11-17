@@ -784,6 +784,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn missing_root_projects_offline_status_instead_of_failing_status() {
+        let fixture = sync::test_support::connection_fixture().await;
+        let paths = StatePaths::new(fixture.directory.path().join("state"));
+        let key = fixture.account.account_key();
+        let mut envelope = rejected_envelope("sync-fixture");
+        envelope.namespace = "test-user".to_owned();
+        envelope.access_token = "missing-root-fixture-not-a-live-token".to_owned();
+        hfdrive_auth::AccountCredentialStore::open(paths.account(key).credentials(), key)
+            .unwrap().save(&envelope).unwrap();
+        fixture.state.select_account(key).await.unwrap();
+        fixture.state.close().await.unwrap();
+        std::fs::remove_dir(&fixture.root).unwrap();
+
+        let mut provider = Provider::open(paths.clone(), "S-1-5-21-fixture".to_owned()).await.unwrap();
+        let auth = hfdrive_auth::AuthManager::new(
+            hfdrive_auth::AuthConfig::production(), paths.base().to_path_buf(), None,
+        );
+        auth.restore_account(key).unwrap();
+        let mutable = Arc::get_mut(&mut provider).unwrap();
+        mutable.tokens = Arc::new(crate::tokens::DurableTokens::new(auth.clone()));
+        mutable.auth = auth;
+        let raw = rusqlite::Connection::open(paths.account(key).database()).unwrap();
+        assert_eq!(raw.execute(
+            "UPDATE connections SET config_json = json_set(config_json, '$.visibility', 'private') WHERE connection_id = ?1",
+            rusqlite::params![fixture.connection.as_bytes().as_slice()],
+        ).unwrap(), 1);
+        drop(raw);
+        let record = provider.state.reconcile_connections().await.unwrap().pop().unwrap();
+        assert_eq!(record.config_json.get("visibility").and_then(serde_json::Value::as_str), Some("private"));
+        let statuses = provider.connection_statuses().await.unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, hfdrive_protocol::ConnectionState::Offline);
+        let error = statuses[0].last_error.as_ref().unwrap();
+        assert_eq!(error.code, hfdrive_protocol::ProtocolErrorCode::LocalRootInvalid);
+        assert!(error.message.contains("unavailable"));
+        assert_eq!(statuses[0].hydration, hfdrive_protocol::HydrationState::OnlineOnly);
+        provider.drain().await.unwrap();
+        drop(provider);
+        fixture.directory.close().unwrap();
+    }
+
     fn account() -> AccountStatus {
         AccountStatus {
             state: AuthenticationState::SignedIn,

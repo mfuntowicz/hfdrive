@@ -245,6 +245,13 @@ pub async fn restore_connections(
             .and_then(serde_json::Value::as_str)
             .and_then(|value| value.parse::<ItemId>().ok())
             .ok_or_else(|| AdmissionError::LocalRoot("durable root item identity is missing".to_owned()))?;
+        // A deleted folder or disconnected volume pauses the binding; it does
+        // not invalidate every other connection or turn into a generic
+        // identity conflict. Other admission failures remain fatal because
+        // they could attach the wrong root or registration.
+        if matches!(std::fs::symlink_metadata(&record.root_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            continue;
+        }
         let configured = all
             .iter()
             .filter(|other| other.connection_id != record.connection_id)
@@ -311,5 +318,27 @@ impl RootFacts {
             volume: validated.volume.clone(),
             sync_root_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_root_is_skipped_without_a_generic_restore_conflict() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let record = fixture.account.get_connection(fixture.connection).await.unwrap().unwrap();
+        std::fs::remove_dir(&fixture.root).unwrap();
+        let restored = restore_connections(
+            &fixture.account,
+            std::slice::from_ref(&record),
+            &fixture.directory.path().join("state"),
+            "S-1-5-21-fixture",
+        )
+        .await
+        .unwrap();
+        assert!(restored.is_empty(), "an absent root stays recoverable but inactive");
+        fixture.state.close().await.unwrap();
     }
 }

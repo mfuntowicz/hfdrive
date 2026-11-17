@@ -469,10 +469,11 @@ impl Provider {
         )
         .await
         .map_err(|_| error(wire::ProtocolErrorCode::Conflict, "A persisted connection could not be restored safely"))?;
-        let entry = restored
-            .into_iter()
-            .next()
-            .ok_or_else(|| error(wire::ProtocolErrorCode::Conflict, "A persisted connection could not be restored safely"))?;
+        let Some(entry) = restored.into_iter().next() else {
+            // The durable binding remains recoverable, but its folder/volume
+            // is currently absent. No runtime or registration was changed.
+            return Ok(false);
+        };
         self.connect_restored_entry(engine, &entry, &profile, true).await?;
         let health = engine.health(connection).await.map_err(crate::storage::engine_failure)?;
         Ok(health.runtime.is_active())

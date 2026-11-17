@@ -996,3 +996,20 @@ verification.
   registration, package signing/install/trust, second-device, clean-VM and
   minimum-OS acceptance were not initiated. The 15 ignored tests are explicit
   manual/live acceptance cases, not silently skipped deterministic failures.
+
+## Missing-root restoration — 2026-11-17
+
+- **diagnosed** — the persisted connection root was absent. Restoration
+  previously converted that expected unavailable-volume state into a generic
+  `Conflict` and residency scanning prevented `GetStatus` from returning any
+  connection snapshot.
+- **passed** — absent roots now remain durable but inactive, runtime refresh
+  reports no active binding, and status projects `Offline` with
+  `LocalRootInvalid` and an actionable restore message. Other admission
+  failures remain fatal. Provider verification passed 248 unit, 6 session and
+  16 durability tests. Evidence: `artifacts/tests/missing-root-provider-full.log`.
+- **passed** — the rebuilt live provider returned `status --json` with
+  `state=offline`, `error_code=local_root_invalid`, and the message “The local
+  folder or volume is unavailable; restore it to resume synchronization.”
+  Evidence: `artifacts/acceptance/missing-root-status.json`. No root was
+  recreated, moved, registered, or deleted during verification.
