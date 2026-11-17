@@ -5,8 +5,9 @@
 //!
 //! * issuer must equal the configured issuer (production: exactly
 //!   `https://huggingface.co`);
-//! * every endpoint (authorization, token, userinfo, JWKS) must be HTTPS on a
-//!   trusted host with no embedded controls;
+//! * every endpoint (authorization, token, userinfo, JWKS, and the optional
+//!   RFC 8628 device authorization endpoint) must be HTTPS on a trusted host
+//!   with no embedded controls and within the explicit port policy;
 //! * `id_token_signing_alg_values_supported` must contain RS256;
 //! * the JWKS must be non-empty and fetched from the discovered `jwks_uri`;
 //! * redirects are never followed and response bodies are bounded.
@@ -98,6 +99,18 @@ pub(crate) async fn fetch_provider(
         .ok_or(AuthError::ProviderMetadata)?;
     settings.validate_endpoint(userinfo_endpoint.as_str())?;
     settings.validate_endpoint(metadata.jwks_uri().as_str())?;
+
+    // The RFC 8628 device authorization endpoint is optional, but when
+    // advertised it must already satisfy the same trust policy — it is
+    // validated here so a poisoned discovery document fails closed before any
+    // device request is ever built.
+    if let Some(device_endpoint) = metadata
+        .additional_metadata()
+        .device_authorization_endpoint
+        .as_deref()
+    {
+        settings.validate_endpoint(device_endpoint)?;
+    }
 
     // RS256 must be advertised; verification is additionally restricted to
     // RS256 at token-validation time.

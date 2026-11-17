@@ -8,6 +8,8 @@
 //! in this source file. There is no runtime override: environment variables
 //! cannot redirect users to a different OAuth client or service.
 
+use openidconnect::url::Url;
+
 use crate::error::AuthError;
 use crate::login::LoginPurpose;
 
@@ -28,15 +30,22 @@ pub const DEFAULT_LOGIN_LIFETIME_SECS: u64 = 300;
 /// OIDC trust policy for discovery, endpoints and signatures.
 ///
 /// Production ([`OidcSettings::huggingface`]) pins the issuer to
-/// `https://huggingface.co`, requires HTTPS and the trusted host for every
-/// endpoint, and accepts only RS256 ID tokens. Fixture construction is for
-/// deterministic tests against a local fake provider.
+/// `https://huggingface.co`, requires the exact HTTPS scheme, the exact
+/// trusted host and the exact service port for every endpoint, and accepts
+/// only RS256 ID tokens. Fixture construction is for deterministic tests
+/// against a local fake provider; it authorizes exactly the scheme and port
+/// its own issuer/discovery URLs name.
 #[derive(Debug, Clone)]
 pub struct OidcSettings {
     pub(crate) issuer: String,
     pub(crate) discovery_url: String,
     pub(crate) trusted_hosts: Vec<String>,
-    pub(crate) require_https: bool,
+    /// Exact allowed URL scheme for every endpoint (lowercase): `https` for
+    /// production, the fixture issuer's own scheme for local tests.
+    pub(crate) scheme: String,
+    /// Complete set of acceptable effective URL ports (an explicit port or the
+    /// scheme's default). Production allows exactly the HTTPS service port.
+    pub(crate) allowed_ports: Vec<u16>,
     pub(crate) required_issuer: Option<String>,
     pub(crate) login_lifetime_secs: u64,
     /// Fixed for production; zero selects an ephemeral port for local fixtures.
@@ -50,14 +59,16 @@ impl OidcSettings {
     pub const HUGGINGFACE_DISCOVERY: &'static str =
         "https://huggingface.co/.well-known/openid-configuration";
 
-    /// Production trust policy: issuer exactly `https://huggingface.co`,
-    /// HTTPS on the trusted host only, 5-minute login sessions.
+    /// Production trust policy: issuer exactly `https://huggingface.co`, the
+    /// exact HTTPS scheme, trusted host and service port for every endpoint,
+    /// 5-minute login sessions.
     pub fn huggingface() -> Self {
         Self {
             issuer: Self::HUGGINGFACE_ISSUER.to_owned(),
             discovery_url: Self::HUGGINGFACE_DISCOVERY.to_owned(),
             trusted_hosts: vec!["huggingface.co".to_owned()],
-            require_https: true,
+            scheme: "https".to_owned(),
+            allowed_ports: vec![443],
             required_issuer: Some(Self::HUGGINGFACE_ISSUER.to_owned()),
             login_lifetime_secs: DEFAULT_LOGIN_LIFETIME_SECS,
             callback_port: CALLBACK_PORT,
@@ -65,7 +76,9 @@ impl OidcSettings {
     }
 
     /// Deterministic-test policy for a local fixture provider. Validation is
-    /// identical apart from the pinned host/issuer and login lifetime.
+    /// identical apart from the pinned host/issuer, the login lifetime, and
+    /// the fixture's own scheme and port, which become the exact policy just
+    /// as the HTTPS service port is the production policy.
     #[doc(hidden)]
     pub fn fixture(
         issuer: &str,
@@ -73,11 +86,26 @@ impl OidcSettings {
         trusted_host: &str,
         login_lifetime_secs: u64,
     ) -> Self {
+        let scheme = Url::parse(issuer)
+            .map(|url| url.scheme().to_owned())
+            .unwrap_or_else(|_| "http".to_owned());
+        let mut allowed_ports: Vec<u16> = Vec::new();
+        for candidate in [issuer, discovery_url] {
+            if let Some(port) = Url::parse(candidate)
+                .ok()
+                .and_then(|url| url.port_or_known_default())
+            {
+                if port != 0 && !allowed_ports.contains(&port) {
+                    allowed_ports.push(port);
+                }
+            }
+        }
         Self {
             issuer: issuer.to_owned(),
             discovery_url: discovery_url.to_owned(),
             trusted_hosts: vec![trusted_host.to_owned()],
-            require_https: false,
+            scheme,
+            allowed_ports,
             required_issuer: Some(issuer.to_owned()),
             login_lifetime_secs: login_lifetime_secs.max(1),
             callback_port: 0,
@@ -85,22 +113,45 @@ impl OidcSettings {
     }
 
     /// Validate a discovered endpoint URL against this policy.
+    ///
+    /// The URL is parsed with [`url::Url`], never by string splitting, so the
+    /// scheme, userinfo, host and port components are the parser's own: a
+    /// userinfo-embedded "trusted host" (`https://huggingface.co@evil/`) or a
+    /// `host:port@host` confusion cannot reach the request path. Requirements:
+    ///
+    /// * the configured exact scheme (`https` in production);
+    /// * empty username **and** password — embedded userinfo is rejected
+    ///   outright, never stripped;
+    /// * an exact match of the parser-normalized host against the trusted-host
+    ///   list;
+    /// * an explicit port policy: the effective port (the explicit port, or
+    ///   the scheme default when absent) must be nonzero and a member of
+    ///   [`Self::allowed_ports`] — the HTTPS service port in production, the
+    ///   fixture's own port in tests.
     pub(crate) fn validate_endpoint(&self, url: &str) -> Result<(), AuthError> {
-        let (scheme, rest) = url
-            .split_once("://")
-            .ok_or(AuthError::ProviderMetadata)?;
-        if self.require_https && !scheme.eq_ignore_ascii_case("https") {
+        let parsed = Url::parse(url).map_err(|_| AuthError::ProviderMetadata)?;
+        if parsed.scheme() != self.scheme {
             return Err(AuthError::ProviderMetadata);
         }
-        if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        // Userinfo bypass: an endpoint may never carry credentials.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(AuthError::ProviderMetadata);
         }
-        if url.chars().any(|c| c <= ' ' || c == '\u{7f}') {
+        // Exact trusted host (parser-normalized): no untrusted host, and no
+        // trailing-dot/case/port smuggling past the exact-match list.
+        let Some(host) = parsed.host_str() else {
+            return Err(AuthError::ProviderMetadata);
+        };
+        if host.is_empty() || !self.trusted_hosts.iter().any(|trusted| trusted == host) {
             return Err(AuthError::ProviderMetadata);
         }
-        let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
-        let host = host_port.split(':').next().unwrap_or("");
-        if host.is_empty() || !self.trusted_hosts.iter().any(|h| h == host) {
+        // Explicit port policy: `Url` normalizes the scheme's default port
+        // away, so an effective default is accepted only because the policy
+        // lists it. A zero or unlisted port is rejected.
+        let Some(port) = parsed.port_or_known_default() else {
+            return Err(AuthError::ProviderMetadata);
+        };
+        if port == 0 || !self.allowed_ports.contains(&port) {
             return Err(AuthError::ProviderMetadata);
         }
         Ok(())
@@ -203,5 +254,120 @@ mod tests {
         assert_eq!(OidcSettings::huggingface().callback_port, CALLBACK_PORT);
         assert_eq!(OidcSettings::fixture("http://fixture", "http://fixture/discovery", "127.0.0.1", 300).callback_port, 0);
         assert!(AuthConfig::default().require_client_id().is_err());
+    }
+
+    #[test]
+    fn endpoints_reject_userinfo_host_bypass() {
+        // A userinfo-embedded "trusted host" must never validate an untrusted
+        // authority: `url` puts `huggingface.co` in the username, `evil` in
+        // the host. Both the exact host check and the empty-userinfo rule
+        // reject it.
+        let settings = OidcSettings::huggingface();
+        assert_eq!(
+            settings.validate_endpoint("https://huggingface.co@evil.example.com/oauth/token"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_endpoint("https://user:pass@huggingface.co/oauth/token"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_endpoint("https://huggingface.co:8443@evil.example.com/x"),
+            Err(AuthError::ProviderMetadata)
+        );
+        // The same rules hold for the production discovery/issuer URLs' own
+        // shapes and for the fixture policy.
+        let fixture = OidcSettings::fixture(
+            "http://127.0.0.1:9417",
+            "http://127.0.0.1:9417/.well-known/openid-configuration",
+            "127.0.0.1",
+            300,
+        );
+        assert_eq!(
+            fixture.validate_endpoint("http://127.0.0.1:9417@evil.example.com/userinfo"),
+            Err(AuthError::ProviderMetadata)
+        );
+    }
+
+    #[test]
+    fn endpoints_reject_untrusted_hosts_and_schemes() {
+        let settings = OidcSettings::huggingface();
+        // Exact host matching: no subdomain, suffix, lookalike or trailing dot.
+        for url in [
+            "https://evil.huggingface.co/oauth/token",
+            "https://huggingface.co.evil.example.com/oauth/token",
+            "https://huggingface.co./oauth/token",
+            "https://huggingface.co:443.evil.example.com/x",
+            "https://xn--huggingface-9xa.co/oauth/token",
+        ] {
+            assert_eq!(settings.validate_endpoint(url), Err(AuthError::ProviderMetadata), "{url}");
+        }
+        // Scheme policy: HTTPS only in production; the fixture allows exactly
+        // its own scheme.
+        assert_eq!(
+            settings.validate_endpoint("http://huggingface.co/oauth/token"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_endpoint("ftp://huggingface.co/oauth/token"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_endpoint("file:///etc/passwd"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert!(settings
+            .validate_endpoint("https://huggingface.co/oauth/token")
+            .is_ok());
+    }
+
+    #[test]
+    fn endpoints_enforce_the_explicit_port_policy() {
+        let settings = OidcSettings::huggingface();
+        // Production: only the HTTPS service port — an absent/default port is
+        // the single allowed form; any explicit or foreign port is rejected.
+        assert!(settings.validate_endpoint("https://huggingface.co/oauth/token").is_ok());
+        assert!(settings.validate_endpoint("https://huggingface.co:443/oauth/token").is_ok());
+        for url in [
+            "https://huggingface.co:444/oauth/token",
+            "https://huggingface.co:8443/oauth/token",
+            "https://huggingface.co:0/oauth/token",
+        ] {
+            assert_eq!(settings.validate_endpoint(url), Err(AuthError::ProviderMetadata), "{url}");
+        }
+
+        // Fixture: exactly the fixture's own port is allowed.
+        let fixture = OidcSettings::fixture(
+            "http://127.0.0.1:9417",
+            "http://127.0.0.1:9417/.well-known/openid-configuration",
+            "127.0.0.1",
+            300,
+        );
+        assert!(fixture.validate_endpoint("http://127.0.0.1:9417/device").is_ok());
+        for url in [
+            "http://127.0.0.1/device",
+            "http://127.0.0.1:9418/device",
+            "http://127.0.0.1:0/device",
+        ] {
+            assert_eq!(fixture.validate_endpoint(url), Err(AuthError::ProviderMetadata), "{url}");
+        }
+    }
+
+    #[test]
+    fn issuer_validation_is_exact_and_policy_bound() {
+        let settings = OidcSettings::huggingface();
+        assert!(settings.validate_issuer("https://huggingface.co").is_ok());
+        assert_eq!(
+            settings.validate_issuer("https://huggingface.co/"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_issuer("https://huggingface.co:8443"),
+            Err(AuthError::ProviderMetadata)
+        );
+        assert_eq!(
+            settings.validate_issuer("https://evil.example.com"),
+            Err(AuthError::ProviderMetadata)
+        );
     }
 }
