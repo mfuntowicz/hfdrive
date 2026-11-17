@@ -552,6 +552,13 @@ fn parse_rfc3339_whole_seconds(value: &str) -> Option<i64> {
         .and_then(|value| value.checked_add(116_444_736_000_000_000))
 }
 
+/// Scans inspect current facts without consuming queued watcher/CFAPI echoes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservationSource {
+    Notification,
+    Scan,
+}
+
 impl<R: RemoteOps> ConnectionRuntime<R> {
     /// Builds the runtime and starts its worker loop. `notifications` carries
     /// the connection's remote-watch updates (durably recorded `HEAD`
@@ -1494,6 +1501,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             staging_dir: &self.config.staging_dir,
             recovery_dir: &self.config.recovery_dir,
             scheduler: &self.scheduler,
+            echo: &self.echo,
             cancel,
         }
     }
@@ -1502,15 +1510,23 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     // Observation ingestion
     // -----------------------------------------------------------------------
 
-    /// Classifies one observation batch and persists generations and intents
+    /// Classifies one watcher/CFAPI batch and persists generations and intents
     /// before any effect. Watcher overflow voids deletion evidence.
     pub async fn ingest_observations(&self, batch: crate::sync::observe::ObservationBatch) -> Result<(), ()> {
+        self.ingest_observations_from(batch, ObservationSource::Notification).await
+    }
+
+    async fn ingest_observations_from(
+        &self,
+        batch: crate::sync::observe::ObservationBatch,
+        source: ObservationSource,
+    ) -> Result<(), ()> {
         let result: Result<(), ()> = async {
             if batch.rescan_required {
                 self.scan_requested.store(true, Ordering::Release);
                 self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
             }
-            let echo = self.echo.lock().await;
+            let mut echo = self.echo.lock().await;
             for observation in batch.observations {
                 let classification = classify_observation(
                     &self.state,
@@ -1523,6 +1539,11 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                     now_ms(),
                 )
                 .await;
+                // Only queued notifications consume this path's coverage.
+                // A scan can see the applied result before RenamedTo arrives.
+                if source == ObservationSource::Notification {
+                    echo.forget(&observation.relative_path);
+                }
                 match classification {
                     Classification::Echo { .. }
                     | Classification::Excluded
@@ -1714,9 +1735,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 relative_path: entry.relative_path.clone(),
                 action: hfdrive_windows::filesystem::WatchAction::Modified,
             }).collect();
-            self.ingest_observations(crate::sync::observe::ObservationBatch {
+            self.ingest_observations_from(crate::sync::observe::ObservationBatch {
                 observations, rescan_required: false,
-            }).await.map_err(|()| "Local changes could not be recorded")?;
+            }, ObservationSource::Scan).await.map_err(|()| "Local changes could not be recorded")?;
             if !report.complete || report.overflow || self.persistence_failed.load(Ordering::Acquire) {
                 return Err("Local discovery is incomplete; no deletions were inferred");
             }
@@ -1751,6 +1772,15 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 if seen.contains(path.as_path()) { continue; }
                 match std::fs::symlink_metadata(self.config.root.join(&path)) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let echo = self.echo.lock().await;
+                        if matches!(classify_observation(
+                            &self.state, self.config.connection_id, self.config.root_item_id,
+                            &self.config.root, &echo, &path,
+                            hfdrive_windows::filesystem::WatchAction::Removed, now_ms(),
+                        ).await, Classification::Echo { .. }) {
+                            continue;
+                        }
+                        drop(echo);
                         if self.observer.lock().await.as_ref().is_none_or(LocalObserver::overflowed) {
                             return Err("Local observation was lost; deletion inference stopped");
                         }
@@ -1920,11 +1950,15 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         let _ = crate::sync::publish::execute_pending_actions(ctx).await;
         let blocking_items = match self
             .state
-            .pending_local_actions(self.config.connection_id)
+            .list_local_actions(self.config.connection_id, None)
             .await
         {
             Ok(actions) => actions
                 .iter()
+                .filter(|action| matches!(
+                    action.state,
+                    LocalActionState::Pending | LocalActionState::InProgress | LocalActionState::Requeued
+                ))
                 .filter_map(|action| action.item_id)
                 .collect::<std::collections::BTreeSet<_>>(),
             Err(_) => return,
@@ -2185,15 +2219,33 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                 }
                 _ => crate::sync::apply::TargetProof::Missing,
             };
-            let decision = crate::sync::apply::classify_recovered(
-                action.kind,
-                expected.as_ref(),
-                &live,
-                generation,
-                target,
-            );
+            // A first hop that reached the journaled intermediate is not a
+            // local deletion. Keep it Pending so the guarded executor can
+            // finish the second hop, even though the old USN has advanced.
+            let intermediate = if live == crate::sync::apply::Probe::Missing
+                && target == crate::sync::apply::TargetProof::Missing
+            {
+                crate::sync::apply::case_rename_intermediate(&action).map(|path|
+                    crate::sync::apply::target_proof(
+                        &self.config.root.join(path), expected.as_ref(), generation,
+                        identity.as_ref().map(|_| self.config.workspace), identity.as_ref(), false,
+                    ))
+            } else {
+                None
+            };
+            let decision = if matches!(intermediate, Some(
+                crate::sync::apply::TargetProof::JournaledObject
+                | crate::sync::apply::TargetProof::Unreadable
+            )) {
+                crate::sync::apply::RecoveryDecision::Retry
+            } else {
+                crate::sync::apply::classify_recovered(
+                    action.kind, expected.as_ref(), &live, generation, target,
+                )
+            };
             match decision {
                 crate::sync::apply::RecoveryDecision::Done => {
+                    let mut echo = self.echo.lock().await;
                     self.state
                         .set_local_action_state(
                             self.config.connection_id,
@@ -2201,8 +2253,13 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                             LocalActionState::Recovered,
                         )
                         .await?;
+                    echo.note_applied(&action, &self.config.root);
                 }
-                crate::sync::apply::RecoveryDecision::Retry => {}
+                crate::sync::apply::RecoveryDecision::Retry => {
+                    self.state.set_local_action_state(
+                        self.config.connection_id, action.action_id, LocalActionState::Pending,
+                    ).await?;
+                }
                 crate::sync::apply::RecoveryDecision::PreserveFirst => {
                     let source = action.source_path.as_ref().ok_or(
                         PublishError::LocalApply("recovery action has no source path to preserve"),
@@ -2213,6 +2270,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                         action.action_id,
                     )
                     .map_err(PublishError::LocalApply)?;
+                    self.state.set_local_action_state(
+                        self.config.connection_id, action.action_id, LocalActionState::Pending,
+                    ).await?;
                 }
                 crate::sync::apply::RecoveryDecision::Requeue => {
                     self.state
@@ -2916,6 +2976,457 @@ mod tests {
         runtime.disconnect().await.unwrap();
         assert!(cancel.is_cancelled());
         assert!(runtime.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none());
+        fixture.state.close().await.unwrap();
+    }
+
+    async fn journaled_echo_action(
+        fixture: &crate::sync::test_support::TestConnection,
+        source: &str,
+        target: Option<&str>,
+    ) -> hfdrive_state::LocalAction {
+        std::fs::write(fixture.root.join(source), b"committed provider bytes").unwrap();
+        let item_id = local_item(fixture, source).await;
+        let live = query_file_state(&fixture.root.join(source)).unwrap();
+        fixture.account.record_local_action(hfdrive_state::LocalAction {
+            connection_id: fixture.connection,
+            action_id: hfdrive_core::ids::ActionId::new(),
+            item_id: Some(item_id),
+            kind: if target.is_some() {
+                hfdrive_state::LocalActionKind::Rename
+            } else {
+                hfdrive_state::LocalActionKind::DeletePlaceholder
+            },
+            expected_file_id: Some(live.identity.file_id.iter().map(|byte| format!("{byte:02x}")).collect()),
+            expected_generation: Some(0),
+            expected_usn: Some(u64::try_from(live.usn.expect("NTFS echo fixture requires a USN")).unwrap()),
+            old_version: None,
+            new_version: None,
+            source_path: Some(PathBuf::from(source)),
+            target_path: target.map(PathBuf::from),
+            recovery_path: None,
+            state: LocalActionState::Pending,
+        }).await.unwrap()
+    }
+
+    async fn assert_action_observations_are_echoes(
+        fixture: &crate::sync::test_support::TestConnection,
+        runtime: &ConnectionRuntime<crate::sync::test_support::HeadOnlyRemote>,
+        action: &hfdrive_state::LocalAction,
+    ) {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use hfdrive_windows::filesystem::WatchAction;
+        let item_id = action.item_id.unwrap();
+        let source = action.source_path.as_ref().unwrap();
+        let mut observations = vec![RawObservation {
+            relative_path: source.clone(),
+            action: if action.target_path.is_some() { WatchAction::RenamedFrom } else { WatchAction::Removed },
+        }];
+        if let Some(target) = &action.target_path {
+            observations.push(RawObservation {
+                relative_path: target.clone(), action: WatchAction::RenamedTo,
+            });
+            if hfdrive_windows::filesystem::names::windows_case_equivalent(
+                &source.to_string_lossy(), &target.to_string_lossy(),
+            ) {
+                let intermediate = crate::sync::apply::rename_intermediate(target, action.action_id);
+                observations.push(RawObservation {
+                    relative_path: intermediate, action: WatchAction::RenamedFrom,
+                });
+            }
+        }
+        {
+            let echo = runtime.echo.lock().await;
+            for observation in &observations {
+                assert_eq!(
+                    classify_observation(
+                        &fixture.account, fixture.connection, fixture.root_item, &fixture.root,
+                        &echo, &observation.relative_path, observation.action, now_ms(),
+                    ).await,
+                    Classification::Echo { item_id },
+                    "provider fallout at {:?} must not become local work", observation.relative_path,
+                );
+            }
+        }
+        runtime.ingest_observations(ObservationBatch {
+            observations, rescan_required: false,
+        }).await.unwrap();
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        assert!(fixture.account.observation(fixture.connection, item_id).await.unwrap().is_none());
+        assert!(runtime.pending_removals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_progress_rename_and_delete_absorb_observations_without_an_echo_table() {
+        use crate::sync::test_support::connection_fixture;
+        for target in [Some("after.txt"), None] {
+            let fixture = connection_fixture().await;
+            let action = journaled_echo_action(&fixture, "before.txt", target).await;
+            let (runtime, _cancel) = unlink_runtime(&fixture);
+            fixture.account.set_local_action_state(
+                fixture.connection, action.action_id, LocalActionState::InProgress,
+            ).await.unwrap();
+            // Deterministically observe the interval after the effect landed
+            // but before its durable completion/echo-table handoff.
+            match target {
+                Some(target) => std::fs::rename(
+                    fixture.root.join("before.txt"), fixture.root.join(target),
+                ).unwrap(),
+                None => std::fs::remove_file(fixture.root.join("before.txt")).unwrap(),
+            }
+            assert!(!runtime.echo.lock().await.in_window(action.item_id.unwrap()));
+            assert_action_observations_are_echoes(&fixture, &runtime, &action).await;
+
+            // Restart recovery closes the same landed action and reconstructs
+            // the echo coverage; it never replays it as a new local intent.
+            assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Recovered);
+            assert!(runtime.echo.lock().await.in_window(action.item_id.unwrap()));
+            assert_action_observations_are_echoes(&fixture, &runtime, &action).await;
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_rename_and_delete_complete_echo_handoff_without_local_intents() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_windows::filesystem::WatchAction;
+        for (source, target, registry_advanced) in [
+            ("before.txt", Some("after.txt"), false),
+            ("case.txt", Some("CASE.txt"), false),
+            ("deleted.txt", None, false),
+            ("before.txt", Some("after.txt"), true),
+            ("case.txt", Some("CASE.txt"), true),
+            ("deleted.txt", None, true),
+        ] {
+            let fixture = connection_fixture().await;
+            let action = journaled_echo_action(&fixture, source, target).await;
+            let item_id = action.item_id.unwrap();
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            // Exercise the retry handoff for an unmoved source whose target
+            // does not alias it. Case-only spelling changes run below through
+            // the real two-step executor instead.
+            if target.is_none_or(|target|
+                !hfdrive_windows::filesystem::names::windows_case_equivalent(source, target))
+            {
+                fixture.account.set_local_action_state(
+                    fixture.connection, action.action_id, LocalActionState::InProgress,
+                ).await.unwrap();
+                assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+                assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                    .await.unwrap().unwrap().state, LocalActionState::Pending);
+            }
+
+            let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+                .account(fixture.account.account_key()).database();
+            let reached_mutation = std::rc::Rc::new(std::cell::Cell::new(false));
+            let reached = reached_mutation.clone();
+            let connection = fixture.connection;
+            let action_id = action.action_id;
+            crate::sync::apply::seams::install_before_mutation(Box::new(move |_| {
+                // Read the real durable journal at the exact mutation seam:
+                // the transition must precede the filesystem effect.
+                let raw = rusqlite::Connection::open(&database).unwrap();
+                let state: String = raw.query_row(
+                    "SELECT state FROM local_actions WHERE connection_id = ?1 AND action_id = ?2",
+                    rusqlite::params![connection.as_bytes().as_slice(), action_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                ).unwrap();
+                assert_eq!(state, "in_progress");
+                reached.set(true);
+            }));
+            let context = runtime.round_context(&cancel);
+            assert!(std::ptr::eq(context.echo, &runtime.echo), "rounds must use the observer's real table");
+            let outcome = crate::sync::publish::execute_pending_actions(&context).await.unwrap();
+            assert!(reached_mutation.get());
+            assert_eq!(outcome.applied, 1);
+            assert_eq!(outcome.requeued, 0);
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Applied);
+            assert!(fixture.account.pending_local_actions(fixture.connection).await.unwrap().is_empty());
+            assert!(runtime.echo.lock().await.in_window(item_id));
+            match target {
+                Some(target) => {
+                    assert_eq!(std::fs::read(fixture.root.join(target)).unwrap(), b"committed provider bytes");
+                    assert_eq!(
+                        std::fs::read_dir(&fixture.root).unwrap().next().unwrap().unwrap().file_name(),
+                        std::ffi::OsStr::new(target),
+                    );
+                }
+                None => assert!(!fixture.root.join(source).exists()),
+            }
+
+            // The queued batch is covered both before the registry advances
+            // and after it changes spelling or hides the tombstone.
+            let mut item = fixture.account.item(fixture.connection, item_id).await.unwrap().unwrap();
+            match target {
+                Some(target) => {
+                    item.name = target.to_owned();
+                    item.name_key = String::from_utf8(hfdrive_core::names::collision_key(target)).unwrap();
+                }
+                None => item.deleted = true,
+            }
+            if registry_advanced {
+                fixture.account.upsert_item(item.clone()).await.unwrap();
+            }
+            assert_action_observations_are_echoes(&fixture, &runtime, &action).await;
+            assert!(!runtime.echo.lock().await.in_window(item_id),
+                "every observed path is consumed, not retained until a timeout");
+            if !registry_advanced {
+                fixture.account.upsert_item(item).await.unwrap();
+            }
+
+            // Consumed coverage must not swallow a real edit or a new
+            // occupant at the deleted name.
+            let changed = PathBuf::from(target.unwrap_or(source));
+            std::fs::write(fixture.root.join(&changed), b"new unsynchronized local content").unwrap();
+            runtime.ingest_observations(ObservationBatch {
+                observations: vec![RawObservation { relative_path: changed, action: WatchAction::Modified }],
+                rescan_required: false,
+            }).await.unwrap();
+            let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap();
+            assert_eq!(entries.len(), 1, "only the subsequent genuine local edit creates work");
+            assert!(matches!(parse_intent(&entries[0]).unwrap(),
+                SyncIntent::Content { .. } | SyncIntent::Create { .. }));
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_before_renamed_to_preserves_echo_coverage_without_a_move_intent() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_windows::filesystem::WatchAction;
+        for (source, target) in [("before.txt", "after.txt"), ("case.txt", "CASE.txt")] {
+            let fixture = connection_fixture().await;
+            let action = journaled_echo_action(&fixture, source, Some(target)).await;
+            let item_id = action.item_id.unwrap();
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            assert_eq!(
+                crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel))
+                    .await.unwrap(),
+                crate::sync::publish::LocalActionOutcome { applied: 1, requeued: 0 },
+            );
+            let mut item = fixture.account.item(fixture.connection, item_id).await.unwrap().unwrap();
+            item.name = target.to_owned();
+            item.name_key = String::from_utf8(hfdrive_core::names::collision_key(target)).unwrap();
+            fixture.account.upsert_item(item).await.unwrap();
+
+            let mut first_events = vec![RawObservation {
+                relative_path: source.into(), action: WatchAction::RenamedFrom,
+            }];
+            if let Some(intermediate) = crate::sync::apply::case_rename_intermediate(&action) {
+                first_events.push(RawObservation {
+                    relative_path: intermediate, action: WatchAction::RenamedFrom,
+                });
+            }
+            runtime.ingest_observations(ObservationBatch {
+                observations: first_events, rescan_required: false,
+            }).await.unwrap();
+
+            // The metadata scan reaches the completed target while its
+            // RenamedTo notification is still queued behind the source event.
+            runtime.ingest_observations_from(ObservationBatch {
+                observations: vec![RawObservation {
+                    relative_path: target.into(), action: WatchAction::Modified,
+                }],
+                rescan_required: false,
+            }, ObservationSource::Scan).await.unwrap();
+            assert!(runtime.echo.lock().await.in_window(item_id));
+            {
+                let echo = runtime.echo.lock().await;
+                assert_eq!(classify_observation(
+                    &fixture.account, fixture.connection, fixture.root_item, &fixture.root,
+                    &echo, Path::new(target), WatchAction::RenamedTo, now_ms(),
+                ).await, Classification::Echo { item_id });
+            }
+            runtime.ingest_observations(ObservationBatch {
+                observations: vec![RawObservation {
+                    relative_path: target.into(), action: WatchAction::RenamedTo,
+                }],
+                rescan_required: false,
+            }).await.unwrap();
+            assert!(!runtime.echo.lock().await.in_window(item_id),
+                "only the queued target notification consumes its path");
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty(),
+                "the scan must not turn the delayed RenamedTo into a local move");
+            assert!(fixture.account.observation(fixture.connection, item_id).await.unwrap().is_none());
+            assert!(runtime.pending_removals.lock().await.is_empty());
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_case_only_rename_recovers_without_delete_or_create_intents() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_windows::filesystem::WatchAction;
+        for restart in [false, true] {
+            let fixture = connection_fixture().await;
+            let action = journaled_echo_action(&fixture, "case.txt", Some("CASE.txt")).await;
+            let intermediate = crate::sync::apply::case_rename_intermediate(&action).unwrap();
+            fixture.account.set_local_action_state(
+                fixture.connection, action.action_id, LocalActionState::InProgress,
+            ).await.unwrap();
+            // Stop after exactly the first filesystem hop. This reproduces
+            // both a failed second hop and a crash before journal completion.
+            std::fs::rename(fixture.root.join("case.txt"), fixture.root.join(&intermediate)).unwrap();
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            if restart {
+                assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+            } else {
+                fixture.account.set_local_action_state(
+                    fixture.connection, action.action_id, LocalActionState::Pending,
+                ).await.unwrap();
+            }
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Pending);
+            assert!(!runtime.echo.lock().await.in_window(action.item_id.unwrap()));
+            runtime.ingest_observations(ObservationBatch {
+                observations: vec![
+                    RawObservation { relative_path: "case.txt".into(), action: WatchAction::RenamedFrom },
+                    RawObservation { relative_path: intermediate.clone(), action: WatchAction::RenamedTo },
+                    RawObservation { relative_path: "CASE.txt".into(), action: WatchAction::Removed },
+                ],
+                rescan_required: false,
+            }).await.unwrap();
+            assert!(runtime.pending_removals.lock().await.is_empty());
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty(),
+                "the provider's intermediate is neither an unrelated create nor a local deletion");
+            assert!(fixture.account.observation(fixture.connection, action.item_id.unwrap())
+                .await.unwrap().is_none(), "provider fallout must not change the guarded generation");
+
+            let outcome = crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel))
+                .await.unwrap();
+            assert_eq!(outcome, crate::sync::publish::LocalActionOutcome { applied: 1, requeued: 0 });
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Applied);
+            assert!(!fixture.root.join(&intermediate).exists());
+            assert_eq!(std::fs::read(fixture.root.join("CASE.txt")).unwrap(), b"committed provider bytes");
+            assert_eq!(std::fs::read_dir(&fixture.root).unwrap().next().unwrap().unwrap().file_name(),
+                std::ffi::OsStr::new("CASE.txt"));
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_case_rename_intermediate_stays_pending_without_a_delete_intent() {
+        use crate::sync::test_support::connection_fixture;
+        use std::os::windows::fs::OpenOptionsExt;
+        for restart in [false, true] {
+            let fixture = connection_fixture().await;
+            let action = journaled_echo_action(&fixture, "case.txt", Some("CASE.txt")).await;
+            let intermediate = crate::sync::apply::case_rename_intermediate(&action).unwrap();
+            fixture.account.set_local_action_state(
+                fixture.connection, action.action_id, LocalActionState::InProgress,
+            ).await.unwrap();
+            std::fs::rename(fixture.root.join("case.txt"), fixture.root.join(&intermediate)).unwrap();
+            let held = std::fs::OpenOptions::new().read(true).share_mode(0)
+                .open(fixture.root.join(&intermediate)).unwrap();
+            assert_eq!(crate::sync::apply::probe(&fixture.root.join("case.txt")),
+                crate::sync::apply::Probe::Missing);
+            assert_eq!(crate::sync::apply::probe(&fixture.root.join(&intermediate)),
+                crate::sync::apply::Probe::Unreadable);
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            if restart {
+                assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+            } else {
+                fixture.account.set_local_action_state(
+                    fixture.connection, action.action_id, LocalActionState::Pending,
+                ).await.unwrap();
+            }
+            assert!(matches!(
+                crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel)).await,
+                Err(PublishError::LocalApply(_)),
+            ));
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Pending);
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty(),
+                "an unreadable intermediate is not evidence that the original was deleted");
+            assert!(fixture.account.observation(fixture.connection, action.item_id.unwrap())
+                .await.unwrap().is_none());
+            assert!(!runtime.echo.lock().await.in_window(action.item_id.unwrap()));
+
+            // Once inspection is possible, the same journal resumes the
+            // second hop even though the original name is still missing.
+            drop(held);
+            assert_eq!(std::fs::read(fixture.root.join(&intermediate)).unwrap(), b"committed provider bytes");
+            assert_eq!(
+                crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel))
+                    .await.unwrap(),
+                crate::sync::publish::LocalActionOutcome { applied: 1, requeued: 0 },
+            );
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Applied);
+            assert!(!fixture.root.join(&intermediate).exists());
+            assert_eq!(std::fs::read(fixture.root.join("CASE.txt")).unwrap(), b"committed provider bytes");
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_case_rename_does_not_hide_foreign_intermediate_or_unrelated_creation() {
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_windows::filesystem::WatchAction;
+        let fixture = connection_fixture().await;
+        let action = journaled_echo_action(&fixture, "case.txt", Some("CASE.txt")).await;
+        let intermediate = crate::sync::apply::case_rename_intermediate(&action).unwrap();
+        std::fs::rename(fixture.root.join("case.txt"), fixture.directory.path().join("preserved.txt")).unwrap();
+        std::fs::write(fixture.root.join(&intermediate), b"foreign intermediate bytes").unwrap();
+        std::fs::write(fixture.root.join("unrelated.txt"), b"new user file").unwrap();
+        let (runtime, _cancel) = unlink_runtime(&fixture);
+        let echo = runtime.echo.lock().await;
+        for path in [intermediate.as_path(), Path::new("unrelated.txt")] {
+            assert!(matches!(classify_observation(
+                &fixture.account, fixture.connection, fixture.root_item, &fixture.root,
+                &echo, path, WatchAction::Added, now_ms(),
+            ).await, Classification::Created { item_id, .. } if Some(item_id) != action.item_id),
+                "a pending rename suppresses only its proven same-object intermediate");
+        }
+        drop(echo);
+        assert_eq!(std::fs::read(fixture.root.join(&intermediate)).unwrap(), b"foreign intermediate bytes");
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_local_execution_restores_pending_without_registering_an_echo() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let item_id = ItemId::new();
+        let action = fixture.account.record_local_action(hfdrive_state::LocalAction {
+            connection_id: fixture.connection,
+            action_id: hfdrive_core::ids::ActionId::new(),
+            item_id: Some(item_id),
+            kind: hfdrive_state::LocalActionKind::CreatePlaceholder,
+            expected_file_id: None, expected_generation: None, expected_usn: None,
+            old_version: None, new_version: None, source_path: None,
+            target_path: Some(PathBuf::from("unregistered.txt")),
+            recovery_path: None, state: LocalActionState::Pending,
+        }).await.unwrap();
+        let (runtime, cancel) = unlink_runtime(&fixture);
+        // Missing durable target metadata is an execution error, not a
+        // successful apply and not evidence for a replacement local intent.
+        let error = crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel))
+            .await.unwrap_err();
+        assert!(matches!(error, PublishError::LocalApply("journaled action references an unknown item")));
+        assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+            .await.unwrap().unwrap().state, LocalActionState::Pending);
+        assert!(!runtime.echo.lock().await.in_window(item_id));
+        assert!(!fixture.root.join("unregistered.txt").exists());
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        assert!(fixture.account.work_error(
+            fixture.connection, hfdrive_state::WorkErrorKind::Action, *action.action_id.as_uuid(),
+        ).await.unwrap().is_some());
+        runtime.disconnect().await.unwrap();
         fixture.state.close().await.unwrap();
     }
 

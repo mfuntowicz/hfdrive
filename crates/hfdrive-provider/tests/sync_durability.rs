@@ -306,12 +306,31 @@ fn provider_applied_changes_absorb_matching_observations_only() {
 }
 
 #[test]
-fn echo_window_expires_and_can_be_forgotten() {
+fn echo_coverage_survives_until_its_relative_path_is_consumed() {
     let item = ItemId::new();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("a.txt"), b"provider bytes").unwrap();
+    let action = LocalAction {
+        connection_id: connection(),
+        action_id: ActionId::new(),
+        item_id: Some(item),
+        kind: LocalActionKind::UpdatePlaceholder,
+        expected_file_id: None,
+        expected_generation: Some(1),
+        expected_usn: Some(42),
+        old_version: None,
+        new_version: None,
+        source_path: None,
+        target_path: Some(PathBuf::from("a.txt")),
+        recovery_path: None,
+        state: LocalActionState::Applied,
+    };
     let mut table = EchoTable::default();
-    table.note_applied(item, PathBuf::from("a.txt"));
+    table.note_applied(&action, directory.path());
     assert!(table.in_window(item));
-    table.forget(item);
+    table.forget(Path::new("other.txt"));
+    assert!(table.in_window(item));
+    table.forget(Path::new("a.txt"));
     assert!(!table.in_window(item));
 }
 

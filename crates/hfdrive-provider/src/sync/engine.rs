@@ -2141,11 +2141,17 @@ mod tests {
         // The boundary itself never resumes remote scheduling.
         runtime.drive().await;
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0, "no remote work ran unreleased");
-        // The probe is sensitive: an explicit resume does release scheduling.
+        // The probe is sensitive: an explicit resume reconstructs the durable
+        // replacement. Its unbound content intentionally blocks a remote HEAD
+        // read until the upload pass has captured and bound the payload.
+        let replacement = OperationId::from_uuid(*action_id.as_uuid()).unwrap();
+        assert!(fixture.account.outbox_entry(fixture.connection, replacement).await.unwrap().is_none());
         runtime.resume();
         runtime.drive().await;
-        runtime.drive().await;
-        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0, "an explicit resume releases scheduling");
+        assert!(
+            fixture.account.outbox_entry(fixture.connection, replacement).await.unwrap().is_some(),
+            "an explicit resume releases replacement scheduling"
+        );
         cancel.cancel();
         runtime.disconnect().await.unwrap();
         fixture.state.close().await.unwrap();

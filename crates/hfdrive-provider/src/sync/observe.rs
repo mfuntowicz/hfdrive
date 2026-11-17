@@ -28,7 +28,7 @@ use hfdrive_core::names::collision_key;
 use hfdrive_state::{AccountStore, LocalAction, LocalActionState, ScanState};
 use hfdrive_windows::filesystem::volume::FileState;
 use hfdrive_windows::filesystem::{
-    MetadataEntry, ScanBudget, ScanReport, WatchAction, WatchEvent, query_file_state,
+    MetadataEntry, ScanBudget, ScanReport, WatchAction, WatchEvent,
     scan_metadata,
 };
 use tokio::sync::mpsc;
@@ -44,10 +44,6 @@ pub const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_milli
 
 /// Periodic metadata reconciliation interval.
 pub const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-
-/// Echo window: journal actions keep absorbing matching observations for
-/// this long after they were applied (slow watchers, USN lag, restarts).
-pub const ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One normalized watcher observation before classification.
 #[derive(Debug, Clone)]
@@ -91,9 +87,8 @@ pub enum Classification {
 // Pure classification helpers (deterministically tested)
 // ---------------------------------------------------------------------------
 
-/// True when the observation matches a journaled provider-applied action and
-/// must be absorbed. Matching is by stable item identity and by the action's
-/// expected or target path; an unknown USN never matches anything.
+/// True when the item and path belong to an executing or completed provider
+/// action. Pending intermediate recovery needs a separate same-object proof.
 pub fn echo_matches(action: &LocalAction, item_id: ItemId, relative_path: &Path) -> bool {
     if action.item_id != Some(item_id) {
         return false;
@@ -104,16 +99,9 @@ pub fn echo_matches(action: &LocalAction, item_id: ItemId, relative_path: &Path)
     let path_matches = [action.source_path.as_ref(), action.target_path.as_ref()]
         .into_iter()
         .flatten()
-        .any(|path| path_ends_with(path, relative_path));
-    // Identity match on the item is sufficient inside the echo window; the
-    // window itself is enforced by the caller through the journal's states.
-    action.item_id == Some(item_id) && (path_matches || action.target_path.is_none())
-}
-
-fn path_ends_with(haystack: &Path, relative: &Path) -> bool {
-    let hay: Vec<_> = haystack.components().collect();
-    let needle: Vec<_> = relative.components().collect();
-    hay.len() >= needle.len() && hay[hay.len() - needle.len()..] == needle[..]
+        .any(|path| path == relative_path);
+    path_matches || crate::sync::apply::case_rename_intermediate(action)
+        .is_some_and(|path| path == relative_path)
 }
 
 /// True when a disappearance may become a deletion intent.
@@ -216,32 +204,54 @@ pub fn names_equivalent(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Echo table (in-memory half of the suppression window)
+// Echo table (coverage until the queued path notification is observed)
 // ---------------------------------------------------------------------------
 
-/// Recently applied provider actions. The durable half is the local-action
-/// journal; this table only carries the fast path and the post-restart
-/// window reconstruction.
+/// Applied provider paths and their post-apply metadata. Coverage lasts until
+/// a watcher/CFAPI notification, not a wall-clock timeout: scans classify
+/// without consuming it. Consuming one path leaves the other paths covered.
 #[derive(Default)]
 pub struct EchoTable {
-    applied: HashMap<ItemId, (PathBuf, std::time::Instant)>,
+    applied: HashMap<PathBuf, (ItemId, crate::sync::apply::Probe)>,
 }
 
 impl EchoTable {
-    pub fn note_applied(&mut self, item_id: ItemId, target: PathBuf) {
-        self.applied.insert(item_id, (target, std::time::Instant::now()));
+    pub fn note_applied(&mut self, action: &LocalAction, root: &Path) {
+        // PreserveDirty only reads the source; it creates no watcher echo.
+        if action.kind == hfdrive_state::LocalActionKind::Other {
+            return;
+        }
+        let Some(item_id) = action.item_id else { return; };
+        for path in [action.source_path.as_ref(), action.target_path.as_ref()].into_iter().flatten() {
+            self.note_path(item_id, path, root);
+        }
+        if let Some(intermediate) = crate::sync::apply::case_rename_intermediate(action) {
+            self.note_path(item_id, &intermediate, root);
+        }
     }
 
-    /// True while the item's provider-applied change may still be echoing
-    /// through watchers and the USN journal.
+    fn note_path(&mut self, item_id: ItemId, path: &Path, root: &Path) {
+        let facts = crate::sync::apply::probe(&root.join(path));
+        // A locked/unreadable path is not proof of absence or of our result.
+        if facts != crate::sync::apply::Probe::Unreadable {
+            self.applied.insert(path.to_path_buf(), (item_id, facts));
+        }
+    }
+
+    fn matching_item(&self, path: &Path, facts: &crate::sync::apply::Probe) -> Option<ItemId> {
+        self.applied.get(path).and_then(|(item_id, applied)| {
+            (applied == facts).then_some(*item_id)
+        })
+    }
+
+    /// True while any path of the item's provider-applied action is unconsumed.
     pub fn in_window(&self, item_id: ItemId) -> bool {
-        self.applied
-            .get(&item_id)
-            .is_some_and(|(_, at)| at.elapsed() <= ECHO_WINDOW)
+        self.applied.values().any(|(item, _)| *item == item_id)
     }
 
-    pub fn forget(&mut self, item_id: ItemId) {
-        self.applied.remove(&item_id);
+    /// Consume only this notification's path after classification, never a scan.
+    pub fn forget(&mut self, relative_path: &Path) {
+        self.applied.remove(relative_path);
     }
 }
 
@@ -524,21 +534,68 @@ pub async fn classify_observation(
     //    Windows identity).
     let item_id = resolve_item(state, connection, root_item_id, &components).await;
     let full = root.join(relative_path);
-    let live = query_file_state(&full).ok();
+    let facts = crate::sync::apply::probe(&full);
+    let live = match &facts {
+        crate::sync::apply::Probe::Present(live) => Some(live),
+        _ => None,
+    };
 
-    // 2. Echo suppression: provider-applied changes are absorbed first.
-    if let Some(item_id) = item_id {
-        if echo.in_window(item_id) {
-            return Classification::Echo { item_id };
+    // 2. Resolve echoes by the journaled paths even while the registry still
+    //    names the rename source, or already hides a deleted item.
+    if let Some(applied_item) = echo.matching_item(relative_path, &facts) {
+        if item_id.is_none_or(|item| item == applied_item) {
+            return Classification::Echo { item_id: applied_item };
         }
-        if let Ok(actions) = state
-            .list_local_actions(connection, Some(LocalActionState::InProgress))
-            .await
-        {
-            for journal in &actions {
-                if echo_matches(journal, item_id, relative_path) {
-                    return Classification::Echo { item_id };
-                }
+    }
+    if let Ok(actions) = state
+        .list_local_actions(connection, Some(LocalActionState::InProgress))
+        .await
+    {
+        for journal in &actions {
+            let Some(journal_item) = journal.item_id else { continue; };
+            if item_id.is_none_or(|item| item == journal_item)
+                && echo_matches(journal, journal_item, relative_path)
+                && facts != crate::sync::apply::Probe::Unreadable
+                && live.is_none_or(|live| journal.expected_file_id.as_deref().is_none_or(|id|
+                    crate::sync::publish::parse_hex_file_id(id) == Some(live.identity.file_id)))
+            {
+                return Classification::Echo { item_id: journal_item };
+            }
+        }
+    }
+    // A failed second hop returns the action to Pending while the original
+    // path is absent. Only its journaled NTFS object at the exact intermediate
+    // may cover those observations; pending creates and foreign occupants
+    // must remain genuine local work.
+    if let Ok(actions) = state.list_local_actions(connection, Some(LocalActionState::Pending)).await {
+        for journal in &actions {
+            let Some(journal_item) = journal.item_id else { continue; };
+            let Some(intermediate) = crate::sync::apply::case_rename_intermediate(journal) else { continue; };
+            if facts == crate::sync::apply::Probe::Unreadable
+                || item_id.is_some_and(|item| item != journal_item)
+                || (relative_path != intermediate.as_path()
+                    && ![journal.source_path.as_ref(), journal.target_path.as_ref()]
+                        .into_iter().flatten().any(|path| path == relative_path))
+            {
+                continue;
+            }
+            let (Some(file_id), Some(expected_generation)) = (
+                journal.expected_file_id.as_deref().and_then(crate::sync::publish::parse_hex_file_id),
+                journal.expected_generation,
+            ) else { continue; };
+            if crate::sync::apply::probe(&root.join(journal.source_path.as_ref().unwrap()))
+                != crate::sync::apply::Probe::Missing
+            {
+                continue;
+            }
+            let crate::sync::apply::Probe::Present(moved) =
+                crate::sync::apply::probe(&root.join(&intermediate)) else { continue; };
+            let generation = match state.observation(connection, journal_item).await {
+                Ok(observation) => observation.map_or(expected_generation, |observation| observation.generation),
+                Err(_) => continue,
+            };
+            if moved.identity.file_id == file_id && generation == expected_generation {
+                return Classification::Echo { item_id: journal_item };
             }
         }
     }
@@ -576,7 +633,7 @@ pub async fn classify_observation(
         };
     }
 
-    let Some(state_now) = live else {
+    let Some(state_now) = live.cloned() else {
         return Classification::Ignored;
     };
 
@@ -752,6 +809,8 @@ mod tests {
         let item = ItemId::new();
         let active = action(item, LocalActionState::InProgress);
         assert!(echo_matches(&active, item, Path::new("docs\\report.txt")));
+        assert!(!echo_matches(&action(item, LocalActionState::Pending), item, Path::new("docs\\report.txt")));
+        assert!(!echo_matches(&active, item, Path::new("report.txt")));
         let done = action(item, LocalActionState::Applied);
         assert!(echo_matches(&done, item, Path::new("docs\\report.txt")));
         let requeued = action(item, LocalActionState::Requeued);
@@ -928,13 +987,44 @@ mod tests {
     }
 
     #[test]
-    fn echo_window_expires() {
+    fn delayed_echo_consumption_keeps_other_paths_and_exposes_later_edits() {
         let item = ItemId::new();
         let mut table = EchoTable::default();
-        table.note_applied(item, PathBuf::from("a.txt"));
-        assert!(table.in_window(item));
-        table.forget(item);
+        let directory = tempfile::tempdir().unwrap();
+        let mut applied = action(item, LocalActionState::Applied);
+        applied.kind = LocalActionKind::Rename;
+        applied.source_path = Some("before.txt".into());
+        applied.target_path = Some("after.txt".into());
+        let target = applied.target_path.as_ref().unwrap();
+        table.note_applied(&applied, directory.path());
+
+        // Drive an arbitrarily delayed queue deterministically. Echo coverage
+        // has no clock/deadline, even when another action is applied first.
+        let queued_at = std::time::Instant::now();
+        let delayed_until = queued_at + std::time::Duration::from_secs(300);
+        let mut queue = PathDebounce::new(COALESCE_WINDOW);
+        queue.record("before.txt".into(), raw("before.txt", WatchAction::RenamedFrom), queued_at);
+        queue.record("after.txt".into(), raw("after.txt", WatchAction::RenamedTo), delayed_until);
+        table.note_applied(&action(ItemId::new(), LocalActionState::Applied), directory.path());
+        let first = queue.drain_due(delayed_until).remove(0);
+        assert_eq!(table.matching_item(&first.relative_path, &crate::sync::apply::Probe::Missing), Some(item));
+        table.forget(&first.relative_path);
+        assert!(table.in_window(item), "the rename target has not been consumed");
+        assert_eq!(table.matching_item(target, &crate::sync::apply::Probe::Missing), Some(item));
+        let second = queue.drain_due(delayed_until + COALESCE_WINDOW).remove(0);
+        table.forget(&second.relative_path);
         assert!(!table.in_window(item));
+        assert_eq!(table.matching_item(target, &crate::sync::apply::Probe::Missing), None);
+
+        // Even identical metadata cannot reuse consumed coverage, and changed
+        // bytes do not match still-unconsumed provider facts.
+        let original = crate::sync::apply::Probe::Present(dummy_state());
+        table.applied.insert(target.clone(), (item, original.clone()));
+        let mut changed = dummy_state();
+        changed.size = 7;
+        assert_eq!(table.matching_item(target, &crate::sync::apply::Probe::Present(changed)), None);
+        table.forget(target);
+        assert_eq!(table.matching_item(target, &original), None);
     }
 
     fn dummy_state() -> FileState {

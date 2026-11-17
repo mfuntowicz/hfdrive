@@ -258,6 +258,18 @@ pub fn rename_intermediate(to: &Path, action_id: ActionId) -> PathBuf {
     ))
 }
 
+/// Only a case-only rename owns an intermediate, deterministically bound to
+/// its action UUID. A matching spelling alone is never an ownership proof.
+pub(crate) fn case_rename_intermediate(action: &hfdrive_state::LocalAction) -> Option<PathBuf> {
+    if action.kind != hfdrive_state::LocalActionKind::Rename {
+        return None;
+    }
+    let (source, target) = (action.source_path.as_ref()?, action.target_path.as_ref()?);
+    (source != target && hfdrive_windows::filesystem::names::windows_case_equivalent(
+        &source.to_string_lossy(), &target.to_string_lossy(),
+    )).then(|| rename_intermediate(target, action.action_id))
+}
+
 /// Bind the committed version and mark it in-sync only for the captured local
 /// generation. Normal files are converted; existing placeholders keep resident
 /// bytes while their identity advances. Newer edits remain dirty.
@@ -741,20 +753,20 @@ pub async fn free_space_evidence(
     }
 }
 
-/// Closes an applied local action and registers the echo window so watcher
-/// fallout of the provider's own write is absorbed.
+/// Closes an applied local action and registers all of its echo paths,
+/// including a rename's old/intermediate names and a deletion's absent path.
+/// The caller holds the observer's echo lock across this durable handoff:
+/// observers see either `InProgress` or the completed echo, never a gap.
 pub async fn complete_action(
     state: &AccountStore,
-    connection: hfdrive_core::ids::ConnectionId,
-    action_id: ActionId,
-    item_id: ItemId,
-    echo_path: PathBuf,
+    action: &hfdrive_state::LocalAction,
+    root: &Path,
     echo: &mut EchoTable,
 ) -> Result<(), hfdrive_state::StateError> {
     state
-        .set_local_action_state(connection, action_id, LocalActionState::Applied)
+        .set_local_action_state(action.connection_id, action.action_id, LocalActionState::Applied)
         .await?;
-    echo.note_applied(item_id, echo_path);
+    echo.note_applied(action, root);
     Ok(())
 }
 
