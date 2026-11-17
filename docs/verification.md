@@ -955,3 +955,44 @@ verification.
   initiated. Existing live native publication evidence remains in
   `artifacts/acceptance/fresh-published-file-native-verified.json`; the Hub
   web UI intentionally exposes raw managed keys, not Explorer-relative paths.
+
+## Final synchronization recovery and cache verification — 2026-11-17
+
+- **passed** — `cargo test --workspace --all-targets --locked --offline --target
+  x86_64-pc-windows-msvc` completed on the pinned Windows/Rust 1.100.0
+  toolchain: **770 passed, 0 failed, 15 intentionally ignored**, wall time
+  1,757.95 seconds. This includes the real 100,000-item Debug catalog case,
+  CLI binaries, the authenticated pipe integration test, and all current
+  provider/state/Windows/auth/core/protocol/HF/publication/shell targets.
+  Evidence: `artifacts/tests/final-rust-workspace.log`.
+- **passed** — `scripts/build.ps1 -Configuration Release -Locked` rebuilt the
+  final Rust workspace and managed desktop solution with **0 errors**; all 6
+  shell contract tests passed. Managed protocol/view-model verification passed
+  **183/183** against the final Release assembly. Evidence:
+  `artifacts/tests/final-release-build.log`, `final-managed.log`, and the TRX
+  under `artifacts/tests/final-managed/`.
+- **passed** — deterministic protocol regeneration produced no schema or
+  fixture diff. `git apply -p0 --reverse --check --unidiff-zero
+  vendor/xet-core/xet-client.patch` confirmed vendor/patch parity. Static
+  packaging passed with 763 manifest tokens and the pinned build-environment
+  regression passed. The three zero-context Xet hunks require the explicit
+  `--unidiff-zero` Git mode; no vendor or patch content was changed.
+- **passed** — the current Debug CLI built successfully and returned real
+  authenticated `status --json`: signed out, zero connections. An existing
+  provider owner was detected, so no second writer was started and no existing
+  provider was stopped. Evidence: `artifacts/tests/final-cli-build.log` and
+  `artifacts/tests/final-cli-status.log`.
+- **reviewed** — independent gpt-6-astra reviews covered every changed hunk in
+  the auth/core, state/Windows, and provider ranges. Final verdicts are
+  accepted after regressions closed their reported batch-provenance,
+  rejection-fencing, smoke-cleanup, recovery, selective-sync IPC, setup
+  accounting, scheduler, and rename-target findings. F1/F2, K16, and F5 were
+  also independently accepted before their milestone commits.
+- **observed** — `cargo fmt --all -- --check` reports broad pre-existing
+  formatting drift across the source tree. No repository-wide formatting
+  rewrite was applied during this behavioral verification. This is separate
+  from the successful compile and test gates above.
+- **not_run** — authorized live HF/OAuth/S3 operations, new CFAPI root
+  registration, package signing/install/trust, second-device, clean-VM and
+  minimum-OS acceptance were not initiated. The 15 ignored tests are explicit
+  manual/live acceptance cases, not silently skipped deterministic failures.
