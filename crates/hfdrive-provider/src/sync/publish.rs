@@ -348,7 +348,7 @@ async fn run_round_inner<R: RemoteOps>(
     //    read-only mode: zero remote ops, local intents deferred, remote
     //    changes materialized through guarded local actions.
     let catalog_root = catalog_root_of(ctx, &head).await?;
-    let digests_source = RemoteDigests(ctx.remote);
+    let digests_source = RemoteDigests::new(ctx.remote, ctx.workspace);
     let mut digests = DigestResolver::new(&digests_source, ctx.cancel);
     let base = build_base_view(ctx.state, ctx.connection, baseline.applied_commit, &mut digests).await?;
     let remote = build_remote_view(ctx.remote, catalog_root, &mut digests, ctx.cancel).await?;
@@ -637,15 +637,29 @@ async fn park_for_rebase<R: RemoteOps>(
 // ---------------------------------------------------------------------------
 
 /// Resolves the catalog root of a committed head by reading its commit
-/// record. The `HEAD` names the commit; the commit names the catalog.
+/// record. The `HEAD` names the commit; the commit names the catalog. The
+/// commit body must prove the head's identity and this connection's
+/// workspace: a body naming a different commit or a foreign workspace is
+/// never this head's namespace.
 pub async fn catalog_root_of<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     head: &RemoteHead,
 ) -> Result<CatalogRoot, PublishError> {
+    Ok(CatalogRoot::from_digest(verified_commit(ctx, head).await?.catalog_root))
+}
+
+/// Reads and verifies the commit record named by a committed head.
+async fn verified_commit<R: RemoteOps>(
+    ctx: &RoundContext<'_, R>,
+    head: &RemoteHead,
+) -> Result<CommitV1, PublishError> {
     let record = hfdrive_publication::MetadataRecord::Commit(head.head.commit_id);
     let body = ctx.remote.read_metadata(record, ctx.cancel).await?;
     let commit = format::from_commit_bytes(&body).map_err(|_| PublishError::UnsupportedFormat)?;
-    Ok(CatalogRoot::from_digest(commit.catalog_root))
+    if commit.commit_id != head.head.commit_id || commit.workspace_id != ctx.workspace {
+        return Err(PublishError::UnsupportedFormat);
+    }
+    Ok(commit)
 }
 
 /// Applies one batch to the copy-on-write catalog and assembles the candidate
@@ -770,7 +784,9 @@ async fn finish_remote_application<R: RemoteOps>(
     outcome.applied_local_actions = execute_pending_actions(ctx).await?;
     require_namespace_application(ctx).await?;
     close_bookkeeping(ctx, entries, planned, head, outcome).await?;
-    advance_base(ctx, head.head.commit_id, planned, sources).await?;
+    // Nothing was published in this round: the complete remote view is the
+    // whole post-round namespace.
+    advance_base(ctx, head.head.commit_id, &[], planned, sources).await?;
     ctx.state.set_baseline(ctx.connection, BaselineKind::Applied, Some(head.head.commit_id)).await?;
     Ok(())
 }
@@ -852,18 +868,13 @@ async fn close_bookkeeping<R: RemoteOps>(
 
 /// The identity evidence bundle of the current committed head, used when a
 /// converged/superseded intent adopts the committed state as its outcome.
+/// The commit body must name the head's commit and this connection's
+/// workspace, so the adopted evidence is exactly the committed state.
 async fn head_evidence<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     head: &RemoteHead,
 ) -> Result<serde_json::Value, PublishError> {
-    let body = ctx
-        .remote
-        .read_metadata(
-            hfdrive_publication::MetadataRecord::Commit(head.head.commit_id),
-            ctx.cancel,
-        )
-        .await?;
-    let commit = format::from_commit_bytes(&body).map_err(|_| PublishError::UnsupportedFormat)?;
+    let commit = verified_commit(ctx, head).await?;
     let bundle = CandidateBundle {
         head: to_json(&head.head)?,
         commit: to_json(&commit)?,
@@ -941,8 +952,9 @@ async fn finish_commit<R: RemoteOps>(
         outcome.published_operations.push(entry.operation_id);
     }
 
-    // Advance the remembered base and the durable item registry.
-    advance_base(ctx, commit_id, planned, sources).await?;
+    // Advance the remembered base and the durable item registry to exactly
+    // the committed batch's namespace (later batches re-plan afterwards).
+    advance_base(ctx, commit_id, &batch.remote_ops, planned, sources).await?;
     ctx.state
         .set_baseline(ctx.connection, BaselineKind::Applied, Some(commit_id))
         .await?;
@@ -950,21 +962,27 @@ async fn finish_commit<R: RemoteOps>(
     Ok(())
 }
 
-/// Remembers the new common base (the full namespace at the observed commit)
-/// and refreshes the durable item registry with the applied records.
+/// Remembers the new common base and refreshes the durable item registry.
+///
+/// The namespace is the complete remote view overlaid with **only the remote
+/// operations that were actually committed** — one commit batch's ops, never
+/// the later batches that re-plan in a later round. A remote-only round (or
+/// any round without a publication) overlays nothing and adopts the complete
+/// remote view as-is.
 async fn advance_base<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     commit_id: CommitId,
+    committed_ops: &[hfdrive_core::reconcile::RemoteOp],
     planned: &PlannedRound,
     sources: &PlanSources,
 ) -> Result<(), PublishError> {
-    // Post-round namespace = committed remote view overlaid with this round's
-    // records (local publications); remote-only rounds overlay nothing.
+    // Post-round namespace = committed remote view overlaid with this
+    // commit's records (local publications).
     let mut namespace: HashMap<ItemId, ItemRecord> = HashMap::new();
     for item in sources.remote.iter() {
         namespace.insert(item.item_id, item.to_record());
     }
-    for op in &planned.plan.remote_ops {
+    for op in committed_ops {
         namespace.insert(op.record.item_id, op.record.clone());
     }
     let records: Vec<ItemRecord> = namespace.into_values().collect();
@@ -1248,22 +1266,32 @@ pub fn parse_hex_file_id(value: &str) -> Option<[u8; 16]> {
 }
 
 /// Binds each planned action to the live local file identity, generation and
-/// USN at persist time. The target path honours a deterministic local alias.
+/// USN at persist time.
+///
+/// The **source** path is where the local file exists before the action: the
+/// action's expected state resolved in the expected/base namespace. The
+/// **target** path is the reconciled location: the action's target state
+/// resolved in the complete reconciled target namespace (committed remote
+/// view plus the plan's target operations) — never an earlier base location,
+/// so a rename whose parent also moved and a case-only rename both get their
+/// distinct, correct paths. The target honours a deterministic local alias.
 async fn bind_action_facts<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     planned: &ReconcilePlan,
     sources: &PlanSources,
 ) -> Result<HashMap<ActionId, ActionFacts>, PublishError> {
+    let source_locations = source_locations(sources);
+    let target_locations = target_locations(sources, planned);
     let mut facts = HashMap::new();
     for action in &planned.local_actions {
         let expected_path = action
             .expected
             .as_ref()
-            .and_then(|state| item_path_sync(sources, state.item_id));
+            .and_then(|state| action_path(&source_locations, state));
         let mut target_path = action
             .target
             .as_ref()
-            .and_then(|state| item_path_sync(sources, state.item_id));
+            .and_then(|state| action_path(&target_locations, state));
         if let (Some(alias), Some(path)) = (action.local_alias.as_ref(), target_path.as_mut()) {
             path.set_file_name(alias);
         }
@@ -1388,6 +1416,7 @@ async fn upload_entry_inner<R: RemoteOps>(
                 snapshot_id,
                 upload_id,
                 expected: None,
+                workspace: ctx.workspace,
                 root: ctx.root.to_path_buf(),
             };
             let captured = match crate::sync::capture::capture_local_change(
@@ -1643,21 +1672,74 @@ pub async fn initialize_workspace<R: RemoteOps>(
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Resolves an item's relative path from a record map.
-fn record_path(records: &HashMap<ItemId, ItemRecord>, item_id: ItemId) -> Option<std::path::PathBuf> {
+/// One item's location (parent and exact name spelling) in a namespace view.
+type Locations = HashMap<ItemId, (Option<ItemId>, String)>;
+
+/// The namespace in which a journaled action's **source** path resolves: the
+/// expected/base namespace — the remembered base overlaid with this round's
+/// local intents — because the source is what exists locally before apply.
+fn source_locations(sources: &PlanSources) -> Locations {
+    let mut locations: Locations = sources
+        .base
+        .iter()
+        .map(|item| (item.item_id, (item.parent_id, item.name.clone())))
+        .collect();
+    for intent in &sources.intents {
+        apply_intent_location(&mut locations, intent);
+    }
+    locations
+}
+
+/// The namespace in which a journaled action's **target** path resolves: the
+/// complete reconciled target namespace — the committed remote view overlaid
+/// with the planned target operations — because the target is the reconciled
+/// location, never an earlier base location.
+fn target_locations(sources: &PlanSources, planned: &ReconcilePlan) -> Locations {
+    let mut locations: Locations = sources
+        .remote
+        .iter()
+        .map(|item| (item.item_id, (item.parent_id, item.name.clone())))
+        .collect();
+    for op in &planned.remote_ops {
+        locations.insert(op.record.item_id, (op.record.parent_id, op.record.name.clone()));
+    }
+    locations
+}
+
+/// Applies one local intent's location effect to an expected namespace.
+/// Content-only intents leave location untouched; deletion keeps the last
+/// location so removals still resolve the path they must clear.
+fn apply_intent_location(locations: &mut Locations, intent: &hfdrive_core::reconcile::LocalIntent) {
+    use hfdrive_core::reconcile::LocalChange;
+    match &intent.change {
+        LocalChange::Create { parent_id, name, .. }
+        | LocalChange::Move { parent_id, name }
+        | LocalChange::MoveAndContent { parent_id, name, .. } => {
+            locations.insert(intent.item_id, (Some(*parent_id), name.clone()));
+        }
+        LocalChange::Delete | LocalChange::Content { .. } => {}
+        LocalChange::Materialized { state } => {
+            locations.insert(intent.item_id, (state.parent_id, state.name.clone()));
+        }
+    }
+}
+
+/// Resolves an item's relative path, taking the item's own name and parent
+/// from `state` (the action's expected/target state is authoritative for the
+/// item itself) and its ancestors' locations from `locations`.
+fn action_path(locations: &Locations, state: &hfdrive_core::reconcile::ItemState) -> Option<std::path::PathBuf> {
     let mut components = Vec::new();
-    let mut current = item_id;
+    let mut name = state.name.clone();
+    let mut parent = state.parent_id;
     let mut depth = 0;
-    loop {
+    while let Some(parent_id) = parent {
         if depth > 512 {
             return None;
         }
-        let record = records.get(&current)?;
-        if record.parent_id.is_none() {
-            break;
-        }
-        components.push(record.name.clone());
-        current = record.parent_id?;
+        components.push(name);
+        let (grandparent, parent_name) = locations.get(&parent_id)?;
+        name = parent_name.clone();
+        parent = *grandparent;
         depth += 1;
     }
     components.reverse();
@@ -1666,17 +1748,6 @@ fn record_path(records: &HashMap<ItemId, ItemRecord>, item_id: ItemId) -> Option
         path.push(component);
     }
     Some(path)
-}
-
-fn item_path_sync(sources: &PlanSources, item_id: ItemId) -> Option<std::path::PathBuf> {
-    let mut map = HashMap::new();
-    for item in sources.base.iter() {
-        map.insert(item.item_id, item.to_record());
-    }
-    for item in sources.remote.iter() {
-        map.entry(item.item_id).or_insert_with(|| item.to_record());
-    }
-    record_path(&map, item_id)
 }
 
 /// Resolves an item's current relative path from the durable registry.
@@ -1742,6 +1813,131 @@ mod tests {
     use super::*;
 
     use crate::sync::test_support::{HeadOnlyRemote, connection_fixture};
+
+    fn item_record(
+        item_id: ItemId,
+        parent_id: Option<ItemId>,
+        name: &str,
+        kind: ItemKind,
+        content_version_id: Option<VersionId>,
+        revision: OperationId,
+    ) -> ItemRecord {
+        ItemRecord {
+            item_id,
+            parent_id,
+            name: name.to_owned(),
+            kind,
+            item_revision: revision,
+            content_version_id,
+            deleted: false,
+            content_operation: revision,
+            location_operation: revision,
+            deletion_operation: None,
+        }
+    }
+
+    /// View state for a test record: file payloads derive their identity from
+    /// the bound version, so equal versions mean equal content everywhere.
+    fn item_state(record: &ItemRecord) -> hfdrive_core::reconcile::ItemState {
+        use hfdrive_core::storage::Sha256Digest;
+        let (sha256, size) = match record.content_version_id {
+            Some(version) => (Some(Sha256Digest::of(version.as_bytes())), Some(4)),
+            None => (None, None),
+        };
+        hfdrive_core::reconcile::ItemState::from_record(record, sha256, size).unwrap()
+    }
+
+    fn rel(components: &[&str]) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::new();
+        for component in components {
+            path.push(component);
+        }
+        path
+    }
+
+    fn head_record(
+        workspace: WorkspaceId,
+        root_item: ItemId,
+        commit_id: CommitId,
+    ) -> HeadV1 {
+        HeadV1 {
+            format: format::FORMAT_NAME.to_owned(),
+            schema_version: format::SCHEMA_VERSION,
+            workspace_id: workspace,
+            root_item_id: root_item,
+            commit_id,
+            generation: GenerationId::new(),
+            required_features: Vec::new(),
+        }
+    }
+
+    fn commit_record(
+        workspace: WorkspaceId,
+        commit_id: CommitId,
+        catalog_root: hfdrive_core::storage::Sha256Digest,
+    ) -> CommitV1 {
+        CommitV1 {
+            format: format::FORMAT_NAME.to_owned(),
+            schema_version: format::SCHEMA_VERSION,
+            workspace_id: workspace,
+            commit_id,
+            parent_commit_id: Some(CommitId::new()),
+            catalog_root,
+            operation_ids: vec![OperationId::new()],
+            changes: Vec::new(),
+            device_id: DeviceId::new(),
+            created_at: "2026-11-17T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn planned_round(
+        workspace: WorkspaceId,
+        remote_ops: Vec<hfdrive_core::reconcile::RemoteOp>,
+    ) -> PlannedRound {
+        let plan = ReconcilePlan {
+            workspace_id: workspace,
+            mode: ReconcileMode::Writable,
+            remote_ops,
+            versions: Vec::new(),
+            changes: Vec::new(),
+            operation_ids: Vec::new(),
+            local_actions: Vec::new(),
+            conflicts: Vec::new(),
+            aliases: Vec::new(),
+            intents: Vec::new(),
+        };
+        PlannedRound { plan, outcomes: Vec::new() }
+    }
+
+    fn create_op(record: ItemRecord) -> hfdrive_core::reconcile::RemoteOp {
+        hfdrive_core::reconcile::RemoteOp {
+            record,
+            change: format::ChangeKind::Create,
+            old_revision: None,
+        }
+    }
+
+    fn round_context<'a>(
+        fixture: &'a crate::sync::test_support::TestConnection,
+        remote: &'a HeadOnlyRemote,
+        scheduler: &'a crate::scheduler::Scheduler,
+        cancel: &'a CancellationToken,
+    ) -> RoundContext<'a, HeadOnlyRemote> {
+        RoundContext {
+            state: &fixture.account,
+            remote,
+            connection: fixture.connection,
+            workspace: fixture.workspace,
+            root_item_id: fixture.root_item,
+            device_id: DeviceId::new(),
+            mode: ReconcileMode::Writable,
+            root: &fixture.root,
+            staging_dir: fixture.directory.path(),
+            recovery_dir: fixture.directory.path(),
+            scheduler,
+            cancel,
+        }
+    }
 
     #[tokio::test]
     async fn quiet_head_poll_records_observation_without_advancing_publication() {
@@ -1918,6 +2114,567 @@ mod tests {
         assert_eq!(baseline.observed_commit, Some(target));
         assert_eq!(fixture.account.pending_local_actions(fixture.connection).await.unwrap()[0].state, LocalActionState::Pending);
         assert_eq!(std::fs::read(fixture.root.join(path)).unwrap(), b"local bytes must survive");
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- K01: the base advances by the committed batch only ----------------
+
+    #[tokio::test]
+    async fn later_batch_operations_never_enter_the_committed_base() {
+        use hfdrive_core::reconcile::CatalogView;
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let dir = item_record(ItemId::new(), Some(fixture.root_item), "alpha", ItemKind::Directory, None, revision);
+        let first = item_record(ItemId::new(), Some(fixture.root_item), "beta.bin", ItemKind::File, Some(VersionId::new()), revision);
+        let second = item_record(ItemId::new(), Some(fixture.root_item), "gamma.bin", ItemKind::File, Some(VersionId::new()), revision);
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let planned = planned_round(
+            fixture.workspace,
+            vec![create_op(dir.clone()), create_op(first.clone()), create_op(second.clone())],
+        );
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let commit = CommitId::new();
+        // Only the first operation committed in this batch; the other two
+        // belong to later batches and re-plan afterwards.
+        advance_base(&ctx, commit, &planned.plan.remote_ops[..1], &planned, &sources).await.unwrap();
+        let rows = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        let sealed: HashMap<ItemId, String> = rows
+            .iter()
+            .map(|row| {
+                let record = format::from_item_record_bytes(row.item_json.as_bytes()).unwrap();
+                (record.item_id, record.name)
+            })
+            .collect();
+        assert_eq!(sealed.len(), 2, "only the root and the committed operation belong to this base");
+        assert_eq!(sealed.get(&fixture.root_item).map(String::as_str), Some(""));
+        assert_eq!(sealed.get(&dir.item_id).map(String::as_str), Some("alpha"));
+        assert!(!sealed.contains_key(&first.item_id), "a later batch's operation must not enter this base");
+        assert!(!sealed.contains_key(&second.item_id), "a later batch's operation must not enter this base");
+        // The durable registry mirrors exactly the committed records.
+        assert!(fixture.account.item(fixture.connection, dir.item_id).await.unwrap().is_some());
+        assert!(fixture.account.item(fixture.connection, first.item_id).await.unwrap().is_none());
+        assert!(fixture.account.item(fixture.connection, second.item_id).await.unwrap().is_none());
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn more_than_a_commit_bound_of_operations_cannot_enter_one_base() {
+        use hfdrive_core::reconcile::CatalogView;
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let mut records = vec![root];
+        for index in 0..(format::MAX_COMMIT_OPERATIONS + 1) {
+            records.push(item_record(
+                ItemId::new(),
+                Some(fixture.root_item),
+                &format!("file-{index:04}"),
+                ItemKind::File,
+                Some(VersionId::new()),
+                OperationId::new(),
+            ));
+        }
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&records[0])]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&records[0])]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        let planned =
+            planned_round(fixture.workspace, records[1..].iter().cloned().map(create_op).collect());
+        let batches = planned
+            .plan
+            .commit_batches(format::MAX_COMMIT_OPERATIONS, format::MAX_COMMIT_OPERATIONS)
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].remote_ops.len(), format::MAX_COMMIT_OPERATIONS);
+        assert_eq!(batches[1].remote_ops.len(), 1);
+        let last = batches[1].remote_ops[0].record.item_id;
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let first_commit = CommitId::new();
+        advance_base(&ctx, first_commit, &batches[0].remote_ops, &planned, &sources).await.unwrap();
+        let rows = fixture.account.list_common_bases(fixture.connection, first_commit).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            format::MAX_COMMIT_OPERATIONS + 1,
+            "the earlier base holds the root plus exactly the committed batch"
+        );
+        assert!(
+            fixture.account.get_common_base(fixture.connection, last, first_commit).await.unwrap().is_none(),
+            "the 1001st operation must not enter the earlier base"
+        );
+        // The later batch's single operation lands only in its own later base.
+        let second_commit = CommitId::new();
+        advance_base(&ctx, second_commit, &batches[1].remote_ops, &planned, &sources).await.unwrap();
+        assert!(
+            fixture.account.get_common_base(fixture.connection, last, second_commit).await.unwrap().is_some()
+        );
+        assert_eq!(
+            fixture.account.list_common_bases(fixture.connection, second_commit).await.unwrap().len(),
+            2
+        );
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_remote_only_round_seals_the_complete_remote_view() {
+        use hfdrive_core::reconcile::CatalogView;
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let remote_only = item_record(
+            ItemId::new(), Some(fixture.root_item), "remote-only.txt", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&root), item_state(&remote_only)]).unwrap(),
+            intents: Vec::new(),
+            names: HashMap::new(),
+        };
+        // The plan is empty of remote ops: the round published nothing.
+        let planned = planned_round(fixture.workspace, Vec::new());
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let head_commit = CommitId::new();
+        advance_base(&ctx, head_commit, &[], &planned, &sources).await.unwrap();
+        let rows = fixture.account.list_common_bases(fixture.connection, head_commit).await.unwrap();
+        assert_eq!(rows.len(), 2, "the remote-only base is the complete remote view");
+        assert!(
+            fixture.account
+                .get_common_base(fixture.connection, remote_only.item_id, head_commit)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- K10: head evidence proves its identity ---------------------------
+
+    /// Evaluates `catalog_root_of` against a fresh remote serving `body`, so
+    /// no test case mutates storage under a live borrow.
+    async fn catalog_root_of_body(
+        fixture: &crate::sync::test_support::TestConnection,
+        scheduler: &crate::scheduler::Scheduler,
+        cancel: &CancellationToken,
+        head: &RemoteHead,
+        body: Vec<u8>,
+    ) -> Result<CatalogRoot, PublishError> {
+        let remote = HeadOnlyRemote { metadata: Some(bytes::Bytes::from(body)), ..Default::default() };
+        let ctx = round_context(fixture, &remote, scheduler, cancel);
+        catalog_root_of(&ctx, head).await
+    }
+
+    /// Evaluates `head_evidence` against a fresh remote serving `body`, so no
+    /// test case mutates storage under a live borrow.
+    async fn head_evidence_body(
+        fixture: &crate::sync::test_support::TestConnection,
+        scheduler: &crate::scheduler::Scheduler,
+        cancel: &CancellationToken,
+        head: &RemoteHead,
+        body: Vec<u8>,
+    ) -> Result<serde_json::Value, PublishError> {
+        let remote = HeadOnlyRemote { metadata: Some(bytes::Bytes::from(body)), ..Default::default() };
+        let ctx = round_context(fixture, &remote, scheduler, cancel);
+        head_evidence(&ctx, head).await
+    }
+
+    #[tokio::test]
+    async fn committed_head_evidence_rejects_wrong_commit_or_workspace() {
+        use hfdrive_core::storage::Sha256Digest;
+        let fixture = connection_fixture().await;
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let commit_id = CommitId::new();
+        let catalog_root = Sha256Digest::of(b"catalog-root");
+        let head = RemoteHead {
+            head: head_record(fixture.workspace, fixture.root_item, commit_id),
+            etag: None,
+        };
+
+        // The correct body resolves the catalog root and the evidence bundle.
+        let correct = format::to_commit_bytes(&commit_record(fixture.workspace, commit_id, catalog_root)).unwrap();
+        let resolved = catalog_root_of_body(&fixture, &scheduler, &cancel, &head, correct.clone()).await;
+        assert_eq!(resolved.unwrap().digest(), catalog_root);
+        let evidence = head_evidence_body(&fixture, &scheduler, &cancel, &head, correct).await.unwrap();
+        let bundle: CandidateBundle = serde_json::from_value(evidence).unwrap();
+        assert_eq!(bundle.commit_v1().unwrap().commit_id, commit_id);
+
+        // A body naming another commit is not this head's namespace.
+        let wrong_commit =
+            format::to_commit_bytes(&commit_record(fixture.workspace, CommitId::new(), catalog_root)).unwrap();
+        assert!(matches!(
+            catalog_root_of_body(&fixture, &scheduler, &cancel, &head, wrong_commit.clone()).await,
+            Err(PublishError::UnsupportedFormat)
+        ));
+        assert!(matches!(
+            head_evidence_body(&fixture, &scheduler, &cancel, &head, wrong_commit).await,
+            Err(PublishError::UnsupportedFormat)
+        ));
+
+        // A body from another workspace is foreign storage, never evidence.
+        let wrong_workspace =
+            format::to_commit_bytes(&commit_record(WorkspaceId::new(), commit_id, catalog_root)).unwrap();
+        assert!(matches!(
+            catalog_root_of_body(&fixture, &scheduler, &cancel, &head, wrong_workspace.clone()).await,
+            Err(PublishError::UnsupportedFormat)
+        ));
+        assert!(matches!(
+            head_evidence_body(&fixture, &scheduler, &cancel, &head, wrong_workspace).await,
+            Err(PublishError::UnsupportedFormat)
+        ));
+        fixture.state.close().await.unwrap();
+    }
+
+    // -- G07: action source/target paths --------------------------------
+
+    #[tokio::test]
+    async fn rename_binding_uses_distinct_expected_and_target_paths() {
+        use hfdrive_core::reconcile::{CatalogView, LocalActionKind};
+        let fixture = connection_fixture().await;
+        let base_revision = OperationId::new();
+        let move_op = OperationId::new();
+        let case_op = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, base_revision);
+        let docs = item_record(ItemId::new(), Some(fixture.root_item), "docs", ItemKind::Directory, None, base_revision);
+        let report = item_record(
+            ItemId::new(), Some(fixture.root_item), "report.txt", ItemKind::File,
+            Some(VersionId::new()), base_revision,
+        );
+        let photo = item_record(
+            ItemId::new(), Some(fixture.root_item), "photo.jpg", ItemKind::File,
+            Some(VersionId::new()), base_revision,
+        );
+        // Remote round: `report.txt` moved into `docs` **and** renamed;
+        // `photo.jpg` renamed to its case-only spelling `Photo.JPG`.
+        let moved = ItemRecord {
+            name: "report-2026.txt".to_owned(),
+            parent_id: Some(docs.item_id),
+            item_revision: move_op,
+            content_operation: move_op,
+            location_operation: move_op,
+            ..report.clone()
+        };
+        let case_renamed = ItemRecord {
+            name: "Photo.JPG".to_owned(),
+            item_revision: case_op,
+            content_operation: case_op,
+            location_operation: case_op,
+            ..photo.clone()
+        };
+        let base = CatalogView::new(vec![
+            item_state(&root),
+            item_state(&docs),
+            item_state(&report),
+            item_state(&photo),
+        ])
+        .unwrap();
+        let remote_view = CatalogView::new(vec![
+            item_state(&root),
+            item_state(&docs),
+            item_state(&moved),
+            item_state(&case_renamed),
+        ])
+        .unwrap();
+        let names = collect_names(&base, &remote_view);
+        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let planned =
+            plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
+                .await
+                .unwrap();
+        let renames: Vec<_> = planned
+            .plan
+            .local_actions
+            .iter()
+            .filter(|action| action.action == LocalActionKind::Rename)
+            .collect();
+        assert_eq!(renames.len(), 2, "exactly the moved file and the case-only rename apply locally");
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let facts = bind_action_facts(&ctx, &planned.plan, &sources).await.unwrap();
+        for action in renames {
+            let fact = &facts[&action.action_id];
+            let source = fact.source_path.as_ref().unwrap();
+            let target = fact.target_path.as_ref().unwrap();
+            assert_ne!(source, target, "a rename's source and target paths must differ");
+            match action.item_id {
+                id if id == report.item_id => {
+                    // Source is the expected/base location; target is the
+                    // reconciled location in the planned target namespace.
+                    assert_eq!(source, &rel(&["report.txt"]));
+                    assert_eq!(target, &rel(&["docs", "report-2026.txt"]));
+                }
+                id if id == photo.item_id => {
+                    assert_eq!(source, &rel(&["photo.jpg"]));
+                    assert_eq!(target, &rel(&["Photo.JPG"]));
+                    assert!(hfdrive_windows::filesystem::names::windows_case_equivalent(
+                        &source.to_string_lossy(),
+                        &target.to_string_lossy()
+                    ));
+                    assert!(!hfdrive_windows::filesystem::names::windows_exact_equal(
+                        &source.to_string_lossy(),
+                        &target.to_string_lossy()
+                    ));
+                }
+                other => panic!("unexpected rename item {other}"),
+            }
+        }
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_binding_follows_a_renamed_parent_directory() {
+        use hfdrive_core::reconcile::{CatalogView, LocalActionKind};
+        let fixture = connection_fixture().await;
+        let base_revision = OperationId::new();
+        let move_op = OperationId::new();
+        let content_op = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, base_revision);
+        let old_parent = item_record(ItemId::new(), Some(fixture.root_item), "docs", ItemKind::Directory, None, base_revision);
+        let notes = item_record(
+            ItemId::new(), Some(old_parent.item_id), "notes.txt", ItemKind::File,
+            Some(VersionId::new()), base_revision,
+        );
+        // Remote round: the parent directory is renamed and the file's
+        // content version changes.
+        let new_parent = ItemRecord {
+            name: "docs-2026".to_owned(),
+            item_revision: move_op,
+            content_operation: move_op,
+            location_operation: move_op,
+            ..old_parent.clone()
+        };
+        let updated = ItemRecord {
+            content_version_id: Some(VersionId::new()),
+            item_revision: content_op,
+            content_operation: content_op,
+            ..notes.clone()
+        };
+        let base = CatalogView::new(vec![item_state(&root), item_state(&old_parent), item_state(&notes)]).unwrap();
+        let remote_view =
+            CatalogView::new(vec![item_state(&root), item_state(&new_parent), item_state(&updated)]).unwrap();
+        let names = collect_names(&base, &remote_view);
+        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let planned =
+            plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
+                .await
+                .unwrap();
+        let update = planned
+            .plan
+            .local_actions
+            .iter()
+            .find(|action| action.action == LocalActionKind::UpdatePlaceholder && action.item_id == notes.item_id)
+            .expect("the content change applies locally");
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let facts = bind_action_facts(&ctx, &planned.plan, &sources).await.unwrap();
+        let fact = &facts[&update.action_id];
+        // The source resolves in the expected/base namespace (old parent);
+        // the target resolves in the reconciled target namespace (new parent).
+        assert_eq!(fact.source_path.as_ref().unwrap(), &rel(&["docs", "notes.txt"]));
+        assert_eq!(fact.target_path.as_ref().unwrap(), &rel(&["docs-2026", "notes.txt"]));
+        assert_ne!(fact.source_path, fact.target_path);
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_ancestor_move_and_remote_child_change_resolve_in_their_own_namespaces() {
+        use hfdrive_core::reconcile::{CatalogView, LocalActionKind, LocalChange, LocalIntent, LocalOrigin};
+        let fixture = connection_fixture().await;
+        let base_revision = OperationId::new();
+        let remote_op = OperationId::new();
+        let local_op = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, base_revision);
+        // Base: `work/draft/notes.txt`. The local edit moves the top ancestor
+        // `work` -> `archive`; the remote round renames the middle directory
+        // and publishes new content for the leaf.
+        let work = item_record(ItemId::new(), Some(fixture.root_item), "work", ItemKind::Directory, None, base_revision);
+        let draft = item_record(ItemId::new(), Some(work.item_id), "draft", ItemKind::Directory, None, base_revision);
+        let notes = item_record(
+            ItemId::new(), Some(draft.item_id), "notes.txt", ItemKind::File,
+            Some(VersionId::new()), base_revision,
+        );
+        let moved_draft = ItemRecord {
+            name: "draft-2026".to_owned(),
+            item_revision: remote_op,
+            content_operation: remote_op,
+            location_operation: remote_op,
+            ..draft.clone()
+        };
+        let updated = ItemRecord {
+            content_version_id: Some(VersionId::new()),
+            item_revision: remote_op,
+            content_operation: remote_op,
+            location_operation: remote_op,
+            ..notes.clone()
+        };
+        let intents = vec![LocalIntent {
+            operation_id: local_op,
+            item_id: work.item_id,
+            origin: LocalOrigin::LocalEdit,
+            observed_generation: 1,
+            change: LocalChange::Move { parent_id: fixture.root_item, name: "archive".to_owned() },
+        }];
+        let base = CatalogView::new(vec![
+            item_state(&root),
+            item_state(&work),
+            item_state(&draft),
+            item_state(&notes),
+        ])
+        .unwrap();
+        let remote_view = CatalogView::new(vec![
+            item_state(&root),
+            item_state(&work),
+            item_state(&moved_draft),
+            item_state(&updated),
+        ])
+        .unwrap();
+        let names = collect_names(&base, &remote_view);
+        let sources = PlanSources { base, remote: remote_view, intents, names };
+        let planned =
+            plan::plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources)
+                .await
+                .unwrap();
+        let update = planned
+            .plan
+            .local_actions
+            .iter()
+            .find(|action| action.action == LocalActionKind::UpdatePlaceholder && action.item_id == notes.item_id)
+            .expect("the remote content change materializes locally");
+
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let facts = bind_action_facts(&ctx, &planned.plan, &sources).await.unwrap();
+        let fact = &facts[&update.action_id];
+        // The source resolves its ancestors in the base overlaid with the
+        // local intents: the locally moved top ancestor is already `archive`
+        // (the base alone knows only `work`) and the middle directory keeps
+        // its base spelling `draft`. The target resolves its ancestors in the
+        // remote view overlaid with the plan's target operations: the middle
+        // directory is `draft-2026` and the top ancestor is `archive` because
+        // the planned move operation published it (the remote view alone
+        // still knows `work`).
+        assert_eq!(fact.source_path.as_ref().unwrap(), &rel(&["archive", "draft", "notes.txt"]));
+        assert_eq!(fact.target_path.as_ref().unwrap(), &rel(&["archive", "draft-2026", "notes.txt"]));
+        assert_ne!(fact.source_path, fact.target_path);
+        // The remote directory rename materializes the same way: its source
+        // ancestor comes from the intent overlay, its target ancestor from
+        // the planned target operations.
+        let rename = planned
+            .plan
+            .local_actions
+            .iter()
+            .find(|action| action.action == LocalActionKind::Rename && action.item_id == draft.item_id)
+            .expect("the remote directory rename applies locally");
+        let rename_fact = &facts[&rename.action_id];
+        assert_eq!(rename_fact.source_path.as_ref().unwrap(), &rel(&["archive", "draft"]));
+        assert_eq!(rename_fact.target_path.as_ref().unwrap(), &rel(&["archive", "draft-2026"]));
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn target_path_resolves_through_planned_target_operations() {
+        use hfdrive_core::reconcile::{CatalogView, LocalActionKind, RemoteOp};
+        let fixture = connection_fixture().await;
+        let base_revision = OperationId::new();
+        let recover_op = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, base_revision);
+        let report = item_record(
+            ItemId::new(), Some(fixture.root_item), "report.txt", ItemKind::File,
+            Some(VersionId::new()), base_revision,
+        );
+        // The plan itself creates the recovered directory and re-homes the
+        // file into it: the target parent exists only among the planned
+        // target operations, never in the committed remote view.
+        let recovered = ItemRecord {
+            item_id: ItemId::new(),
+            parent_id: Some(fixture.root_item),
+            name: "Recovered (conflict 0000000000000000)".to_owned(),
+            kind: ItemKind::Directory,
+            item_revision: recover_op,
+            content_version_id: None,
+            deleted: false,
+            content_operation: recover_op,
+            location_operation: recover_op,
+            deletion_operation: None,
+        };
+        let rehomed = ItemRecord {
+            parent_id: Some(recovered.item_id),
+            item_revision: recover_op,
+            content_operation: recover_op,
+            location_operation: recover_op,
+            ..report.clone()
+        };
+        let base = CatalogView::new(vec![item_state(&root), item_state(&report)]).unwrap();
+        let remote_view = CatalogView::new(vec![item_state(&root), item_state(&report)]).unwrap();
+        let names = collect_names(&base, &remote_view);
+        let sources = PlanSources { base, remote: remote_view, intents: Vec::new(), names };
+        let plan = ReconcilePlan {
+            workspace_id: fixture.workspace,
+            mode: ReconcileMode::Writable,
+            remote_ops: vec![
+                RemoteOp {
+                    record: recovered.clone(),
+                    change: format::ChangeKind::Create,
+                    old_revision: None,
+                },
+                RemoteOp {
+                    record: rehomed.clone(),
+                    change: format::ChangeKind::Location,
+                    old_revision: Some(report.item_revision),
+                },
+            ],
+            versions: Vec::new(),
+            changes: Vec::new(),
+            operation_ids: Vec::new(),
+            local_actions: vec![hfdrive_core::reconcile::LocalAction {
+                action_id: ActionId::new(),
+                item_id: report.item_id,
+                action: LocalActionKind::Rename,
+                expected: Some(item_state(&report)),
+                target: Some(item_state(&rehomed)),
+                local_alias: None,
+            }],
+            conflicts: Vec::new(),
+            aliases: Vec::new(),
+            intents: Vec::new(),
+        };
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let ctx = round_context(&fixture, &remote, &scheduler, &cancel);
+        let facts = bind_action_facts(&ctx, &plan, &sources).await.unwrap();
+        let fact = &facts[&plan.local_actions[0].action_id];
+        assert_eq!(fact.source_path.as_ref().unwrap(), &rel(&["report.txt"]));
+        assert_eq!(
+            fact.target_path.as_ref().unwrap(),
+            &rel(&["Recovered (conflict 0000000000000000)", "report.txt"]),
+            "the target parent comes from the planned target operations"
+        );
+        assert_ne!(fact.source_path, fact.target_path);
         fixture.state.close().await.unwrap();
     }
 }

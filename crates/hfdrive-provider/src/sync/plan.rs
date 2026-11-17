@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use hfdrive_core::catalog::{CatalogReader, CatalogRoot, PageSource};
 use hfdrive_core::format::{self, ItemRecord};
-use hfdrive_core::ids::{ActionId, CommitId, ConnectionId, ItemId, OperationId};
+use hfdrive_core::ids::{ActionId, CommitId, ConnectionId, ItemId, OperationId, WorkspaceId};
 use hfdrive_core::reconcile::{
     CatalogView, ConflictRecord as CoreConflict, IdSource, ItemState, LocalIntent, LocalOrigin,
     OrdinalIgnoreCase, ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
@@ -553,8 +553,21 @@ pub fn ready_to_plan(entry: &OutboxEntry) -> bool {
     }
 }
 
-/// A `DigestSource` implementation over the remote boundary.
-pub struct RemoteDigests<'a, R: RemoteOps>(pub &'a R);
+/// A `DigestSource` implementation over the remote boundary, bound to one
+/// connection's workspace. The returned record must prove the requested
+/// identity itself: a body naming another version or another workspace is a
+/// different payload binding (or foreign storage) and never resolves this
+/// request.
+pub struct RemoteDigests<'a, R: RemoteOps> {
+    remote: &'a R,
+    workspace: WorkspaceId,
+}
+
+impl<'a, R: RemoteOps> RemoteDigests<'a, R> {
+    pub fn new(remote: &'a R, workspace: WorkspaceId) -> Self {
+        Self { remote, workspace }
+    }
+}
 
 impl<R: RemoteOps> DigestSource for RemoteDigests<'_, R> {
     async fn version_digest(
@@ -563,9 +576,12 @@ impl<R: RemoteOps> DigestSource for RemoteDigests<'_, R> {
         cancel: &CancellationToken,
     ) -> Result<(Sha256Digest, u64), RemoteError> {
         let record = hfdrive_publication::MetadataRecord::Version(version);
-        let body = self.0.read_metadata(record, cancel).await?;
+        let body = self.remote.read_metadata(record, cancel).await?;
         let version_record = format::from_version_bytes(&body)
             .map_err(|_| RemoteError::InvalidResponse)?;
+        if version_record.workspace_id != self.workspace || version_record.version_id != version {
+            return Err(RemoteError::InvalidResponse);
+        }
         Ok((version_record.sha256, version_record.size))
     }
 }
@@ -600,7 +616,7 @@ mod tests {
         fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(applied)).await.unwrap();
         fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Observed, Some(observed)).await.unwrap();
         let remote = crate::sync::test_support::HeadOnlyRemote::default();
-        let source = RemoteDigests(&remote);
+        let source = RemoteDigests::new(&remote, fixture.workspace);
         let cancel = CancellationToken::new();
         let mut digests = DigestResolver::new(&source, &cancel);
         let baseline = fixture.account.baseline(fixture.connection).await.unwrap();
@@ -655,5 +671,67 @@ mod tests {
         assert_eq!(changed.content_sha256, Some(second_digest));
         assert_eq!(changed.content_size, Some(6));
         assert_eq!(resolver.resolve(&tombstone.to_record()).await.unwrap(), (Some(first_digest), Some(5)));
+    }
+
+    /// Resolves one version digest against a fresh remote serving `body`, so
+    /// no test case mutates storage under a live borrow.
+    async fn resolve_version_body(
+        workspace: WorkspaceId,
+        version: hfdrive_core::ids::VersionId,
+        body: Vec<u8>,
+    ) -> Result<(Sha256Digest, u64), RemoteError> {
+        use bytes::Bytes;
+        let remote = crate::sync::test_support::HeadOnlyRemote {
+            metadata: Some(Bytes::from(body)),
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        RemoteDigests::new(&remote, workspace).version_digest(version, &cancel).await
+    }
+
+    /// A resolved version record must name the exact requested version and the
+    /// connection's workspace; anything else is a foreign binding and never
+    /// resolves a digest.
+    #[tokio::test]
+    async fn remote_digests_reject_wrong_version_id_or_workspace() {
+        use hfdrive_core::ids::{UploadId, VersionId};
+        use hfdrive_core::storage::{PayloadKey, XetFileId};
+        let requested = VersionId::new();
+        let workspace = WorkspaceId::new();
+        let mut record = format::VersionV1 {
+            format: format::FORMAT_NAME.to_owned(),
+            schema_version: format::SCHEMA_VERSION,
+            workspace_id: workspace,
+            version_id: requested,
+            object_key: PayloadKey::new(UploadId::new()),
+            size: 7,
+            sha256: Sha256Digest::of(b"seven"),
+            xet_file_id: Some(XetFileId::new("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned()).unwrap()),
+            display: format::DisplayMetadata { name: "file.bin".to_owned(), modified_at: "2026-11-17T00:00:00Z".to_owned() },
+        };
+
+        // The exact record resolves.
+        let exact = format::to_version_bytes(&record).unwrap();
+        assert_eq!(
+            resolve_version_body(workspace, requested, exact).await.unwrap(),
+            (Sha256Digest::of(b"seven"), 7)
+        );
+
+        // A body naming a different version never resolves the request.
+        record.version_id = VersionId::new();
+        let wrong_version = format::to_version_bytes(&record).unwrap();
+        assert!(matches!(
+            resolve_version_body(workspace, requested, wrong_version).await,
+            Err(RemoteError::InvalidResponse)
+        ));
+
+        // A body from another workspace never resolves the request either.
+        record.version_id = requested;
+        record.workspace_id = WorkspaceId::new();
+        let wrong_workspace = format::to_version_bytes(&record).unwrap();
+        assert!(matches!(
+            resolve_version_body(workspace, requested, wrong_workspace).await,
+            Err(RemoteError::InvalidResponse)
+        ));
     }
 }
