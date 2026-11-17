@@ -4,6 +4,10 @@
 //! 409 as ownership. Creation provenance is an exact committed operation
 //! receipt; the reserved connection ID binds both the IPC ciphertext and the
 //! provider's stable at-rest DPAPI record.
+//! Preview captures have their own account-local durable journal because a
+//! setup is not yet a registered connection. Capture intent precedes file
+//! creation; retained bytes survive preview replacement, failure and restart,
+//! and participate in the same staging admission as synchronization snapshots.
 
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
@@ -13,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use hfdrive_core::format::{self, ItemKind as FormatItemKind};
-use hfdrive_core::ids::{ConnectionId, ItemId, OperationId, SnapshotId};
+use hfdrive_core::ids::{ConnectionId, ItemId, OperationId, SetupId, SnapshotId};
 use hfdrive_core::names;
 use hfdrive_core::storage::{BucketBinding, BucketName, DriveBinding, ImmutableKey, Sha256Digest};
 use hfdrive_hf::{BucketSummary, HeadFormat, HeadRead, NativeBucketStore, NativeControl, NativeLease, OwnerLocator, PrefixState};
@@ -222,6 +226,71 @@ struct CaptureRecord {
     sha256: String,
 }
 
+const SETUP_CAPTURES_SCOPE: &str = "setup/captures/v1";
+
+/// Independent of replaceable preview evidence. A missing size means capture
+/// did not finish journaling; only its exact owned path is inspected on recovery.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupCapture {
+    setup_id: SetupId,
+    snapshot_id: SnapshotId,
+    relative_path: String,
+    staged_path: PathBuf,
+    size: Option<u64>,
+    sha256: Option<Sha256Digest>,
+}
+
+struct SetupCaptures {
+    revision: Option<u64>,
+    entries: Vec<SetupCapture>,
+}
+
+impl SetupCaptures {
+    async fn load(account: &hfdrive_state::AccountStore) -> Result<Self, hfdrive_state::StateError> {
+        match account.settings(SETUP_CAPTURES_SCOPE.to_owned()).await? {
+            Some(row) => Ok(Self {
+                revision: Some(row.revision),
+                entries: serde_json::from_value(row.value_json).map_err(|_| hfdrive_state::StateError::Corrupt {
+                    detail: "invalid setup capture journal".to_owned(),
+                })?,
+            }),
+            None => Ok(Self { revision: None, entries: Vec::new() }),
+        }
+    }
+
+    /// Every writer holds the scheduler's staging-admission guard. CAS also
+    /// refuses a stale journal rather than replacing another capture's intent.
+    async fn save(&mut self, account: &hfdrive_state::AccountStore) -> Result<(), hfdrive_state::StateError> {
+        let value = serde_json::to_value(&self.entries).map_err(|_| hfdrive_state::StateError::Corrupt {
+            detail: "invalid setup capture journal".to_owned(),
+        })?;
+        let row = account.set_settings(SETUP_CAPTURES_SCOPE.to_owned(), value, self.revision).await?;
+        self.revision = Some(row.revision);
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> Result<u64, hfdrive_state::StateError> {
+        self.entries.iter().try_fold(0u64, |total, capture| {
+            let size = match capture.size {
+                Some(size) => size,
+                None => match std::fs::metadata(&capture.staged_path) {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.into()),
+                },
+            };
+            Ok(total.saturating_add(size))
+        })
+    }
+}
+
+pub(crate) async fn retained_setup_capture_bytes(
+    account: &hfdrive_state::AccountStore,
+) -> Result<u64, hfdrive_state::StateError> {
+    SetupCaptures::load(account).await?.retained_bytes()
+}
+
 /// One deterministic plan entry: an actionable or colliding path.
 struct PlanEntry {
     relative_path: String,
@@ -366,6 +435,7 @@ impl Provider {
         let staging_dir = self.paths.account(profile.account_key)
             .drive(setup.binding.workspace_id)
             .snapshots();
+        let account = self.state.open_account(setup.account_key).await.map_err(crate::operations::state_error)?;
         let mut entries: Vec<PlanEntry> = Vec::new();
         let mut captures: Vec<CaptureRecord> = Vec::new();
         let mut parent_groups: HashMap<Vec<u8>, Vec<(Side, usize)>> = HashMap::new();
@@ -444,8 +514,8 @@ impl Provider {
                     let local_digest = if local.is_directory {
                         None
                     } else {
-                        match self.capture_digest_proof(
-                            &root_path, local, &staging_dir, *setup.binding.workspace_id.as_uuid(), cancel,
+                        match capture_digest_proof(
+                            &account, &self.scheduler, &setup, &root_path, local, &staging_dir, cancel,
                         ).await? {
                             Some(record) => {
                                 let digest = record.sha256.clone();
@@ -665,80 +735,100 @@ impl Provider {
         })
     }
 
-    /// Captures one coherent staged snapshot of a both-present local file to
-    /// prove its digest. The staged file is retained (never deleted here) and
-    /// recorded in the preview document. `None` means the digest proof was not
-    /// obtainable (unsupported source, staging admission, drift, sharing): the
-    /// caller must never treat those bytes as identical or different.
-    async fn capture_digest_proof(
-        &self,
-        root: &Path,
-        local: &LocalView,
-        staging_dir: &Path,
-        drive: uuid::Uuid,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Option<CaptureRecord>, wire::ProtocolError> {
-        if local.unsupported.is_some() {
-            return Ok(None);
+}
+
+/// Journals ownership before creating the file and completion before releasing
+/// admission. Failed captures are forgotten only when their exact path is
+/// absent; partial bytes stay tracked. Successful captures are never reclaimed
+/// here, even if the enclosing preview is cancelled, replaced or fails to save.
+async fn capture_digest_proof(
+    account: &hfdrive_state::AccountStore,
+    scheduler: &crate::scheduler::Scheduler,
+    setup: &SetupRecord,
+    root: &Path,
+    local: &LocalView,
+    staging_dir: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<CaptureRecord>, wire::ProtocolError> {
+    if local.unsupported.is_some() {
+        return Ok(None);
+    }
+    if cancel.is_cancelled() {
+        return Err(error(wire::ProtocolErrorCode::Cancelled, "The preview was cancelled"));
+    }
+    let mut source = root.to_path_buf();
+    for component in &local.components {
+        source.push(component);
+    }
+    // The shared sample includes both registered snapshots and every retained
+    // setup capture. The free-space check still targets the staging volume.
+    let admission = scheduler.staging_admission(
+        crate::scheduler::WorkClass::LocalEdit,
+        *setup.binding.workspace_id.as_uuid(),
+        staging_dir,
+        local.size,
+        crate::sync::capture::retained_staging_bytes(account),
+        cancel,
+    ).await;
+    let admission = match admission {
+        Ok(admission) => admission,
+        Err(crate::scheduler::StagingAdmissionError::RetainedOccupancy(error)) => {
+            return Err(crate::operations::state_error(error));
         }
-        if cancel.is_cancelled() {
-            return Err(error(wire::ProtocolErrorCode::Cancelled, "The preview was cancelled"));
-        }
-        let mut source = root.to_path_buf();
-        for component in &local.components {
-            source.push(component);
-        }
-        // Staging admission is one serialized critical section: the retained
-        // occupancy sample, the staging reservation and this capture's
-        // completion all run while its guard is held (the guard below lives
-        // until the staged file is produced). The sample charges this
-        // capture's bytes plus the durable occupancy the account's retained
-        // `Capturing`/`Ready` snapshots already hold (reconstructed from state
-        // on every capture), and free space is asked of the staging volume
-        // holding the staged file — never the sync root's volume.
-        let account = self
-            .state
-            .open_account(self.current_account()?.account_key)
-            .await
-            .map_err(crate::operations::state_error)?;
-        let admission = self.scheduler.staging_admission(
-            crate::scheduler::WorkClass::LocalEdit,
-            drive,
-            staging_dir,
-            local.size,
-            async {
-                let retained = crate::sync::capture::retained_staging_bytes(&account).await?;
-                Ok::<u64, hfdrive_state::StateError>(retained)
-            },
-            cancel,
-        ).await;
-        let admission = match admission {
-            Ok(admission) => admission,
-            // The occupancy sample is a durable-state read: a failure there is
-            // a real error, not a missing digest proof.
-            Err(crate::scheduler::StagingAdmissionError::RetainedOccupancy(error)) => {
-                return Err(crate::operations::state_error(error));
-            }
-            // Staging admission refused: no proof, no deletion, no claim.
-            Err(crate::scheduler::StagingAdmissionError::Refused(_)) => return Ok(None),
-        };
-        let _admission = admission;
-        let snapshot_id = SnapshotId::new();
-        let staging = staging_dir.to_path_buf();
-        let expected = local.state.clone();
-        let captured = tokio::task::spawn_blocking(move || {
-            filesystem::capture_snapshot(&source, &staging, snapshot_id, Some(&expected))
-        }).await.map_err(|_| crate::operations::internal())?;
-        match captured {
-            Ok(captured) => Ok(Some(CaptureRecord {
+        // No proof, no new journal entry, no staged bytes, no deletion.
+        Err(crate::scheduler::StagingAdmissionError::Refused(_)) => return Ok(None),
+    };
+    let mut journal = SetupCaptures::load(account).await.map_err(crate::operations::state_error)?;
+    let snapshot_id = SnapshotId::new();
+    let staged_path = staging_dir.join(format!("{snapshot_id}.snap"));
+    journal.entries.push(SetupCapture {
+        setup_id: setup.setup_id,
+        snapshot_id,
+        relative_path: local.display.clone(),
+        staged_path: staged_path.clone(),
+        size: None,
+        sha256: None,
+    });
+    journal.save(account).await.map_err(crate::operations::state_error)?;
+    let staging = staging_dir.to_path_buf();
+    let expected = local.state.clone();
+    // A dropped async caller cannot release admission while spawn_blocking
+    // still writes. Its result owns the guard until completion is journaled;
+    // if the caller vanished, the prewritten exact-path intent accounts for
+    // any bytes left behind once the worker and guard finish.
+    let (captured, _admission) = tokio::task::spawn_blocking(move || {
+        let captured = filesystem::capture_snapshot(&source, &staging, snapshot_id, Some(&expected));
+        (captured, admission)
+    }).await.map_err(|_| crate::operations::internal())?;
+    match captured {
+        Ok(captured) => {
+            let entry = journal.entries.last_mut().ok_or_else(crate::operations::internal)?;
+            entry.size = Some(captured.size);
+            entry.sha256 = Some(captured.sha256);
+            journal.save(account).await.map_err(crate::operations::state_error)?;
+            Ok(Some(CaptureRecord {
                 relative_path: local.display.clone(),
                 snapshot_id: captured.snapshot_id,
                 staged_path: captured.staged_path.to_string_lossy().into_owned(),
                 size: captured.size,
                 sha256: captured.sha256.to_string(),
-            })),
-            Err(FsError::Cancelled) => Err(error(wire::ProtocolErrorCode::Cancelled, "The preview was cancelled")),
-            Err(_) => Ok(None),
+            }))
+        }
+        Err(capture_error) => {
+            if let Err(error) = std::fs::symlink_metadata(&staged_path) {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    // The capture worker has stopped and no bytes remain.
+                    // Never remove another capture or a partial retained file.
+                    journal.entries.pop();
+                    journal.save(account).await.map_err(crate::operations::state_error)?;
+                } else {
+                    return Err(crate::operations::state_error(error.into()));
+                }
+            }
+            match capture_error {
+                FsError::Cancelled => Err(error(wire::ProtocolErrorCode::Cancelled, "The preview was cancelled")),
+                _ => Ok(None),
+            }
         }
     }
 }
@@ -1152,6 +1242,216 @@ fn action_description(action: wire::ProposedAction, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StagingProbe {
+        available: u64,
+        asked: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl crate::scheduler::FreeSpaceProbe for StagingProbe {
+        fn available_bytes(&self, path: &Path) -> Option<u64> {
+            self.asked.lock().unwrap().push(path.to_path_buf());
+            Some(self.available)
+        }
+    }
+
+    fn capture_scheduler(available: u64) -> (crate::scheduler::Scheduler, Arc<StagingProbe>) {
+        let scheduler = crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig {
+            staging_admission_bytes: 10,
+            minimum_free_bytes: 100,
+            ..Default::default()
+        });
+        let probe = Arc::new(StagingProbe { available, asked: std::sync::Mutex::new(Vec::new()) });
+        scheduler.set_free_space_probe(Some(probe.clone()));
+        (scheduler, probe)
+    }
+
+    async fn capture_setup(fixture: &crate::sync::test_support::TestConnection) -> SetupRecord {
+        let mut binding = fixture.account.get_connection(fixture.connection).await.unwrap().unwrap().binding;
+        binding.workspace_id = hfdrive_core::ids::WorkspaceId::new();
+        binding.prefix = hfdrive_core::storage::RemotePrefix::new(format!("hfdrive/{}", binding.workspace_id)).unwrap();
+        let reservation = fixture.state.reserve_setup(SetupDraft {
+            operation_id: OperationId::new(),
+            account_key: fixture.account.account_key(),
+            binding,
+            initialize: false,
+        }).await.unwrap();
+        fixture.state.get_setup(reservation.setup_id).await.unwrap().unwrap()
+    }
+
+    fn capture_local(root: &Path, name: &str) -> LocalView {
+        let state = hfdrive_windows::filesystem::volume::query_file_state(&root.join(name)).unwrap();
+        LocalView {
+            components: vec![name.to_owned()],
+            display: name.to_owned(),
+            invalid_name: false,
+            is_directory: false,
+            size: state.size,
+            state,
+            unsupported: None,
+        }
+    }
+
+    /// Scaled 6 + 6 > 10 regression, using real coherent captures and durable
+    /// state. No finalized connection or saved preview owns the first capture.
+    #[tokio::test]
+    async fn successive_preview_captures_share_durable_staging_budget() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let setup = capture_setup(&fixture).await;
+        assert!(fixture.account.get_connection(setup.connection_id).await.unwrap().is_none());
+        let staging = fixture.directory.path().join("setup-staging");
+        std::fs::create_dir(&staging).unwrap();
+        let unrelated = staging.join("unrelated.snap");
+        std::fs::write(&unrelated, b"unrelated bytes exceed the entire budget").unwrap();
+        std::fs::write(fixture.root.join("first.bin"), b"first!").unwrap();
+        std::fs::write(fixture.root.join("second.bin"), b"second").unwrap();
+        let first = capture_local(&fixture.root, "first.bin");
+        let second = capture_local(&fixture.root, "second.bin");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (scheduler, probe) = capture_scheduler(200);
+        let captured = capture_digest_proof(
+            &fixture.account, &scheduler, &setup, &fixture.root, &first, &staging, &cancel,
+        ).await.unwrap().expect("the first six bytes fit; unrelated files never count");
+        assert_eq!(captured.size, 6);
+        assert_eq!(std::fs::read(&captured.staged_path).unwrap(), b"first!");
+        assert_eq!(scheduler.stats().staging_used_bytes, 0, "the transient reservation is released");
+        assert!(fixture.state.get_setup(setup.setup_id).await.unwrap().unwrap().preview_json.is_none());
+        assert_eq!(crate::sync::capture::retained_staging_bytes(&fixture.account).await.unwrap(), 6);
+
+        assert!(capture_digest_proof(
+            &fixture.account, &scheduler, &setup, &fixture.root, &second, &staging, &cancel,
+        ).await.unwrap().is_none(), "the second six bytes cannot fit behind the first");
+        let journal = SetupCaptures::load(&fixture.account).await.unwrap();
+        assert_eq!(journal.entries.len(), 1, "a refusal creates no untracked or empty capture");
+        assert_eq!(journal.entries[0].snapshot_id, captured.snapshot_id);
+        assert_eq!(journal.entries[0].setup_id, setup.setup_id);
+        assert_eq!(journal.entries[0].size, Some(6));
+        assert_eq!(journal.entries[0].sha256, Some(Sha256Digest::of(b"first!")));
+        assert_eq!(*probe.asked.lock().unwrap(), vec![staging.clone(), staging.clone()]);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 2);
+        assert_eq!(std::fs::read(fixture.root.join("second.bin")).unwrap(), b"second");
+        // Replacing the preview must not replace capture ownership.
+        fixture.state.attach_setup_preview(
+            setup.setup_id, serde_json::json!({}), fixture.root.clone(), StoredMode::ReadOnly,
+        ).await.unwrap();
+        fixture.state.close().await.unwrap();
+
+        let reopened = hfdrive_state::StateStore::open(hfdrive_state::StatePaths::new(
+            fixture.directory.path().join("state"),
+        )).await.unwrap();
+        let account = reopened.open_account(setup.account_key).await.unwrap();
+        let (scheduler, _) = capture_scheduler(200);
+        assert!(capture_digest_proof(
+            &account, &scheduler, &setup, &fixture.root, &second, &staging, &cancel,
+        ).await.unwrap().is_none(), "durable occupancy blocks a fresh scheduler after restart");
+        // The same bytes also block ordinary sync capture, not only setup.
+        let request = crate::sync::capture::CaptureRequest {
+            connection_id: fixture.connection,
+            source: fixture.root.join("second.bin"),
+            staging_dir: staging.clone(),
+            item_id: ItemId::new(),
+            operation_id: OperationId::new(),
+            snapshot_id: SnapshotId::new(),
+            upload_id: hfdrive_core::ids::UploadId::new(),
+            expected: Some(second.state.clone()),
+            workspace: fixture.workspace,
+        };
+        let failure = crate::sync::capture::capture_local_change(
+            &account, &scheduler, *fixture.workspace.as_uuid(), &request, &cancel,
+        ).await.err().expect("sync admission includes retained setup captures");
+        assert_eq!(failure.error_code(), "reservation_too_large");
+        assert_eq!(SetupCaptures::load(&account).await.unwrap().entries.len(), 1);
+        assert_eq!(std::fs::read(&captured.staged_path).unwrap(), b"first!");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated bytes exceed the entire budget");
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 2);
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_setup_capture_accounts_only_its_owned_bytes_after_restart() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let setup = capture_setup(&fixture).await;
+        let staging = fixture.directory.path().join("setup-staging");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(fixture.root.join("second.bin"), b"second").unwrap();
+        let local = capture_local(&fixture.root, "second.bin");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (scheduler, _) = capture_scheduler(200);
+        let admission = scheduler.staging_admission(
+            crate::scheduler::WorkClass::LocalEdit, *setup.binding.workspace_id.as_uuid(),
+            &staging, 6, crate::sync::capture::retained_staging_bytes(&fixture.account), &cancel,
+        ).await.unwrap();
+        let partial_id = SnapshotId::new();
+        let partial_path = staging.join(format!("{partial_id}.snap"));
+        let missing_id = SnapshotId::new();
+        let mut journal = SetupCaptures {
+            revision: None,
+            entries: vec![
+                SetupCapture {
+                    setup_id: setup.setup_id, snapshot_id: partial_id, relative_path: "partial.bin".to_owned(),
+                    staged_path: partial_path.clone(), size: None, sha256: None,
+                },
+                SetupCapture {
+                    setup_id: setup.setup_id, snapshot_id: missing_id, relative_path: "missing.bin".to_owned(),
+                    staged_path: staging.join(format!("{missing_id}.snap")), size: None, sha256: None,
+                },
+            ],
+        };
+        journal.save(&fixture.account).await.unwrap();
+        std::fs::write(&partial_path, b"retain").unwrap();
+        drop(admission); // Simulates interruption before completion was journaled.
+        fixture.state.close().await.unwrap();
+        let reopened = hfdrive_state::StateStore::open(hfdrive_state::StatePaths::new(
+            fixture.directory.path().join("state"),
+        )).await.unwrap();
+        let account = reopened.open_account(setup.account_key).await.unwrap();
+        assert_eq!(crate::sync::capture::retained_staging_bytes(&account).await.unwrap(), 6);
+        let (scheduler, _) = capture_scheduler(200);
+        assert!(capture_digest_proof(
+            &account, &scheduler, &setup, &fixture.root, &local, &staging, &cancel,
+        ).await.unwrap().is_none());
+        assert_eq!(SetupCaptures::load(&account).await.unwrap().entries.len(), 2);
+        assert_eq!(std::fs::read(&partial_path).unwrap(), b"retain");
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_setup_capture_releases_only_absent_owned_capture() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let setup = capture_setup(&fixture).await;
+        let staging = fixture.directory.path().join("setup-staging");
+        std::fs::create_dir(&staging).unwrap();
+        let unrelated = staging.join("unrelated.snap");
+        std::fs::write(&unrelated, b"do not remove").unwrap();
+        std::fs::write(fixture.root.join("changed.bin"), b"before").unwrap();
+        let local = capture_local(&fixture.root, "changed.bin");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (no_space, probe) = capture_scheduler(105);
+        assert!(capture_digest_proof(
+            &fixture.account, &no_space, &setup, &fixture.root, &local, &staging, &cancel,
+        ).await.unwrap().is_none(), "six new bytes must preserve the 100-byte free-space floor");
+        assert_eq!(*probe.asked.lock().unwrap(), vec![staging.clone()]);
+        assert!(fixture.account.settings(SETUP_CAPTURES_SCOPE.to_owned()).await.unwrap().is_none());
+
+        // Capture fails after its durable intent but before creating a file.
+        std::fs::write(fixture.root.join("changed.bin"), b"changed").unwrap();
+        let (scheduler, _) = capture_scheduler(200);
+        assert!(capture_digest_proof(
+            &fixture.account, &scheduler, &setup, &fixture.root, &local, &staging, &cancel,
+        ).await.unwrap().is_none());
+        assert!(SetupCaptures::load(&fixture.account).await.unwrap().entries.is_empty());
+        assert_eq!(crate::sync::capture::retained_staging_bytes(&fixture.account).await.unwrap(), 0);
+        assert_eq!(scheduler.stats().staging_used_bytes, 0);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"do not remove");
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+        let refreshed = capture_local(&fixture.root, "changed.bin");
+        let captured = capture_digest_proof(
+            &fixture.account, &scheduler, &setup, &fixture.root, &refreshed, &staging, &cancel,
+        ).await.unwrap().expect("failed admission and capture retain no phantom reservation");
+        assert_eq!(captured.size, 7);
+        assert_eq!(std::fs::read(&captured.staged_path).unwrap(), b"changed");
+        fixture.state.close().await.unwrap();
+    }
 
     #[test]
     fn content_adoption_requires_proof() {

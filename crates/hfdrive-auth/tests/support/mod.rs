@@ -69,6 +69,7 @@ pub struct Controls {
     pub orgs: Vec<Value>,
     pub granted_scope: Option<Option<String>>,
     pub token_fail: bool,
+    pub token_error: Option<String>,
     pub id_token_nonce: Option<String>,
     pub id_token_mode: IdTokenMode,
     pub refresh_rotates: bool,
@@ -371,6 +372,8 @@ async fn handle(
                 } else {
                     token_response(&c, &counters, &client_id, &issuer, true).to_string()
                 }
+            } else if let Some(error) = &c.token_error {
+                json!({ "error": error }).to_string()
             } else if c.token_fail {
                 r#"{"error":"invalid_grant"}"#.to_owned()
             } else {
@@ -405,9 +408,13 @@ async fn handle(
         _ => r#"{"error":"not_found"}"#.to_owned(),
     };
 
-    // The /token route returns JSON errors with 200/400 depending on content.
+    // Token endpoint failures preserve the provider's transient/permanent class.
     let status = if response_body.contains("\"error\"") && path == "/token" {
-        "400 Bad Request"
+        if response_body.contains("\"temporarily_unavailable\"") {
+            "503 Service Unavailable"
+        } else {
+            "400 Bad Request"
+        }
     } else {
         "200 OK"
     };

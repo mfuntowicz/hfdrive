@@ -790,10 +790,10 @@ pub struct IntentOutcome {
 }
 
 /// One commit-sized batch of a plan. Batches are contiguous prefixes of
-/// [`ReconcilePlan::remote_ops`], so every batch is sequentially applicable
-/// and batch `k + 1` applies only after batch `k` committed. A partially
-/// published plan is never a completed operation: the provider keeps the
-/// intent open until every batch is committed and every local action applied.
+/// [`ReconcilePlan::remote_ops`]. Every prefix preserves a valid namespace,
+/// including live parents and tombstone ancestry; batch `k + 1` applies only
+/// after batch `k` committed. A partially published plan is never a completed
+/// operation: all batches and local actions must finish.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitBatch {
     pub index: usize,
@@ -1715,11 +1715,17 @@ impl<'s> Builder<'s> {
                 );
                 let place_near = pid;
                 let dir = self.ensure_recovered_dir(ident, place_near, del_ops[0], root)?;
-                self.drafts
+                let survivor = &mut self.drafts
                     .get_mut(&id)
                     .expect("violation item has a draft")
-                    .state
-                    .parent_id = Some(dir);
+                    .state;
+                let survivor_side = side_of(survivor);
+                survivor.parent_id = Some(dir);
+                // The deletion causes this recovery move. Keep the payload's
+                // provenance, but publish the new location under that causal
+                // operation rather than reusing the survivor's old revision.
+                survivor.location_operation = del_ops[0];
+                survivor.item_revision = del_ops[0];
                 if self.recovery_seen.insert(ident.conflict_id) {
                     self.conflicts.push(ConflictBuild {
                         identity: ident,
@@ -1743,9 +1749,8 @@ impl<'s> Builder<'s> {
                     .iter_mut()
                     .find(|c| c.identity.conflict_id == ident.conflict_id)
                 {
-                    let side = side_of(&self.drafts[&id].state);
-                    if !build.sides.iter().any(|s| s.operation_id == side.operation_id) {
-                        build.sides.push(side);
+                    if !build.sides.iter().any(|side| side.operation_id == survivor_side.operation_id) {
+                        build.sides.push(survivor_side);
                         build.sides = sorted_sides(std::mem::take(&mut build.sides));
                     }
                 }
@@ -1771,23 +1776,24 @@ impl<'s> Builder<'s> {
                     .max_by_key(|id| (self.drafts[id].state.location_operation, **id))
                     .expect("cycle has members");
                 let loser_op = self.drafts[&loser].state.location_operation;
-                let dir = self.ensure_recovered_dir(ident, root, loser_op, root)?;
-                self.drafts
+                let recovery_op = self.causal_location_operation(loser, loser_op, &ops)?;
+                let sides = sorted_sides(
+                    members.iter().map(|id| side_of(&self.drafts[id].state)).collect(),
+                );
+                let dir = self.ensure_recovered_dir(ident, root, recovery_op, root)?;
+                let survivor = &mut self.drafts
                     .get_mut(&loser)
                     .expect("cycle member has a draft")
-                    .state
-                    .parent_id = Some(dir);
+                    .state;
+                survivor.parent_id = Some(dir);
+                survivor.location_operation = recovery_op;
+                survivor.item_revision = recovery_op;
                 self.conflicts.push(ConflictBuild {
                     identity: ident,
                     kind: ConflictKind::CycleMove,
                     item_id: loser,
                     ops: sorted_ops(&ops),
-                    sides: sorted_sides(
-                        members
-                            .iter()
-                            .map(|id| side_of(&self.drafts[id].state))
-                            .collect(),
-                    ),
+                    sides,
                     outcome: ConflictOutcome::RecoveredDirectory,
                     preserved_item_id: Some(loser),
                     preserved_version_id: None,
@@ -1950,8 +1956,19 @@ impl<'s> Builder<'s> {
                 }
             }
             let name = chosen.ok_or(ReconcileError::NotConverged)?;
+            let ops = [
+                self.drafts[&winner].state.location_operation,
+                self.drafts[&loser].state.location_operation,
+            ];
+            let location_op = self.causal_location_operation(*loser, ops[1], &ops)?;
+            let sides = sorted_sides(vec![
+                side_of(&self.drafts[&winner].state),
+                side_of(&self.drafts[&loser].state),
+            ]);
             let draft = self.drafts.get_mut(loser).expect("loser has a draft");
             draft.state.name = name;
+            draft.state.location_operation = location_op;
+            draft.state.item_revision = location_op;
             draft.derived = true;
             draft.conflict_id = Some(ident.conflict_id);
             if !self.drafts[&loser].generated {
@@ -1959,14 +1976,8 @@ impl<'s> Builder<'s> {
                     identity: *ident,
                     kind: ConflictKind::NameCollision,
                     item_id: *winner,
-                    ops: sorted_ops(&[
-                        self.drafts[&winner].state.location_operation,
-                        self.drafts[&loser].state.location_operation,
-                    ]),
-                    sides: sorted_sides(vec![
-                        side_of(&self.drafts[&winner].state),
-                        side_of(&self.drafts[&loser].state),
-                    ]),
+                    ops: sorted_ops(&ops),
+                    sides,
                     outcome: ConflictOutcome::KeepBoth,
                     preserved_item_id: Some(*loser),
                     preserved_version_id: self.drafts[&loser].state.content_version_id,
@@ -2151,152 +2162,101 @@ impl<'s> Builder<'s> {
         })
     }
 
-    /// Deterministic mutation order: tombstones first (deepest first), then
-    /// upserts in a sequentially applicable order that frees name slots and
-    /// creates parents before children.
+    /// Deterministic mutation order with a valid namespace after every op.
+    /// Prefer deepest deletions, but first relocate surviving children, make
+    /// missing parents available, and free occupied names. Commit bounds may
+    /// therefore split this order anywhere without exposing an invalid tree.
     fn order_ops(&mut self) -> Result<Vec<ItemId>, ReconcileError> {
         if self.mode == ReconcileMode::ReadOnly {
             return Ok(Vec::new());
         }
-        let mut needs: Vec<ItemId> = Vec::new();
-        for (id, d) in &self.drafts {
-            let required = match self.remote.get(*id) {
-                None => true,
-                Some(r) => !d.state.meaningful_equal(r),
-            };
-            if required {
-                needs.push(*id);
-            }
-        }
-        let mut tombstones: Vec<ItemId> = Vec::new();
-        let mut upserts: Vec<ItemId> = Vec::new();
-        for id in needs {
-            if self.drafts[&id].state.deleted {
-                tombstones.push(id);
-            } else {
-                upserts.push(id);
-            }
-        }
-        tombstones.sort_by_key(|id| (std::cmp::Reverse(self.namespace_depth(*id)), *id));
-        upserts.sort_by_key(|id| (self.namespace_depth(*id), *id));
-
-        let mut order: Vec<ItemId> = tombstones.clone();
-        let mut placed: BTreeSet<ItemId> = tombstones.iter().copied().collect();
-        let upsert_set: BTreeSet<ItemId> = upserts.iter().copied().collect();
-
-        // Name-slot occupancy as ops apply, starting from committed remote
-        // live names.
-        let mut occ: BTreeMap<(Option<ItemId>, Vec<u8>), ItemId> = BTreeMap::new();
-        for state in self.remote.iter() {
-            if state.deleted || state.parent_id.is_none() {
-                continue;
-            }
-            occ.insert(
-                (state.parent_id, names::collision_key(&state.name)),
-                state.item_id,
-            );
-        }
-        for id in &tombstones {
-            if let Some(r) = self.remote.get(*id) {
-                if !r.deleted {
-                    occ.remove(&(r.parent_id, names::collision_key(&r.name)));
+        for _restart in 0..8 {
+            let mut tombstones: Vec<ItemId> = Vec::new();
+            let mut upserts: Vec<ItemId> = Vec::new();
+            for (id, draft) in &self.drafts {
+                if self.remote.get(*id).is_some_and(|old| draft.state.meaningful_equal(old)) {
+                    continue;
+                }
+                if draft.state.deleted {
+                    tombstones.push(*id);
+                } else {
+                    upserts.push(*id);
                 }
             }
-        }
-
-        for _restart in 0..8 {
-            let result = self.schedule_upserts(
-                &upserts,
-                &upsert_set,
-                &mut placed,
-                &mut occ,
-                &mut order,
-            );
-            match result {
-                Ok(()) => return Ok(order),
-                Err(demote) => {
-                    // A transient name swap that cannot be ordered: demote
-                    // one participant to its deterministic conflict name and
-                    // retry. Unreachable for legal single-device renames; kept
-                    // as a safety net so emission is always sequentially
-                    // applicable.
-                    self.apply_transient_demotion(demote)?;
-                    let mut fresh = Vec::new();
-                    for (id, d) in &self.drafts {
-                        let required = match self.remote.get(*id) {
-                            None => true,
-                            Some(r) => !d.state.meaningful_equal(r),
-                        };
-                        if required {
-                            fresh.push(*id);
-                        }
+            tombstones.sort_by_key(|id| (std::cmp::Reverse(self.namespace_depth(*id)), *id));
+            upserts.sort_by_key(|id| (self.namespace_depth(*id), *id));
+            tombstones.extend(upserts);
+            let needs: BTreeSet<ItemId> = tombstones.iter().copied().collect();
+            let mut order = Vec::with_capacity(needs.len());
+            let mut placed = BTreeSet::new();
+            let mut in_progress = BTreeSet::new();
+            let mut occ = BTreeMap::new();
+            let mut children: BTreeMap<ItemId, BTreeSet<ItemId>> = BTreeMap::new();
+            for state in self.remote.iter().filter(|state| !state.deleted) {
+                if let Some(parent) = state.parent_id {
+                    occ.insert(
+                        (state.parent_id, names::collision_key(&state.name)),
+                        state.item_id,
+                    );
+                    children.entry(parent).or_default().insert(state.item_id);
+                }
+            }
+            let mut demote = None;
+            for id in tombstones {
+                match place_one(
+                    self,
+                    id,
+                    &needs,
+                    &mut placed,
+                    &mut occ,
+                    &mut children,
+                    &mut order,
+                    &mut in_progress,
+                ) {
+                    Ok(()) => {}
+                    Err(Some(item)) => {
+                        demote = Some(item);
+                        break;
                     }
-                    let mut new_tombstones: Vec<ItemId> = Vec::new();
-                    let mut new_upserts: Vec<ItemId> = Vec::new();
-                    for id in fresh {
-                        if self.drafts[&id].state.deleted {
-                            new_tombstones.push(id);
-                        } else {
-                            new_upserts.push(id);
-                        }
-                    }
-                    new_tombstones
-                        .sort_by_key(|id| (std::cmp::Reverse(self.namespace_depth(*id)), *id));
-                    new_upserts.sort_by_key(|id| (self.namespace_depth(*id), *id));
-                    order = new_tombstones.clone();
-                    placed = new_tombstones.iter().copied().collect();
-                    upserts = new_upserts.clone();
-                    occ.clear();
-                    for state in self.remote.iter() {
-                        if state.deleted || state.parent_id.is_none() {
-                            continue;
-                        }
-                        occ.insert(
-                            (state.parent_id, names::collision_key(&state.name)),
-                            state.item_id,
-                        );
-                    }
-                    for id in &new_tombstones {
-                        if let Some(r) = self.remote.get(*id) {
-                            if !r.deleted {
-                                occ.remove(&(r.parent_id, names::collision_key(&r.name)));
-                            }
-                        }
-                    }
+                    Err(None) => return Err(ReconcileError::NotConverged),
+                }
+            }
+            match demote {
+                None => return Ok(order),
+                Some(item) => {
+                    // A cyclic name dependency needs the same deterministic
+                    // conflict-name policy as a transient rename swap. Retry
+                    // from the committed namespace, not the partial order.
+                    self.apply_transient_demotion(item)?;
                 }
             }
         }
         Err(ReconcileError::NotConverged)
     }
 
-    fn schedule_upserts(
+    /// A derived relocation is caused by the competing operations, not by a
+    /// fresh random edit. Prefer its own uncommitted location operation;
+    /// otherwise use the lowest new cause rather than reusing either the
+    /// committed location provenance or the current item revision.
+    fn causal_location_operation(
         &self,
-        upserts: &[ItemId],
-        upsert_set: &BTreeSet<ItemId>,
-        placed: &mut BTreeSet<ItemId>,
-        occ: &mut BTreeMap<(Option<ItemId>, Vec<u8>), ItemId>,
-        order: &mut Vec<ItemId>,
-    ) -> Result<(), ItemId> {
-        let mut in_progress: BTreeSet<ItemId> = BTreeSet::new();
-        for id in upserts {
-            if placed.contains(id) {
-                continue;
-            }
-            if place_one(
-                self,
-                *id,
-                upsert_set,
-                placed,
-                occ,
-                order,
-                &mut in_progress,
-            )
-            .is_err()
-            {
-                return Err(*id);
-            }
+        item: ItemId,
+        preferred: OperationId,
+        causes: &[OperationId],
+    ) -> Result<OperationId, ReconcileError> {
+        let previous = self.remote.get(item);
+        let is_new_cause = |operation: OperationId| {
+            previous.is_none_or(|state| {
+                operation != state.item_revision && operation != state.location_operation
+            })
+        };
+        if is_new_cause(preferred) {
+            return Ok(preferred);
         }
-        Ok(())
+        causes.iter().copied()
+            .filter(|operation| is_new_cause(*operation))
+            .min()
+            .ok_or(ReconcileError::NotConverged)
     }
 
     fn apply_transient_demotion(&mut self, demote: ItemId) -> Result<(), ReconcileError> {
@@ -2304,6 +2264,10 @@ impl<'s> Builder<'s> {
         let base_name = state.name.clone();
         let parent = state.parent_id;
         let op = state.location_operation;
+        let location_op = self.causal_location_operation(
+            demote, op, &[op, state.item_revision, state.content_operation],
+        )?;
+        let side = side_of(state);
         let ident = conflict_identity(
             self.workspace_id,
             ConflictKind::NameCollision,
@@ -2331,6 +2295,8 @@ impl<'s> Builder<'s> {
         let name = chosen.ok_or(ReconcileError::NotConverged)?;
         let draft = self.drafts.get_mut(&demote).expect("demote has a draft");
         draft.state.name = name;
+        draft.state.location_operation = location_op;
+        draft.state.item_revision = location_op;
         draft.derived = true;
         draft.conflict_id = Some(ident.conflict_id);
         self.conflicts.push(ConflictBuild {
@@ -2338,7 +2304,7 @@ impl<'s> Builder<'s> {
             kind: ConflictKind::NameCollision,
             item_id: demote,
             ops: sorted_ops(&[op]),
-            sides: sorted_sides(vec![side_of(&self.drafts[&demote].state)]),
+            sides: vec![side],
             outcome: ConflictOutcome::KeepBoth,
             preserved_item_id: Some(demote),
             preserved_version_id: self.drafts[&demote].state.content_version_id,
@@ -2679,48 +2645,127 @@ fn detect_cycles(
     }
 }
 
+fn placed_state<'a>(
+    builder: &'a Builder<'_>,
+    placed: &BTreeSet<ItemId>,
+    id: ItemId,
+) -> Option<&'a ItemState> {
+    if placed.contains(&id) {
+        builder.drafts.get(&id).map(|draft| &draft.state)
+    } else {
+        builder.remote.get(id)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_one(
     builder: &Builder<'_>,
     id: ItemId,
-    upsert_set: &BTreeSet<ItemId>,
+    needs: &BTreeSet<ItemId>,
     placed: &mut BTreeSet<ItemId>,
     occ: &mut BTreeMap<(Option<ItemId>, Vec<u8>), ItemId>,
+    children: &mut BTreeMap<ItemId, BTreeSet<ItemId>>,
     order: &mut Vec<ItemId>,
     in_progress: &mut BTreeSet<ItemId>,
-) -> Result<(), ()> {
+) -> Result<(), Option<ItemId>> {
     if placed.contains(&id) {
         return Ok(());
     }
-    if in_progress.contains(&id) {
-        return Err(());
+    if !needs.contains(&id) || !in_progress.insert(id) {
+        return Err(None);
     }
-    in_progress.insert(id);
     let state = &builder.drafts[&id].state;
-    // Parents that are themselves being upserted must be placed first.
+    // Tombstones still require parent closure. A newly created-and-deleted
+    // subtree must emit its absent parents before its children, unlike the
+    // leaf-first deletion of an existing live subtree.
     if let Some(parent) = state.parent_id {
-        if upsert_set.contains(&parent) && !placed.contains(&parent) {
-            place_one(builder, parent, upsert_set, placed, occ, order, in_progress)?;
-        }
-    }
-    let target = (state.parent_id, names::collision_key(&state.name));
-    if let Some(&other) = occ.get(&target) {
-        if other != id {
-            if upsert_set.contains(&other) && !placed.contains(&other) {
-                place_one(builder, other, upsert_set, placed, occ, order, in_progress)?;
-            } else {
-                in_progress.remove(&id);
-                return Err(());
+        let available = |placed: &BTreeSet<ItemId>| {
+            placed_state(builder, placed, parent).is_some_and(|parent| {
+                state.deleted || (!parent.deleted && parent.kind == ItemKind::Directory)
+            })
+        };
+        if !available(placed) {
+            place_one(builder, parent, needs, placed, occ, children, order, in_progress)?;
+            if !available(placed) {
+                return Err(None);
             }
         }
     }
-    if let Some(old) = builder.remote.get(id) {
+    if state.deleted {
+        // The index describes the namespace at this exact prefix, not the
+        // final draft: late remote children must move out before deletion.
+        while let Some(child) = children.get(&id).and_then(|items| items.first()).copied() {
+            if placed.contains(&child) {
+                return Err(None);
+            }
+            place_one(builder, child, needs, placed, occ, children, order, in_progress)?;
+        }
+    }
+    let target = (!state.deleted).then(|| (state.parent_id, names::collision_key(&state.name)));
+    if let Some(target) = &target {
+        if let Some(&other) = occ.get(target) {
+            if other != id {
+                if place_one(builder, other, needs, placed, occ, children, order, in_progress).is_err()
+                    || occ.get(target).is_some_and(|occupant| *occupant != id)
+                {
+                    // Propagate the outer name claimant, preserving the
+                    // deterministic transient-swap demotion policy.
+                    return Err(Some(id));
+                }
+            }
+        }
+    }
+    // A destination can exist while its current ancestor is still the item
+    // being moved. Finalize the ancestor relocation that breaks that cycle
+    // before attaching this record, including coalesced move-and-delete ops.
+    loop {
+        let mut ancestor = state.parent_id;
+        let mut relocate = None;
+        while let Some(parent) = ancestor {
+            if parent == id {
+                break;
+            }
+            let current = placed_state(builder, placed, parent).ok_or(None)?;
+            if relocate.is_none()
+                && !placed.contains(&parent)
+                && needs.contains(&parent)
+                && current.parent_id != builder.drafts[&parent].state.parent_id
+            {
+                relocate = Some(parent);
+            }
+            ancestor = current.parent_id;
+        }
+        if ancestor.is_none() {
+            break;
+        }
+        place_one(
+            builder,
+            relocate.ok_or(None)?,
+            needs,
+            placed,
+            occ,
+            children,
+            order,
+            in_progress,
+        )?;
+    }
+    if let Some(old) = builder.remote.get(id).filter(|old| !old.deleted) {
         let old_key = (old.parent_id, names::collision_key(&old.name));
         if occ.get(&old_key) == Some(&id) {
             occ.remove(&old_key);
         }
+        if let Some(parent) = old.parent_id {
+            if let Some(siblings) = children.get_mut(&parent) {
+                siblings.remove(&id);
+            }
+        }
     }
-    occ.insert(target, id);
+    if let Some(target) = target {
+        occ.insert(target, id);
+        if let Some(parent) = state.parent_id {
+            children.entry(parent).or_default().insert(id);
+        }
+    }
     in_progress.remove(&id);
     placed.insert(id);
     order.push(id);

@@ -182,6 +182,76 @@ fn batch_ids(batch: &CommitBatch) -> Vec<OperationId> {
     ids.into_iter().collect()
 }
 
+fn assert_batch_commits(batches: &[CommitBatch]) {
+    let mut parent_commit_id = hfdrive_core::ids::CommitId::from_uuid(Uuid::from_u128(0xc000)).unwrap();
+    for batch in batches {
+        let commit = hfdrive_core::format::CommitV1 {
+            format: hfdrive_core::format::FORMAT_NAME.to_owned(),
+            schema_version: hfdrive_core::format::SCHEMA_VERSION,
+            workspace_id: ws(),
+            commit_id: hfdrive_core::ids::CommitId::from_uuid(
+                Uuid::from_u128(0xc001 + batch.index as u128),
+            ).unwrap(),
+            parent_commit_id: Some(parent_commit_id),
+            catalog_root: digest(0),
+            operation_ids: batch.operation_ids.clone(),
+            changes: batch.changes.clone(),
+            device_id: hfdrive_core::ids::DeviceId::from_uuid(NS).unwrap(),
+            created_at: "2026-11-17T00:00:00Z".to_owned(),
+        };
+        // Exercise the publication codec, including non-no-op revisions and
+        // both the record-count and encoded-byte bounds.
+        let bytes = hfdrive_core::format::to_commit_bytes(&commit)
+            .unwrap_or_else(|error| panic!("invalid batch {} commit: {error}", batch.index));
+        assert_eq!(hfdrive_core::format::from_commit_bytes(&bytes).unwrap(), commit);
+        assert_eq!(commit.operation_ids, batch_ids(batch));
+        parent_commit_id = commit.commit_id;
+    }
+}
+
+/// Apply only complete commits and validate each independently visible prefix.
+fn assert_batch_namespaces(
+    remote: &CatalogView,
+    plan: &ReconcilePlan,
+    max_changes: usize,
+    max_operations: usize,
+) -> CatalogView {
+    let mut items: std::collections::BTreeMap<_, _> =
+        remote.iter().map(|state| (state.item_id, state.clone())).collect();
+    let mut versions: std::collections::BTreeMap<_, _> = remote
+        .iter()
+        .filter_map(|state| {
+            state.content_version_id.map(|version| {
+                (version, (state.content_sha256.unwrap(), state.content_size.unwrap()))
+            })
+        })
+        .collect();
+    for version in &plan.versions {
+        versions.insert(version.version_id, (version.object.sha256, version.object.size));
+    }
+    let batches = plan.commit_batches(max_changes, max_operations).expect("bounded batches");
+    assert_batch_commits(&batches);
+    let mut committed = remote.clone();
+    for batch in &batches {
+        assert!(batch.remote_ops.len() <= max_changes);
+        assert!(batch.operation_ids.len() <= max_operations);
+        assert_eq!(batch.operation_ids, batch_ids(batch), "batch-local provenance only");
+        for operation in &batch.remote_ops {
+            let content = operation.record.content_version_id.map(|version| versions[&version]);
+            let state = ItemState::from_record(
+                &operation.record,
+                content.map(|(digest, _)| digest),
+                content.map(|(_, size)| size),
+            )
+            .expect("complete content binding");
+            items.insert(state.item_id, state);
+        }
+        committed = CatalogView::new(items.values().cloned().collect())
+            .unwrap_or_else(|error| panic!("invalid committed prefix {}: {error}", batch.index));
+    }
+    committed
+}
+
 // ---------------------------------------------------------------------------
 // Race families
 // ---------------------------------------------------------------------------
@@ -443,6 +513,7 @@ fn directory_delete_tombstones_unchanged_descendants() {
     assert_eq!(plan.remote_ops[0].item_id(), uid(ITEM_A));
     assert_eq!(plan.remote_ops[1].item_id(), uid(ITEM_B));
     assert_eq!(plan.remote_ops[0].record.deletion_operation, Some(op(0x0001)));
+    assert_batch_namespaces(&remote, &plan, 1, 2);
 }
 
 #[test]
@@ -485,6 +556,7 @@ fn directory_delete_preserves_new_descendants_under_recovered_directory() {
     assert!(!survivor.record.deleted);
     assert_eq!(survivor.change, hfdrive_core::format::ChangeKind::Location);
     assert_eq!(outcome_of(&plan, op(0x0001)), IntentOutcomeKind::Published);
+    assert_batch_namespaces(&remote, &plan, 1, 2);
 }
 
 #[test]
@@ -535,6 +607,7 @@ fn ancestor_move_cycle_is_redirected_to_root_recovered_directory() {
         .find(|o| o.item_id() == uid(ITEM_A))
         .expect("a upsert");
     assert_eq!(a_op.record.parent_id, Some(uid(ITEM_B)));
+    assert_batch_namespaces(&remote, &plan, 1, 2);
 }
 
 #[test]
@@ -562,6 +635,7 @@ fn directory_recreation_after_delete_takes_the_freed_name() {
     assert!(plan.remote_ops[0].is_tombstone(), "the tombstone frees the name first");
     assert_eq!(plan.remote_ops[1].item_id(), uid(ITEM_A));
     assert_eq!(plan.remote_ops[1].record.name, "docs");
+    assert_batch_namespaces(&remote, &plan, 1, 2);
 }
 
 #[test]
@@ -629,12 +703,50 @@ fn portable_name_collision_renames_the_higher_operation_loser() {
         .find(|o| o.item_id() == uid(ITEM_A))
         .expect("loser upsert");
     assert!(loser.record.name.starts_with("straße (conflict "), "{}", loser.record.name);
+    assert_eq!(loser.record.location_operation, op(0x0001));
+    assert_eq!(loser.record.item_revision, op(0x0001));
+    assert_eq!(loser.old_revision, Some(op(0x0002)));
+    assert_eq!(collision.competing_operations, vec![op(0x0001), op(0x0002)]);
     let winner = plan
         .remote_ops
         .iter()
         .find(|o| o.item_id() == uid(ITEM_B))
         .expect("winner upsert");
     assert_eq!(winner.record.name, "strasse");
+    let committed = assert_batch_namespaces(&remote, &plan, 1, 2);
+    let replay = run(ReconcileMode::Writable, &base, &local, &committed);
+    assert!(replay.remote_ops.is_empty());
+}
+
+#[test]
+fn generated_name_relocation_keeps_remote_content_and_uses_the_competing_cause() {
+    let original = file_state(
+        uid(ITEM_A), uid(ROOT), "straße", ver("before-content-edit"), digest(0), 10, op(2),
+    );
+    let base = view(vec![root_state(), original.clone()]);
+    let mut changed = original;
+    changed.content_version_id = Some(ver("remote-content-edit"));
+    changed.content_sha256 = Some(digest(3));
+    changed.content_size = Some(30);
+    changed.content_operation = op(0x3000);
+    changed.item_revision = op(0x3000);
+    let remote = view(vec![root_state(), changed]);
+    let local = vec![edit(op(1), uid(ITEM_B), LocalChange::Create {
+        parent_id: uid(ROOT),
+        name: "strasse".to_owned(),
+        kind: ItemKind::File,
+        content: Some(new_content("new-colliding-file", 1, 11)),
+    })];
+    let plan = run(ReconcileMode::Writable, &base, &local, &remote);
+    let relocated = plan.remote_ops.iter().find(|operation| operation.item_id() == uid(ITEM_A)).unwrap();
+    assert_eq!(relocated.old_revision, Some(op(0x3000)));
+    assert_eq!(relocated.record.content_operation, op(0x3000));
+    assert_eq!(relocated.record.location_operation, op(1));
+    assert_eq!(relocated.record.item_revision, op(1));
+    let committed = assert_batch_namespaces(&remote, &plan, 1, 2);
+    assert_eq!(committed.get(uid(ITEM_A)).unwrap().content_sha256, Some(digest(3)));
+    let replay = run(ReconcileMode::Writable, &base, &local, &committed);
+    assert!(replay.remote_ops.is_empty());
 }
 
 #[test]
@@ -1147,6 +1259,179 @@ fn commit_batches_split_exactly_at_the_1001_operation_boundary() {
     for (a, b) in flat.into_iter().zip(over.remote_ops.iter()) {
         assert_eq!(a, b, "batch concatenation reproduces the plan order");
     }
+}
+
+#[test]
+fn commit_batches_relocate_new_children_before_the_999th_tombstone() {
+    let directory = dir_state(uid(ITEM_B), uid(ROOT), "docs", op(0x2001));
+    let mut base_items = vec![root_state(), directory];
+    for n in 0..998u128 {
+        base_items.push(file_state(
+            uid(0x1000_0000_0000_4000_8000_0000_0000_0000 + n),
+            uid(ITEM_B),
+            &format!("old-{n}.txt"),
+            ver("unchanged"),
+            digest(0),
+            10,
+            op(0x2001),
+        ));
+    }
+    let mut remote_items = base_items.clone();
+    remote_items.push(file_state(
+        uid(ITEM_A), uid(ITEM_B), "new.txt", ver("new-child"), digest(9), 9, op(0x0002),
+    ));
+    let base = view(base_items);
+    let remote = view(remote_items);
+    let local = vec![edit(op(0x0001), uid(ITEM_B), LocalChange::Delete)];
+    let plan = run(ReconcileMode::Writable, &base, &local, &remote);
+    assert_eq!(plan.remote_ops.len(), 1001);
+    let batches = plan.commit_batches(MAX_COMMIT_OPERATIONS, MAX_COMMIT_OPERATIONS).unwrap();
+    assert_eq!(batches.iter().map(|batch| batch.remote_ops.len()).collect::<Vec<_>>(), vec![1000, 1]);
+    assert_eq!(plan.remote_ops.last().unwrap().item_id(), uid(ITEM_B));
+    assert!(plan.remote_ops.last().unwrap().is_tombstone());
+
+    // Formerly the first commit deleted all 999 old items, created recovery,
+    // and left new.txt live beneath the tombstoned docs until the next commit.
+    let committed = assert_batch_namespaces(
+        &remote, &plan, MAX_COMMIT_OPERATIONS, MAX_COMMIT_OPERATIONS,
+    );
+    // The operation-id limit can split before the survivor even when the
+    // change limit has space. It must expose a valid namespace as well.
+    assert_batch_namespaces(&remote, &plan, MAX_COMMIT_OPERATIONS, 2);
+    let recovery = plan.conflicts.iter()
+        .find(|conflict| conflict.kind == ConflictKind::DirectoryDeleteRecovery)
+        .unwrap();
+    let child = committed.get(uid(ITEM_A)).unwrap();
+    assert_eq!(child.parent_id, recovery.preserved_item_id);
+    assert_eq!(child.content_sha256, Some(digest(9)));
+    assert_eq!(child.content_operation, op(0x0002));
+    assert_eq!(child.location_operation, op(0x0001));
+    assert_eq!(child.item_revision, op(0x0001));
+    assert!(!child.deleted);
+    let replay = run(ReconcileMode::Writable, &base, &local, &remote);
+    assert_eq!(plan.remote_ops, replay.remote_ops);
+    assert_eq!(plan.conflicts, replay.conflicts);
+    let settled = run(ReconcileMode::Writable, &base, &local, &committed);
+    assert!(settled.remote_ops.is_empty(), "replay does not relocate the recovered child again");
+}
+
+#[test]
+fn commit_batches_create_tombstone_ancestors_before_unpublished_descendants() {
+    let parent = uid(ITEM_B);
+    let nested = uid(0xcccc);
+    let created = uid(0xdddd);
+    let base = view(vec![
+        root_state(),
+        file_state(uid(ITEM_A), uid(ROOT), "existing.txt", ver("existing"), digest(1), 1, op(0x2000)),
+    ]);
+    let local = vec![
+        edit(op(1), parent, LocalChange::Create {
+            parent_id: uid(ROOT), name: "temporary".to_owned(), kind: ItemKind::Directory, content: None,
+        }),
+        edit(op(2), nested, LocalChange::Create {
+            parent_id: parent, name: "nested".to_owned(), kind: ItemKind::Directory, content: None,
+        }),
+        edit(op(3), created, LocalChange::Create {
+            parent_id: nested, name: "created.txt".to_owned(), kind: ItemKind::File,
+            content: Some(new_content("ephemeral", 2, 2)),
+        }),
+        edit(op(4), uid(ITEM_A), LocalChange::Move {
+            parent_id: nested, name: "existing.txt".to_owned(),
+        }),
+        edit(op(5), parent, LocalChange::Delete),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &base);
+    assert_eq!(plan.remote_ops.len(), 4);
+    assert!(plan.remote_ops.iter().all(|operation| operation.is_tombstone()));
+    assert_eq!(plan.remote_ops[0].item_id(), parent);
+    assert_eq!(plan.remote_ops[1].item_id(), nested);
+    let committed = assert_batch_namespaces(&base, &plan, 1, 3);
+    assert!(committed.iter().filter(|state| state.item_id != uid(ROOT)).all(|state| state.deleted));
+}
+
+#[test]
+fn commit_batches_detach_ancestors_before_a_coalesced_move_and_delete() {
+    let middle = uid(ITEM_B);
+    let destination = uid(0xcccc);
+    let base = view(vec![
+        root_state(),
+        dir_state(uid(ITEM_A), uid(ROOT), "outer", op(0x2000)),
+        dir_state(middle, uid(ITEM_A), "middle", op(0x2001)),
+        dir_state(destination, middle, "destination", op(0x2002)),
+    ]);
+    let local = vec![
+        edit(op(1), middle, LocalChange::Move {
+            parent_id: uid(ROOT), name: "middle".to_owned(),
+        }),
+        edit(op(2), uid(ITEM_A), LocalChange::Move {
+            parent_id: destination, name: "outer".to_owned(),
+        }),
+        edit(op(3), uid(ITEM_A), LocalChange::Delete),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &base);
+    assert!(plan.conflicts.is_empty());
+    assert_eq!(plan.remote_ops.len(), 2);
+    assert_eq!(plan.remote_ops[0].item_id(), middle);
+    assert_eq!(plan.remote_ops[1].item_id(), uid(ITEM_A));
+    assert!(plan.remote_ops[1].is_tombstone());
+    assert_batch_namespaces(&base, &plan, 1, 3);
+}
+
+#[test]
+fn commit_batches_recover_nested_survivors_before_reusing_a_deleted_name() {
+    let survivor = uid(ITEM_A);
+    let survivor_file = uid(0xcccc);
+    let replacement = uid(0xdddd);
+    let local_file = uid(0xeeee);
+    let directory = dir_state(uid(ITEM_B), uid(ROOT), "docs", op(0x2001));
+    let base = view(vec![root_state(), directory.clone()]);
+    let remote = view(vec![
+        root_state(), directory,
+        dir_state(survivor, uid(ITEM_B), "new-folder", op(0x2002)),
+        file_state(survivor_file, survivor, "keep.txt", ver("keep"), digest(4), 4, op(0x2003)),
+    ]);
+    let local = vec![
+        edit(op(1), uid(ITEM_B), LocalChange::Delete),
+        edit(op(2), replacement, LocalChange::Create {
+            parent_id: uid(ROOT), name: "docs".to_owned(), kind: ItemKind::Directory, content: None,
+        }),
+        edit(op(3), local_file, LocalChange::Create {
+            parent_id: replacement, name: "local.txt".to_owned(), kind: ItemKind::File,
+            content: Some(new_content("replacement-child", 5, 5)),
+        }),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &remote);
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(plan.conflicts[0].kind, ConflictKind::DirectoryDeleteRecovery);
+    assert_eq!(op_count(&plan, survivor_file), 0, "moving a directory preserves its unchanged subtree");
+    let committed = assert_batch_namespaces(&remote, &plan, 1, 2);
+    assert_eq!(committed.get(replacement).unwrap().name, "docs");
+    assert_eq!(committed.get(local_file).unwrap().parent_id, Some(replacement));
+    assert_eq!(committed.get(survivor_file), remote.get(survivor_file));
+}
+
+#[test]
+fn commit_batches_keep_transient_name_swap_demotion_deterministic() {
+    let base = view(vec![
+        root_state(),
+        dir_state(uid(ITEM_A), uid(ROOT), "a", op(0x2000)),
+        dir_state(uid(ITEM_B), uid(ROOT), "b", op(0x2001)),
+    ]);
+    let local = vec![
+        edit(op(1), uid(ITEM_A), LocalChange::Move { parent_id: uid(ROOT), name: "temporary".to_owned() }),
+        edit(op(2), uid(ITEM_B), LocalChange::Move { parent_id: uid(ROOT), name: "a".to_owned() }),
+        edit(op(3), uid(ITEM_A), LocalChange::Move { parent_id: uid(ROOT), name: "b".to_owned() }),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &base);
+    let identity = conflict_identity(ws(), ConflictKind::NameCollision, &[uid(ITEM_A)], &[op(3)]);
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(plan.conflicts[0].conflict_id, identity.conflict_id);
+    let committed = assert_batch_namespaces(&base, &plan, 1, 2);
+    assert_eq!(committed.get(uid(ITEM_A)).unwrap().name, conflict_name("b", identity.conflict_id));
+    assert_eq!(committed.get(uid(ITEM_B)).unwrap().name, "a");
+    let replay = run(ReconcileMode::Writable, &base, &local, &base);
+    assert_eq!(plan.remote_ops, replay.remote_ops);
+    assert_eq!(plan.conflicts, replay.conflicts);
 }
 
 #[test]

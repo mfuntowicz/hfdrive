@@ -587,6 +587,21 @@ impl<R: RemoteOps> SyncEngine<R> {
         }
     }
 
+    /// Installs a paused runtime for dispatch regressions without registering a
+    /// Windows sync root or starting any remote work.
+    #[cfg(test)]
+    pub(crate) async fn insert_runtime_for_test(
+        &self,
+        runtime: Arc<ConnectionRuntime<R>>,
+        cancel: CancellationToken,
+    ) {
+        let previous = self.running.lock().await.insert(
+            runtime.connection_id(),
+            Registered { runtime, cancel, watch_task: None },
+        );
+        assert!(previous.is_none(), "test runtime must have a unique connection");
+    }
+
     /// The shared scheduler (provider-wide, never per connection).
     pub fn scheduler(&self) -> &Arc<Scheduler> {
         &self.scheduler

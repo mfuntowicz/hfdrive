@@ -1960,10 +1960,34 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         loop {
             // Fill the bounded window while unpaused: the check is what makes
             // a pause land between two dispatches and stop the next upload.
-            while in_flight.len() < 2 && !*self.paused.borrow() {
+            while in_flight.len() < 2 && !*self.paused.borrow() && !ctx.cancel.is_cancelled() {
                 let Some(entry) = pending.next() else { break };
-                // The upload owns its entry row for the whole flight.
-                in_flight.push(async move { upload_entry(ctx, &entry).await });
+                // The window overlaps work; the provider-wide permit is the
+                // actual upload bound shared with other drives and imports.
+                in_flight.push(async move {
+                    let _upload = match ctx.scheduler.acquire_upload(
+                        crate::scheduler::WorkClass::LocalEdit,
+                        *ctx.connection.as_uuid(),
+                        ctx.cancel,
+                    ).await {
+                        Ok(permit) => permit,
+                        Err(crate::scheduler::ScheduleError::Cancelled) => return,
+                        Err(error) => {
+                            ctx.record_outbox_error(
+                                entry.operation_id,
+                                crate::sync::work_errors::schedule_code(&error),
+                                "upload admission refused; durable work remains queued",
+                            ).await;
+                            return;
+                        }
+                    };
+                    // Pause/cancellation may have landed while this drive
+                    // waited for another drive's upload to release its slot.
+                    if *self.paused.borrow() || ctx.cancel.is_cancelled() {
+                        return;
+                    }
+                    let _ = upload_entry(ctx, &entry).await;
+                });
             }
             if in_flight.is_empty() {
                 return;
@@ -1977,28 +2001,37 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
     /// Executes pending journaled local actions and closes finished entries
     /// with their generation guard.
     ///
-    /// The blocking-action query runs **once per pass**, before the loop, and
-    /// its result is reused for every entry: an entry whose item still has a
-    /// pending/in-progress journaled action is skipped. A query failure fails
-    /// closed — the pass closes nothing rather than assuming an empty action
-    /// set, which would let a completion race an unfinished local apply.
+    /// Read action blockers once per pass. Pending/in-progress actions block
+    /// their item; a requeued action blocks other operations only while its
+    /// replacement is unfinished. The replacement never blocks itself, and
+    /// its completed journal row cannot remain a stale item-level blocker.
+    /// Any query failure fails closed.
     async fn apply_pass(&self, ctx: &RoundContext<'_, R>) {
         let _ = crate::sync::publish::execute_pending_actions(ctx).await;
-        let blocking_items = match self
-            .state
-            .list_local_actions(self.config.connection_id, None)
-            .await
-        {
-            Ok(actions) => actions
-                .iter()
-                .filter(|action| matches!(
-                    action.state,
-                    LocalActionState::Pending | LocalActionState::InProgress | LocalActionState::Requeued
-                ))
-                .filter_map(|action| action.item_id)
-                .collect::<std::collections::BTreeSet<_>>(),
-            Err(_) => return,
+        let Ok(actions) = self.state.list_local_actions(self.config.connection_id, None).await else {
+            return;
         };
+        let mut blocking_items = std::collections::BTreeSet::new();
+        let mut replacements = std::collections::BTreeMap::new();
+        for action in actions {
+            let Some(item) = action.item_id else { continue };
+            match action.state {
+                LocalActionState::Pending | LocalActionState::InProgress => {
+                    blocking_items.insert(item);
+                }
+                LocalActionState::Requeued => {
+                    let Ok(operation) = OperationId::from_uuid(*action.action_id.as_uuid()) else {
+                        return;
+                    };
+                    match self.state.outbox_entry(self.config.connection_id, operation).await {
+                        Ok(Some(entry)) if entry.item_id == Some(item) && entry.state == OutboxState::Complete => {}
+                        Ok(_) => { replacements.insert(operation, item); }
+                        Err(_) => return,
+                    }
+                }
+                _ => {}
+            }
+        }
         let Ok(entries) = self
             .state
             .list_outbox(self.config.connection_id, Some(OutboxState::LocalApplyPending), 256)
@@ -2008,7 +2041,10 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         };
         for entry in entries {
             let blocking = match entry.item_id {
-                Some(item_id) => blocking_items.contains(&item_id),
+                Some(item_id) => blocking_items.contains(&item_id)
+                    || replacements.iter().any(|(operation, item)| {
+                        *item == item_id && *operation != entry.operation_id
+                    }),
                 None => false,
             };
             if blocking {
@@ -2022,11 +2058,12 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             .await
             {
                 Ok(hfdrive_state::CompletionOutcome::CompletedWithNewerGeneration { .. }) => {
+                    replacements.remove(&entry.operation_id);
                     // The newer generation keeps dirty and gets its own
                     // intent; superseded uploads never clear it.
                     self.schedule_followup(&entry).await;
                 }
-                Ok(_) => {}
+                Ok(_) => { replacements.remove(&entry.operation_id); }
                 Err(error) => {
                     // A real local-apply/close failure is recorded after the
                     // attempt (state advances above cleared stale errors), so
@@ -2205,6 +2242,20 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             {
                 Some(path) => recovery_live_state(query_file_state(&self.config.root.join(path)))?,
                 None => crate::sync::apply::Probe::Missing,
+            };
+            // An ancestor rename changes this child's path, not its file
+            // identity or USN. Recovery uses the journaled target only after
+            // proven source absence; classify_recovered still checks every
+            // identity/generation/USN guard before permitting a retry.
+            let live = if live == crate::sync::apply::Probe::Missing
+                && action.kind == hfdrive_state::LocalActionKind::UpdatePlaceholder
+            {
+                match action.target_path.as_ref().filter(|target| Some(*target) != action.source_path.as_ref()) {
+                    Some(target) => recovery_live_state(query_file_state(&self.config.root.join(target)))?,
+                    None => live,
+                }
+            } else {
+                live
             };
             let expected = match (
                 action.expected_file_id.as_deref().and_then(parse_hex_file_id),
@@ -2616,6 +2667,104 @@ mod tests {
             assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, completion);
             assert!(fixture.account.pending_local_actions(fixture.connection).await.unwrap().is_empty());
             assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_rename_completion_failure_retries_executor_without_delete() {
+        for drift in ["unchanged", "foreign_target", "newer_generation"] {
+            let fixture = crate::sync::test_support::connection_fixture().await;
+            let item = local_item(&fixture, "before.txt").await;
+            std::fs::write(fixture.root.join("before.txt"), b"committed provider bytes").unwrap();
+            let original = query_file_state(&fixture.root.join("before.txt")).unwrap();
+            let usn = u64::try_from(original.usn.expect("the NTFS regression requires a real USN")).unwrap();
+            let observation = fixture.account.bump_observation(fixture.connection, item, Some(usn)).await.unwrap();
+            let operation = OperationId::new();
+            fixture.account.record_observed_work(None, intent_entry(
+                fixture.connection, operation, Some(item), None, None, observation.generation,
+                &SyncIntent::Move {
+                    item_id: *item.as_uuid(), parent_id: *fixture.root_item.as_uuid(), name: "after.txt".to_owned(),
+                },
+            ).unwrap(), None).await.unwrap();
+            for transition in [
+                hfdrive_state::OutboxTransition::MetadataReady {
+                    candidate_commit: hfdrive_core::ids::CommitId::new(),
+                    candidate_head_json: serde_json::json!({}), expected_etag: "\"fixture\"".to_owned(),
+                },
+                hfdrive_state::OutboxTransition::Published,
+                hfdrive_state::OutboxTransition::LocalApplyPending,
+            ] {
+                fixture.account.transition_outbox(fixture.connection, operation, transition).await.unwrap();
+            }
+            let expected_generation = fixture.account.observation(fixture.connection, item)
+                .await.unwrap().unwrap().generation;
+            let action = fixture.account.record_local_action(hfdrive_state::LocalAction {
+                connection_id: fixture.connection, action_id: hfdrive_core::ids::ActionId::new(),
+                item_id: Some(item), kind: hfdrive_state::LocalActionKind::Rename,
+                expected_file_id: Some(original.identity.file_id.iter().map(|byte| format!("{byte:02x}")).collect()),
+                expected_generation: Some(expected_generation), expected_usn: Some(usn),
+                old_version: None, new_version: None,
+                source_path: Some("before.txt".into()), target_path: Some("after.txt".into()),
+                recovery_path: None, state: LocalActionState::Pending,
+            }).await.unwrap();
+            let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+                .account(fixture.account.account_key()).database();
+            let raw = rusqlite::Connection::open(database).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER fail_action_completion BEFORE UPDATE OF state ON local_actions
+                 WHEN NEW.state = 'applied'
+                 BEGIN SELECT RAISE(FAIL, 'action completion interrupted'); END;",
+            ).unwrap();
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            let ctx = runtime.round_context(&cancel);
+            // Run the production pass through the real rename and a failed
+            // durable completion. No recovery/complete_action shortcut is used.
+            runtime.apply_pass(&ctx).await;
+            assert!(!fixture.root.join("before.txt").exists());
+            let moved = query_file_state(&fixture.root.join("after.txt")).unwrap();
+            assert_eq!(moved.identity.file_id, original.identity.file_id);
+            assert_ne!(moved.usn, original.usn, "the rename advances its own USN");
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Pending);
+            assert_eq!(fixture.account.outbox_entry(fixture.connection, operation)
+                .await.unwrap().unwrap().state, OutboxState::LocalApplyPending);
+
+            match drift {
+                "foreign_target" => {
+                    std::fs::rename(fixture.root.join("after.txt"), fixture.root.join("preserved.txt")).unwrap();
+                    std::fs::write(fixture.root.join("after.txt"), b"unrelated target bytes").unwrap();
+                }
+                "newer_generation" => {
+                    std::fs::write(fixture.root.join("after.txt"), b"new local bytes").unwrap();
+                    fixture.account.bump_observation(fixture.connection, item, None).await.unwrap();
+                }
+                _ => {}
+            }
+            let preserved = std::fs::read(fixture.root.join("after.txt")).unwrap();
+            raw.execute_batch("DROP TRIGGER fail_action_completion;").unwrap();
+            runtime.apply_pass(&ctx).await;
+            let completed = drift == "unchanged";
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+                .await.unwrap().unwrap().state,
+                if completed { LocalActionState::Applied } else { LocalActionState::Requeued }, "{drift}");
+            let entries = fixture.account.list_outbox(fixture.connection, None, u32::MAX).await.unwrap();
+            assert_eq!(entries.len(), 1, "retry must not manufacture a replacement Delete: {drift}");
+            assert_eq!(entries[0].operation_id, operation);
+            assert!(matches!(parse_intent(&entries[0]).unwrap(), SyncIntent::Move { .. }));
+            assert_eq!(entries[0].state,
+                if completed { OutboxState::Complete } else { OutboxState::LocalApplyPending }, "{drift}");
+            assert_eq!(std::fs::read(fixture.root.join("after.txt")).unwrap(), preserved);
+            if completed {
+                assert_eq!(query_file_state(&fixture.root.join("after.txt")).unwrap().usn, moved.usn,
+                    "AlreadyMoved acknowledges the landed rename without another mutation");
+                runtime.apply_pass(&ctx).await;
+                assert!(fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap().is_empty());
+            } else {
+                assert!(fixture.account.observation(fixture.connection, item).await.unwrap().unwrap().dirty);
+            }
+            drop(raw);
+            runtime.disconnect().await.unwrap();
             fixture.state.close().await.unwrap();
         }
     }
@@ -4131,6 +4280,99 @@ mod tests {
         fixture.state.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn apply_pass_completes_requeued_replacement_and_releases_other_entries() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let item = local_item(&fixture, "missing.txt").await;
+        let action_id = hfdrive_core::ids::ActionId::new();
+        let replacement = OperationId::from_uuid(*action_id.as_uuid()).unwrap();
+        fixture.account.record_local_action(hfdrive_state::LocalAction {
+            connection_id: fixture.connection, action_id, item_id: Some(item),
+            kind: hfdrive_state::LocalActionKind::UpdatePlaceholder,
+            expected_file_id: None, expected_generation: Some(0), expected_usn: None,
+            old_version: None, new_version: None,
+            source_path: Some("missing.txt".into()), target_path: Some("missing.txt".into()),
+            recovery_path: None, state: LocalActionState::Requeued,
+        }).await.unwrap();
+        let (runtime, cancel) = unlink_runtime(&fixture);
+        let ctx = runtime.round_context(&cancel);
+        runtime.apply_pass(&ctx).await;
+        let replacement_entry = fixture.account.outbox_entry(fixture.connection, replacement)
+            .await.unwrap().unwrap();
+        assert_eq!(replacement_entry.state, OutboxState::Observed);
+
+        async fn ready(
+            fixture: &crate::sync::test_support::TestConnection,
+            operation: OperationId,
+        ) {
+            for transition in [
+                hfdrive_state::OutboxTransition::MetadataReady {
+                    candidate_commit: hfdrive_core::ids::CommitId::new(),
+                    candidate_head_json: serde_json::json!({}),
+                    expected_etag: "\"fixture\"".to_owned(),
+                },
+                hfdrive_state::OutboxTransition::Published,
+                hfdrive_state::OutboxTransition::LocalApplyPending,
+            ] {
+                fixture.account.transition_outbox(fixture.connection, operation, transition).await.unwrap();
+            }
+        }
+        let original = OperationId::new();
+        fixture.account.record_observed_work(None, intent_entry(
+            fixture.connection, original, Some(item), None, None,
+            replacement_entry.observed_generation,
+            &SyncIntent::Delete { item_id: *item.as_uuid() },
+        ).unwrap(), None).await.unwrap();
+        ready(&fixture, original).await;
+        runtime.apply_pass(&ctx).await;
+        assert_eq!(fixture.account.outbox_entry(fixture.connection, original).await.unwrap().unwrap().state,
+            OutboxState::LocalApplyPending, "unfinished replacement work still blocks another operation");
+
+        ready(&fixture, replacement).await;
+        runtime.apply_pass(&ctx).await;
+        assert_eq!(fixture.account.outbox_entry(fixture.connection, replacement).await.unwrap().unwrap().state,
+            OutboxState::Complete, "the replacement cannot be its own blocker");
+        runtime.apply_pass(&ctx).await;
+        assert_eq!(fixture.account.outbox_entry(fixture.connection, original).await.unwrap().unwrap().state,
+            OutboxState::Complete, "a terminal replacement releases other completion");
+        assert_eq!(fixture.account.local_action(fixture.connection, action_id).await.unwrap().unwrap().state,
+            LocalActionState::Requeued, "retained recovery history cannot be a stale blocker");
+        assert!(fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap().is_empty());
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_retries_child_update_at_guarded_target_after_parent_rename() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        std::fs::create_dir(fixture.root.join("before")).unwrap();
+        let source = PathBuf::from("before").join("child.txt");
+        let target = PathBuf::from("after").join("child.txt");
+        std::fs::write(fixture.root.join(&source), b"committed bytes").unwrap();
+        let live = query_file_state(&fixture.root.join(&source)).unwrap();
+        let item = ItemId::new();
+        let usn = u64::try_from(live.usn.expect("the NTFS regression requires a real USN")).unwrap();
+        let observation = fixture.account.bump_observation(fixture.connection, item, Some(usn)).await.unwrap();
+        let action = fixture.account.record_local_action(hfdrive_state::LocalAction {
+            connection_id: fixture.connection, action_id: hfdrive_core::ids::ActionId::new(),
+            item_id: Some(item), kind: hfdrive_state::LocalActionKind::UpdatePlaceholder,
+            expected_file_id: Some(live.identity.file_id.iter().map(|byte| format!("{byte:02x}")).collect()),
+            expected_generation: Some(observation.generation), expected_usn: Some(usn),
+            old_version: Some(VersionId::new()), new_version: Some(VersionId::new()),
+            source_path: Some(source), target_path: Some(target.clone()),
+            recovery_path: None, state: LocalActionState::InProgress,
+        }).await.unwrap();
+        std::fs::rename(fixture.root.join("before"), fixture.root.join("after")).unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+        assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+        assert_eq!(fixture.account.local_action(fixture.connection, action.action_id)
+            .await.unwrap().unwrap().state, LocalActionState::Pending);
+        assert!(fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap().is_empty());
+        assert_eq!(std::fs::read(fixture.root.join(target)).unwrap(), b"committed bytes");
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
     /// A failed pending-action query fails closed: the pass closes nothing
     /// rather than assuming an empty action set, which would let a completion
     /// race an unfinished local apply.
@@ -4716,5 +4958,119 @@ mod tests {
         cancel.cancel();
         runtime.disconnect().await.unwrap();
         fixture.state.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn two_connections_share_upload_admission_and_cancel_queued_dispatches() {
+        let first = crate::sync::test_support::connection_fixture().await;
+        let second = crate::sync::test_support::connection_fixture().await;
+        let scheduler = Arc::new(Scheduler::new(Default::default()));
+        let window = UploadWindow::new();
+        let mut runtimes = Vec::new();
+        let mut operations = Vec::new();
+        for fixture in [&first, &second] {
+            let remote = RecordingRemote {
+                head: None,
+                head_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ingestions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cas_commits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bindings: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                publishes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                upload_window: Some(window.clone()),
+            };
+            let (_notifications, receiver) = mpsc::channel(1);
+            let runtime = ConnectionRuntime::start(
+                ConnectionConfig {
+                    connection_id: fixture.connection, workspace: fixture.workspace,
+                    root_item_id: fixture.root_item, device_id: DeviceId::new(),
+                    root: fixture.root.clone(),
+                    staging_dir: fixture.directory.path().join("snapshots"),
+                    recovery_dir: fixture.directory.path().join("recovery"),
+                    mode: hfdrive_state::ConnectionMode::Writable, start_paused: true,
+                },
+                fixture.account.clone(), remote, scheduler.clone(),
+                Arc::new(crate::sync::activity::ActivityRegistry::new()),
+                CancellationToken::new(), receiver,
+            );
+            runtime.resume();
+            let mut queued = Vec::new();
+            for name in ["one.txt", "two.txt"] {
+                std::fs::write(fixture.root.join(name), b"local bytes").unwrap();
+                let item = local_item(fixture, name).await;
+                let entry = intent_entry(
+                    fixture.connection, OperationId::new(), Some(item), None, None, 0,
+                    &SyncIntent::Content {
+                        item_id: *item.as_uuid(),
+                        content: PendingContent {
+                            upload_id: *UploadId::new().as_uuid(),
+                            version_id: *VersionId::new().as_uuid(),
+                            modified_at: "2026-11-17T00:00:00Z".to_owned(),
+                        },
+                    },
+                ).unwrap();
+                queued.push(entry.operation_id);
+                fixture.account.record_observed_work(None, entry, None).await.unwrap();
+            }
+            operations.push(queued);
+            runtimes.push(runtime);
+        }
+        let first_pass = tokio::spawn({
+            let runtime = runtimes[0].clone();
+            async move {
+                let cancel = CancellationToken::new();
+                runtime.upload_pass(&runtime.round_context(&cancel)).await;
+            }
+        });
+        wait_for_uploads(&window, 2).await;
+        assert_eq!(scheduler.stats().upload_active, 2);
+        let queued_cancel = CancellationToken::new();
+        let second_pass = tokio::spawn({
+            let runtime = runtimes[1].clone();
+            let cancel = queued_cancel.clone();
+            async move { runtime.upload_pass(&runtime.round_context(&cancel)).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while scheduler.stats().queued_by_class.iter().sum::<usize>() < 2 {
+                assert_eq!(window.started().len(), 2, "the second connection bypassed global admission");
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        queued_cancel.cancel();
+        second_pass.await.unwrap();
+        assert_eq!(window.started().len(), 2, "cancelled waiters never dispatch");
+        assert_eq!(window.live_now(), 2, "the first connection keeps overlapping");
+        for operation in &operations[1] {
+            assert_eq!(second.account.outbox_entry(second.connection, *operation).await.unwrap().unwrap().state,
+                OutboxState::Observed);
+        }
+
+        // A fresh pass queues behind the same global slots, then proceeds
+        // once the first drive drains; both drives eventually bind payloads.
+        let second_pass = tokio::spawn({
+            let runtime = runtimes[1].clone();
+            async move {
+                let cancel = CancellationToken::new();
+                runtime.upload_pass(&runtime.round_context(&cancel)).await;
+            }
+        });
+        window.release_uploads(2);
+        first_pass.await.unwrap();
+        wait_for_uploads(&window, 4).await;
+        assert_eq!(scheduler.stats().upload_active, 2);
+        assert_eq!(window.peak(), 2);
+        assert!(!window.overflowed());
+        window.release_uploads(2);
+        second_pass.await.unwrap();
+        assert_eq!(scheduler.stats().upload_active, 0);
+        for (fixture, queued) in [&first, &second].into_iter().zip(&operations) {
+            for operation in queued {
+                assert_eq!(fixture.account.outbox_entry(fixture.connection, *operation).await.unwrap().unwrap().state,
+                    OutboxState::PayloadReady);
+            }
+        }
+        for runtime in runtimes {
+            runtime.disconnect().await.unwrap();
+        }
+        first.state.close().await.unwrap();
+        second.state.close().await.unwrap();
     }
 }

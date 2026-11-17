@@ -150,15 +150,16 @@ pub(crate) fn retained_snapshot_bytes(snapshots: &[hfdrive_state::SnapshotRecord
     bytes
 }
 
-/// The account-wide durable staging occupancy behind
-/// [`retained_snapshot_bytes`]: every connection's retained snapshots, since
-/// the staging budget is provider-wide and never per-connection.
+/// Account-wide durable staging occupancy: registered snapshots plus setup
+/// captures retained before registration. Both journals are sampled inside
+/// the scheduler's shared admission section, including after a restart.
 pub(crate) async fn retained_staging_bytes(state: &AccountStore) -> Result<u64, hfdrive_state::StateError> {
     let mut snapshots = Vec::new();
     for connection in state.list_connections().await? {
         snapshots.extend(state.list_snapshots(connection.connection_id).await?);
     }
-    Ok(retained_snapshot_bytes(&snapshots))
+    let setup_bytes = crate::setup::retained_setup_capture_bytes(state).await?;
+    Ok(retained_snapshot_bytes(&snapshots).saturating_add(setup_bytes))
 }
 
 /// Materializes `path` fully when it is not resident on disk. Uses the

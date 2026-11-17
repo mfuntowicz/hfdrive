@@ -880,7 +880,10 @@ impl Scheduler {
             let reads = self.inner.reads.state.lock().unwrap_or_else(|e| e.into_inner());
             let uploads = self.inner.uploads.state.lock().unwrap_or_else(|e| e.into_inner());
             let metadata = self.inner.metadata.state.lock().unwrap_or_else(|e| e.into_inner());
-            (reads.active, uploads.active, metadata.active, reads.queued)
+            let queued = std::array::from_fn(|index| {
+                reads.queued[index] + uploads.queued[index] + metadata.queued[index]
+            });
+            (reads.active, uploads.active, metadata.active, queued)
         };
         let policy = self.inner.policy.lock().unwrap_or_else(|e| e.into_inner());
         SchedulerStats {
@@ -925,6 +928,40 @@ mod tests {
         let waker = std::task::Waker::noop();
         let mut context = std::task::Context::from_waker(waker);
         assert!(future.poll(&mut context).is_pending());
+    }
+
+    #[tokio::test]
+    async fn stats_aggregate_queued_work_across_all_resource_gates() {
+        let scheduler = Scheduler::new(SchedulerConfig {
+            read_concurrency: 1, foreground_read_reservation: 0,
+            upload_concurrency: 1, metadata_concurrency: 1,
+            ..SchedulerConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let read = scheduler.acquire_read(WorkClass::LocalEdit, drive(1), &cancel).await.unwrap();
+        let upload = scheduler.acquire_upload(WorkClass::LocalEdit, drive(1), &cancel).await.unwrap();
+        let metadata = scheduler.acquire_metadata(WorkClass::DirectoryMetadata, drive(1), &cancel).await.unwrap();
+        let queued_read = scheduler.acquire_read(WorkClass::LocalEdit, drive(2), &cancel);
+        let queued_upload = scheduler.acquire_upload(WorkClass::LocalEdit, drive(2), &cancel);
+        let queued_metadata = scheduler.acquire_metadata(WorkClass::DirectoryMetadata, drive(2), &cancel);
+        tokio::pin!(queued_read, queued_upload, queued_metadata);
+        poll_pending(queued_read.as_mut());
+        poll_pending(queued_upload.as_mut());
+        poll_pending(queued_metadata.as_mut());
+        let stats = scheduler.stats();
+        assert_eq!((stats.read_active, stats.upload_active, stats.metadata_active), (1, 1, 1));
+        let mut expected = [0; 5];
+        expected[WorkClass::LocalEdit as usize] = 2;
+        expected[WorkClass::DirectoryMetadata as usize] = 1;
+        assert_eq!(stats.queued_by_class, expected);
+        cancel.cancel();
+        assert_eq!(queued_read.await.unwrap_err(), ScheduleError::Cancelled);
+        assert_eq!(queued_upload.await.unwrap_err(), ScheduleError::Cancelled);
+        assert_eq!(queued_metadata.await.unwrap_err(), ScheduleError::Cancelled);
+        assert_eq!(scheduler.stats().queued_by_class, [0; 5]);
+        drop((read, upload, metadata));
+        let stats = scheduler.stats();
+        assert_eq!((stats.read_active, stats.upload_active, stats.metadata_active), (0, 0, 0));
     }
 
     #[tokio::test]

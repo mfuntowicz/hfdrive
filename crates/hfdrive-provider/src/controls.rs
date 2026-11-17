@@ -339,36 +339,37 @@ impl Provider {
         let requested = request.exclude_item_ids.into_iter().map(|id| {
             ItemId::from_uuid(id).map_err(|_| invalid("A nonzero excluded item identifier is required"))
         }).collect::<Result<BTreeSet<_>, _>>()?;
+        let engine = self.engine.as_ref().ok_or_else(crate::operations::internal)?;
+        let parents: HashMap<_, _> = account.list_all_items(connection, true).await
+            .map_err(crate::operations::state_error)?
+            .into_iter().map(|item| (item.item_id, item.parent_id)).collect();
+        if requested.iter().any(|item| !parents.contains_key(item)) {
+            return Err(error(wire::ProtocolErrorCode::NotFound, "An excluded item does not exist"));
+        }
         let existing = account.excluded_observations(connection).await.map_err(crate::operations::state_error)?;
-        let mut retained_dirty_item_ids = Vec::new();
-        for observation in existing {
-            if !requested.contains(&observation.item_id) {
-                account.set_observation_flags(
-                    connection,
-                    observation.item_id,
-                    hfdrive_state::ObservationFlags { excluded: Some(false), ..Default::default() },
-                ).await.map_err(crate::operations::state_error)?;
+        // Stored flags cover descendants too. Keeping an excluded ancestor must
+        // not spuriously reinclude its children and erase their presence evidence.
+        let included: BTreeSet<_> = existing.into_iter()
+            .map(|observation| observation.item_id)
+            .filter(|item| !selection_contains(Some(*item), &requested, &parents))
+            .collect();
+        for item in &included {
+            if !selection_contains(parents.get(item).copied().flatten(), &included, &parents) {
+                engine.set_excluded(connection, *item, false).await.map_err(selective_sync_failure)?;
             }
         }
-        for item in requested {
-            let observation = account.observation(connection, item).await.map_err(crate::operations::state_error)?;
-            let busy = observation.as_ref().is_some_and(|observation| observation.dirty || observation.pin_requested);
-            if busy {
-                if observation.as_ref().is_some_and(|observation| observation.dirty) {
-                    retained_dirty_item_ids.push(*item.as_uuid());
-                }
-                continue;
+        // Inclusion precedes exclusion when an old selected ancestor is replaced
+        // by a narrower subtree. Every transition uses the runtime's serialized,
+        // durable subtree guard, generation reset and rescan/reconcile scheduling.
+        for item in &requested {
+            if !selection_contains(parents.get(item).copied().flatten(), &requested, &parents) {
+                engine.set_excluded(connection, *item, true).await.map_err(selective_sync_failure)?;
             }
-            account.set_observation_flags(
-                connection,
-                item,
-                hfdrive_state::ObservationFlags { excluded: Some(true), ..Default::default() },
-            ).await.map_err(crate::operations::state_error)?;
         }
         let effective = account.excluded_observations(connection).await.map_err(crate::operations::state_error)?;
         Ok(wire::SetSelectiveSyncResult {
             excluded_item_ids: effective.into_iter().map(|observation| *observation.item_id.as_uuid()).collect(),
-            retained_dirty_item_ids,
+            retained_dirty_item_ids: Vec::new(),
         })
     }
 
@@ -390,6 +391,31 @@ impl Provider {
             .find(|record| record.connection_id == connection)
             .map(|record| record.root_path)
             .ok_or_else(|| error(wire::ProtocolErrorCode::NotFound, "The connection does not exist"))
+    }
+}
+
+fn selection_contains(
+    mut item: Option<ItemId>,
+    selected: &BTreeSet<ItemId>,
+    parents: &HashMap<ItemId, Option<ItemId>>,
+) -> bool {
+    // The catalog is acyclic; the bound also prevents damaged local ancestry
+    // from hanging an IPC request.
+    for _ in 0..=parents.len() {
+        let Some(current) = item else { return false; };
+        if selected.contains(&current) { return true; }
+        item = parents.get(&current).copied().flatten();
+    }
+    false
+}
+
+fn selective_sync_failure(failure: crate::sync::EngineError) -> wire::ProtocolError {
+    match failure {
+        crate::sync::EngineError::Publish(crate::sync::publish::PublishError::LocalApply(reason)) =>
+            error(wire::ProtocolErrorCode::Conflict, reason),
+        crate::sync::EngineError::Publish(crate::sync::publish::PublishError::State(failure)) =>
+            crate::operations::state_error(failure),
+        failure => engine_failure(failure),
     }
 }
 

@@ -112,16 +112,18 @@ async fn credential_record_file_name_matches_the_file_on_disk() {
     let (manager, account) = signed_in(&fixture, dir.path()).await;
 
     let credentials_dir = hfdrive_auth::store::account_credentials_dir(dir.path(), account);
-    let on_disk: Vec<String> = std::fs::read_dir(&credentials_dir)
+    let mut on_disk: Vec<String> = std::fs::read_dir(&credentials_dir)
         .expect("credentials dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
+    on_disk.sort();
     assert_eq!(
         on_disk,
-        vec![manager.credential_record_file_name()],
-        "credential_ref must be the real record file name"
+        vec!["oauth-refresh-fence.hfdcred".to_owned(), "oauth.hfdcred".to_owned()],
+        "the refresh fence and credential must use their real record file names"
     );
+    assert!(on_disk.iter().any(|name| name.as_str() == manager.credential_record_file_name()));
 }
 
 #[test]

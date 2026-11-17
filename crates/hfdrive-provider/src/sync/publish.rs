@@ -1350,6 +1350,18 @@ async fn record_requeued_intent<R: RemoteOps>(
         }
         Ok(_) => return Err(PublishError::LocalApply("requeued path is not an ordinary file or directory")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if matches!(row.kind, StateActionKind::UpdatePlaceholder | StateActionKind::Rename) {
+                if let Some(target) = row.target_path.as_ref().filter(|target| *target != path) {
+                    // A landed rename or relocated child is not a local
+                    // deletion. Preserve the target without adopting an
+                    // unproven occupant as this item's replacement content.
+                    if !matches!(apply::probe(&ctx.root.join(target)), apply::Probe::Missing) {
+                        return Err(PublishError::LocalApply(
+                            "requeued action target must be reconciled before inferring deletion",
+                        ));
+                    }
+                }
+            }
             SyncIntent::Delete { item_id: *item_id.as_uuid() }
         }
         Err(_) => return Err(PublishError::LocalApply("requeued local metadata could not be read")),
@@ -1487,7 +1499,10 @@ async fn execute_one_action<R: RemoteOps>(
                 identity,
                 invalidate: vec![range],
             };
-            match apply::update_placeholder(&ctx.root.join(path), &spec, &expected_state) {
+            let update = apply::update_placeholder;
+            #[cfg(test)]
+            let update = tests::placeholder_updater(update);
+            match update(&ctx.root.join(path), &spec, &expected_state) {
                 Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Applied { .. }) => {}
                 Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Mismatch(_)) => return Ok(false),
                 Err(error) => return Err(PublishError::LocalApply(error)),
@@ -1562,9 +1577,13 @@ async fn version_object<R: RemoteOps>(
 }
 
 /// Rebuilds the expected guard state from the journaled expectation and the
-/// live file. A half-finished case-only rename proves its intermediate by
-/// identity/generation; its own first hop necessarily changed the USN.
+/// live file. A landed rename proves its destination (or case-only
+/// intermediate) by identity/generation: its own move changed the USN and
+/// the executor must only acknowledge it, never move an unrelated occupant.
 /// Unreadable metadata is a retryable failure, never a changed/missing guard.
+/// A child carried by an ancestor rename is probed at its journaled target
+/// only when the old source is absent. Unlike the renamed object itself,
+/// this update fallback must still match the exact journaled USN.
 async fn expected_guard_state<R: RemoteOps>(
     ctx: &RoundContext<'_, R>,
     row: &LocalAction,
@@ -1579,14 +1598,28 @@ async fn expected_guard_state<R: RemoteOps>(
     let (live, relocated) = match apply::probe(&ctx.root.join(source_path)) {
         apply::Probe::Present(live) => (live, false),
         apply::Probe::Missing => {
-            let Some(intermediate) = apply::case_rename_intermediate(row) else {
+            if !matches!(row.kind, StateActionKind::UpdatePlaceholder | StateActionKind::Rename) {
+                return Ok(None);
+            }
+            let Some(target) = row.target_path.as_ref().filter(|target| *target != source_path) else {
                 return Ok(None);
             };
-            match apply::probe(&ctx.root.join(intermediate)) {
-                apply::Probe::Present(live) => (live, true),
-                apply::Probe::Missing => return Ok(None),
+            match apply::probe(&ctx.root.join(target)) {
+                apply::Probe::Present(live) => (live, row.kind == StateActionKind::Rename),
+                apply::Probe::Missing => {
+                    let Some(intermediate) = apply::case_rename_intermediate(row) else {
+                        return Ok(None);
+                    };
+                    match apply::probe(&ctx.root.join(intermediate)) {
+                        apply::Probe::Present(live) => (live, true),
+                        apply::Probe::Missing => return Ok(None),
+                        apply::Probe::Unreadable => {
+                            return Err(PublishError::LocalApply("local rename intermediate could not be inspected"));
+                        }
+                    }
+                }
                 apply::Probe::Unreadable => {
-                    return Err(PublishError::LocalApply("local rename intermediate could not be inspected"));
+                    return Err(PublishError::LocalApply("local action target could not be inspected"));
                 }
             }
         }
@@ -2182,9 +2215,20 @@ mod tests {
         u64,
     ) -> Result<Option<i64>, &'static str>;
 
+    type PlaceholderUpdater = fn(
+        &std::path::Path,
+        &hfdrive_windows::cfapi::ops::UpdateSpec,
+        &hfdrive_windows::filesystem::volume::FileState,
+    ) -> Result<hfdrive_windows::cfapi::ops::GuardOutcome, &'static str>;
+
     thread_local! {
         static MARK_TARGET: std::cell::RefCell<Option<(
             std::path::PathBuf, hfdrive_windows::cfapi::identity::PlaceholderIdentity,
+        )>> = const { std::cell::RefCell::new(None) };
+        static UPDATE_TARGET: std::cell::RefCell<Option<(
+            std::path::PathBuf,
+            hfdrive_windows::cfapi::identity::PlaceholderIdentity,
+            hfdrive_windows::filesystem::volume::FileState,
         )>> = const { std::cell::RefCell::new(None) };
     }
 
@@ -2197,6 +2241,30 @@ mod tests {
         } else {
             native
         }
+    }
+
+    // Like the publication marker, this checks the native call's exact
+    // inputs. Journal binding, the ancestor rename and guarded dispatch are
+    // real; this deterministic test is not native CFAPI acceptance.
+    pub(super) fn placeholder_updater(native: PlaceholderUpdater) -> PlaceholderUpdater {
+        if UPDATE_TARGET.with(|target| target.borrow().is_some()) {
+            checked_placeholder_updater
+        } else {
+            native
+        }
+    }
+
+    fn checked_placeholder_updater(
+        path: &std::path::Path,
+        spec: &hfdrive_windows::cfapi::ops::UpdateSpec,
+        expected: &hfdrive_windows::filesystem::volume::FileState,
+    ) -> Result<hfdrive_windows::cfapi::ops::GuardOutcome, &'static str> {
+        let (target, identity, original) = UPDATE_TARGET.with(|target| target.borrow_mut().take().unwrap());
+        assert_eq!(path, target);
+        assert_eq!(spec.identity, identity);
+        assert_eq!(expected, &original, "ancestor relocation cannot weaken the child's guard");
+        assert_eq!(&hfdrive_windows::filesystem::volume::query_file_state(path).unwrap(), expected);
+        Ok(hfdrive_windows::cfapi::ops::GuardOutcome::Applied { usn: expected.usn })
     }
 
     fn checked_publication_marker(
@@ -3955,7 +4023,30 @@ mod tests {
             .iter()
             .find(|action| action.action == LocalActionKind::UpdatePlaceholder && action.item_id == notes.item_id)
             .expect("the content change applies locally");
-        let remote = HeadOnlyRemote::default();
+        std::fs::create_dir(fixture.root.join("docs")).unwrap();
+        std::fs::write(fixture.root.join(rel(&["docs", "notes.txt"])), b"old bytes").unwrap();
+        for (record, path) in [
+            (&old_parent, rel(&["docs"])), (&notes, rel(&["docs", "notes.txt"])),
+        ] {
+            fixture.account.upsert_item(registry_item(
+                fixture.connection, record, None, None, None,
+            )).await.unwrap();
+            let live = hfdrive_windows::filesystem::volume::query_file_state(&fixture.root.join(path)).unwrap();
+            fixture.account.bump_observation(fixture.connection, record.item_id,
+                live.usn.and_then(|usn| u64::try_from(usn).ok())).await.unwrap();
+        }
+        let original = hfdrive_windows::filesystem::volume::query_file_state(
+            &fixture.root.join(rel(&["docs", "notes.txt"])),
+        ).unwrap();
+        assert!(original.usn.is_some(), "the NTFS regression requires a real USN");
+        let remote = HeadOnlyRemote {
+            records: [notes.content_version_id.unwrap(), updated.content_version_id.unwrap()]
+                .into_iter().map(|version| (
+                    hfdrive_publication::MetadataRecord::Version(version),
+                    crate::sync::test_support::version_metadata(fixture.workspace, version),
+                )).collect(),
+            ..Default::default()
+        };
         let scheduler = crate::scheduler::Scheduler::new(Default::default());
         let cancel = CancellationToken::new();
         let echo = tokio::sync::Mutex::new(crate::sync::observe::EchoTable::default());
@@ -3967,7 +4058,84 @@ mod tests {
         assert_eq!(fact.source_path.as_ref().unwrap(), &rel(&["docs", "notes.txt"]));
         assert_eq!(fact.target_path.as_ref().unwrap(), &rel(&["docs-2026", "notes.txt"]));
         assert_ne!(fact.source_path, fact.target_path);
+        plan::persist_plan_records(&fixture.account, fixture.connection, &planned.plan, &facts)
+            .await.unwrap();
+        let rename = fixture.account.pending_local_actions(fixture.connection).await.unwrap()
+            .into_iter().find(|action| action.kind == StateActionKind::Rename).unwrap();
+        // Land the parent first, exactly as the journal requires. The child's
+        // old source is now absent, but its file identity and USN are intact.
+        assert!(execute_one_action(&ctx, &rename).await.unwrap());
+        apply::complete_action(
+            &fixture.account, &rename, &fixture.root, LocalActionState::Applied,
+            &mut *echo.lock().await,
+        ).await.unwrap();
+        assert!(!fixture.root.join("docs").exists());
+        UPDATE_TARGET.with(|target| *target.borrow_mut() = Some((
+            fixture.root.join(rel(&["docs-2026", "notes.txt"])),
+            apply::file_identity(fixture.workspace, notes.item_id, updated.content_version_id.unwrap()),
+            original,
+        )));
+        assert_eq!(execute_pending_actions(&ctx).await.unwrap(),
+            LocalActionOutcome { applied: 1, requeued: 0 });
+        UPDATE_TARGET.with(|target| assert!(target.borrow().is_none(), "the child update was dispatched"));
+        assert_eq!(fixture.account.local_action(fixture.connection, update.action_id)
+            .await.unwrap().unwrap().state, LocalActionState::Applied);
+        assert!(fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap().is_empty(),
+            "an applied ancestor rename must never synthesize a local Delete");
+        assert_eq!(std::fs::read(fixture.root.join(rel(&["docs-2026", "notes.txt"]))).unwrap(), b"old bytes");
+
         fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relocated_child_update_rejects_changed_guards_without_inventing_delete() {
+        for changed in ["identity", "generation", "usn", "unknown_usn"] {
+            let fixture = connection_fixture().await;
+            let item = ItemId::new();
+            let source = rel(&["before", "child.txt"]);
+            let target = rel(&["after", "child.txt"]);
+            std::fs::create_dir(fixture.root.join("before")).unwrap();
+            std::fs::write(fixture.root.join(&source), b"original bytes").unwrap();
+            let live = hfdrive_windows::filesystem::volume::query_file_state(&fixture.root.join(&source)).unwrap();
+            let usn = u64::try_from(live.usn.expect("the NTFS regression requires a real USN")).unwrap();
+            let observation = fixture.account.bump_observation(fixture.connection, item, Some(usn)).await.unwrap();
+            let row = LocalAction {
+                connection_id: fixture.connection, action_id: ActionId::new(), item_id: Some(item),
+                kind: StateActionKind::UpdatePlaceholder,
+                expected_file_id: Some(hex_file_id(&live.identity.file_id)),
+                expected_generation: Some(observation.generation),
+                expected_usn: if changed == "unknown_usn" { None } else { Some(usn) },
+                old_version: Some(VersionId::new()), new_version: Some(VersionId::new()),
+                source_path: Some(source), target_path: Some(target.clone()),
+                recovery_path: None, state: LocalActionState::Pending,
+            };
+            fixture.account.record_local_action(row.clone()).await.unwrap();
+            std::fs::rename(fixture.root.join("before"), fixture.root.join("after")).unwrap();
+            match changed {
+                "identity" => {
+                    std::fs::rename(fixture.root.join(&target), fixture.root.join("preserved.txt")).unwrap();
+                    std::fs::write(fixture.root.join(&target), b"foreign bytes").unwrap();
+                }
+                "generation" => { fixture.account.bump_observation(fixture.connection, item, Some(usn)).await.unwrap(); }
+                "usn" => { std::fs::write(fixture.root.join(&target), b"new local bytes").unwrap(); }
+                _ => {}
+            }
+            let preserved = std::fs::read(fixture.root.join(&target)).unwrap();
+            let remote = HeadOnlyRemote::default();
+            let scheduler = crate::scheduler::Scheduler::new(Default::default());
+            let cancel = CancellationToken::new();
+            let echo = tokio::sync::Mutex::new(crate::sync::observe::EchoTable::default());
+            let ctx = round_context(&fixture, &remote, &scheduler, &cancel, &echo);
+            assert!(expected_guard_state(&ctx, &row).await.unwrap().is_none(), "{changed}");
+            assert!(matches!(execute_pending_actions(&ctx).await, Err(PublishError::LocalApply(_))),
+                "an unproven target remains blocked instead of becoming Delete: {changed}");
+            assert_eq!(fixture.account.local_action(fixture.connection, row.action_id)
+                .await.unwrap().unwrap().state, LocalActionState::Requeued);
+            assert!(fixture.account.list_active_outbox(fixture.connection, u32::MAX).await.unwrap().is_empty());
+            assert!(remote.metadata_reads.lock().unwrap().is_empty(), "no update was dispatched");
+            assert_eq!(std::fs::read(fixture.root.join(&target)).unwrap(), preserved);
+            fixture.state.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

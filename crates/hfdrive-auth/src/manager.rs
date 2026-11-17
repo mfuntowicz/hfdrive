@@ -9,8 +9,8 @@
 //!   **before** any token exposure (login and refresh alike);
 //! * single-flight per-account refresh with the plan's refresh deadline
 //!   (earlier of five minutes before expiry and 10% of the token lifetime),
-//!   old-refresh-token retention on rotation, and `invalid_grant` failing
-//!   closed to `NeedsSignIn` — never a retry loop;
+//!   old-refresh-token retention on rotation, and a durable write-ahead fence
+//!   that keeps rejected or interrupted refreshes fail-closed across restart;
 //! * credential generations rotate immutable consumers while the
 //!   authorization epoch stays untouched by refresh: a refreshed token can
 //!   never revive a signed-out lease;
@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use hfdrive_core::ids::AccountKey;
 use hfdrive_core::storage::Namespace;
+use hfdrive_windows::credentials::{CredentialStore, RecordName};
 use openidconnect::{OAuth2TokenResponse, TokenResponse as OidcTokenResponse};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -266,10 +267,9 @@ impl AuthManager {
 
     /// Restore the explicitly selected account from its protected record.
     ///
-    /// Only call this for an account whose **durable** status is not
-    /// `NeedsSignIn`: an envelope rejected earlier (`invalid_grant`, failed
-    /// identity validation, unreadable record) must be restored with
-    /// [`Self::restore_rejected_account`] instead, or it would be reactivated.
+    /// A durable refresh fence is checked even when the provider's account
+    /// database still says `Active`. Persisted account rejections additionally
+    /// require [`Self::restore_rejected_account`].
     pub fn restore_account(&self, account: AccountKey) -> Result<AccountProfile, AuthError> {
         self.restore_account_with(account, RestoreMode::Reusable)
     }
@@ -310,14 +310,21 @@ impl AuthManager {
             if AccountKey::from_subject(&envelope.issuer, &envelope.subject) != account {
                 return Err(AuthError::ExistingSessionPreserved);
             }
+            let mode = if self.refresh_fence(account)?
+                == Some((envelope.generation, envelope.authorization_epoch))
+            {
+                RestoreMode::Rejected
+            } else {
+                mode
+            };
             let (entry, profile) = entry_from_envelope(account, envelope, mode)?;
             let needs_sign_in = lock(&entry.shared).needs_sign_in;
             if !needs_sign_in {
                 entry.authority.activate().map_err(|_| AuthError::Internal)?;
             }
-            Ok((entry, profile, needs_sign_in))
+            Ok((entry, profile, needs_sign_in, mode))
         })();
-        let (entry, profile, needs_sign_in) = match restored {
+        let (entry, profile, needs_sign_in, mode) = match restored {
             Ok(value) => value,
             Err(error) => {
                 self.set_last_error(Some(error.clone()));
@@ -328,11 +335,11 @@ impl AuthManager {
         lock(&self.0.accounts).insert(account, entry);
         *lock(&self.0.active) = Some(account);
         if mode == RestoreMode::Rejected {
-            // Make the recorded rejection durable: the rejected envelope's
-            // replayable secrets are removed so no later restore path (even
-            // the reusable one) can reactivate it. Identity, generation and
-            // epoch bookkeeping survive for display and recovery.
-            self.persist_rejection(account);
+            if let Err(error) = self.persist_rejection(account) {
+                self.set_last_error(Some(error.clone()));
+                self.publish();
+                return Err(error);
+            }
         }
         self.set_last_error(needs_sign_in.then_some(AuthError::NeedsSignIn));
         self.publish();
@@ -887,6 +894,8 @@ impl AuthManager {
         let dir = account_credentials_dir(&self.0.state_base, account);
         let store = AccountCredentialStore::open(dir, account)?;
         store.save(&envelope)?;
+        // Only a durably saved fresh grant can clear a previous refresh fence.
+        self.save_refresh_fence(account, None)?;
         drop(envelope);
 
         // Persist first: a failed replacement must not revoke the usable previous login.
@@ -994,7 +1003,7 @@ impl AuthManager {
             }
         };
         if mark_sign_in {
-            self.mark_needs_sign_in(&entry);
+            self.mark_needs_sign_in(&entry)?;
         }
         match decision {
             Some(result) => result,
@@ -1033,7 +1042,7 @@ impl AuthManager {
             }
             if shared.refresh_token.is_none() {
                 drop(shared);
-                self.mark_needs_sign_in(entry);
+                self.mark_needs_sign_in(entry)?;
                 return Err(AuthError::NeedsSignIn);
             }
         }
@@ -1045,14 +1054,45 @@ impl AuthManager {
                 .map(|token| Zeroizing::new(token.to_string()))
                 .ok_or(AuthError::NeedsSignIn)?
         };
+        {
+            let _commit = lock(&self.0.credential_commit);
+            if self.0.signing_out.load(Ordering::SeqCst)
+                || *lock(&self.0.active) != Some(entry.account)
+                || self.entry_opt(entry.account).is_none_or(|current| !Arc::ptr_eq(&current, entry))
+                || lock(&entry.shared).needs_sign_in
+            {
+                return Err(AuthError::NeedsSignIn);
+            }
+            let generation = lock(&entry.shared).generation;
+            let epoch = entry.authority.current_epoch().map_err(|_| AuthError::Internal)?;
+            // Before the request can reject this grant, durably prohibit
+            // replay of this exact envelope on restart. If this write fails,
+            // no refresh is dispatched and no new rejection can be lost.
+            self.save_refresh_fence(entry.account, Some((generation, epoch)))?;
+        }
         match self.do_refresh(entry, &refresh_token).await {
             Ok(token) => Ok(token),
             Err(AuthError::InvalidGrant) => {
                 // Fail closed: no retry loop, no token, sign-in required.
-                self.mark_needs_sign_in(entry);
+                self.mark_needs_sign_in(entry)?;
                 Err(AuthError::InvalidGrant)
             }
             Err(error) => {
+                let _commit = lock(&self.0.credential_commit);
+                if !self.0.signing_out.load(Ordering::SeqCst)
+                    && *lock(&self.0.active) == Some(entry.account)
+                    && self.entry_opt(entry.account).is_some_and(|current| Arc::ptr_eq(&current, entry))
+                    && !lock(&entry.shared).needs_sign_in
+                {
+                    // A known non-rejection can retain the previous session,
+                    // but only after durably releasing its restart fence.
+                    if let Err(persistence) = self.save_refresh_fence(entry.account, None) {
+                        revoke_entry(entry);
+                        self.set_last_error(Some(persistence.clone()));
+                        self.publish();
+                        return Err(persistence);
+                    }
+                }
                 // Transient failure: a still-valid token remains usable.
                 let shared = lock(&entry.shared);
                 if let Some(token) = &shared.token {
@@ -1081,11 +1121,10 @@ impl AuthManager {
         }
         let identity = if token.id_token().is_some() {
             let identity = flows::verify_id_token(&client, &token, None).map_err(|error| {
-                self.mark_needs_sign_in(entry);
-                error
+                self.mark_needs_sign_in(entry).err().unwrap_or(error)
             })?;
             if identity.subject != entry.subject || identity.issuer != entry.issuer {
-                self.mark_needs_sign_in(entry);
+                self.mark_needs_sign_in(entry)?;
                 return Err(AuthError::ExistingSessionPreserved);
             }
             identity
@@ -1098,8 +1137,11 @@ impl AuthManager {
         };
         let userinfo = flows::fetch_userinfo(&client, &http, token.access_token().secret(), &entry.subject)
             .await.map_err(|error| {
-                if error == AuthError::IdentityValidation { self.mark_needs_sign_in(entry); }
-                error
+                if error == AuthError::IdentityValidation {
+                    self.mark_needs_sign_in(entry).err().unwrap_or(error)
+                } else {
+                    error
+                }
             })?;
         let (purpose, flow) = {
             let shared = lock(&entry.shared);
@@ -1108,8 +1150,11 @@ impl AuthManager {
         let mut profile = flows::build_profile(&identity, &userinfo,
             token.scopes().map(|scopes| scopes.iter().map(|scope| scope.as_str().to_owned()).collect()),
             purpose, flow, None, true).map_err(|error| {
-                if error == AuthError::IdentityValidation { self.mark_needs_sign_in(entry); }
-                error
+                if error == AuthError::IdentityValidation {
+                    self.mark_needs_sign_in(entry).err().unwrap_or(error)
+                } else {
+                    error
+                }
             })?;
 
         let _commit = lock(&self.0.credential_commit);
@@ -1208,44 +1253,85 @@ impl AuthManager {
         Ok(secret)
     }
 
-    fn mark_needs_sign_in(&self, entry: &Arc<AccountEntry>) {
+    fn mark_needs_sign_in(&self, entry: &Arc<AccountEntry>) -> Result<(), AuthError> {
         let _commit = lock(&self.0.credential_commit);
         revoke_entry(entry);
         if self.0.signing_out.load(Ordering::SeqCst)
             || *lock(&self.0.active) != Some(entry.account)
             || self.entry_opt(entry.account).is_none_or(|current| !Arc::ptr_eq(&current, entry))
         {
-            return;
+            return Ok(());
         }
-        // Durably record the rejection before the state observer can see it,
-        // so no later startup can reactivate the rejected envelope. Failure
-        // leaves the in-memory rejection authoritative for this run.
-        self.persist_rejection(entry.account);
-        self.set_last_error(Some(AuthError::NeedsSignIn));
+        let persisted = self.persist_rejection(entry.account);
+        self.set_last_error(Some(
+            persisted.as_ref().err().cloned().unwrap_or(AuthError::NeedsSignIn),
+        ));
         self.publish();
+        persisted
     }
 
-    /// Durably mark one account's preserved credential record as rejected.
-    ///
-    /// The record keeps its verified identity, generation and durable
-    /// authorization epoch (so a fresh login replacement stays monotonic and
-    /// rebindable) but loses every replayable secret: the bearer and refresh
-    /// token are cleared and the expiry is zeroed, which forces
-    /// [`entry_from_envelope`] to restore it `needs_sign_in` in any mode. A
-    /// missing or unreadable record is left untouched — an unreadable record
-    /// already fails closed and a missing one has nothing to reactivate.
-    fn persist_rejection(&self, account: AccountKey) {
-        let dir = account_credentials_dir(&self.0.state_base, account);
-        let Ok(store) = AccountCredentialStore::open(dir, account) else { return };
-        let Ok(mut envelope) = store.load() else { return };
-        #[cfg(any(test, feature = "test-support"))]
-        if self.0.fail_rejection_replacement.load(Ordering::SeqCst) {
-            return;
+    /// The write-ahead fence uses the existing atomic, DPAPI-protected record
+    /// store. An interrupted refresh stays rejected on restart; a successfully
+    /// persisted successor has a new generation and cannot match the old fence.
+    fn refresh_fence(&self, account: AccountKey) -> Result<Option<(u64, u64)>, AuthError> {
+        let store = CredentialStore::open(account_credentials_dir(&self.0.state_base, account))
+            .map_err(|_| AuthError::Persistence)?;
+        let name = RecordName::new("oauth-refresh-fence").expect("static record name is valid");
+        match store.load_record(&name, Some(account.as_bytes())) {
+            Ok(record) => serde_json::from_slice(record.expose())
+                .map_err(|_| AuthError::CredentialRecordUnreadable),
+            Err(hfdrive_windows::CredentialError::NotFound) => Ok(None),
+            Err(_) => Err(AuthError::CredentialRecordUnreadable),
         }
-        envelope.access_token = String::new();
+    }
+
+    fn save_refresh_fence(
+        &self,
+        account: AccountKey,
+        fence: Option<(u64, u64)>,
+    ) -> Result<(), AuthError> {
+        let store = CredentialStore::open(account_credentials_dir(&self.0.state_base, account))
+            .map_err(|_| AuthError::Persistence)?;
+        let name = RecordName::new("oauth-refresh-fence").expect("static record name is valid");
+        let bytes = serde_json::to_vec(&fence).map_err(|_| AuthError::Persistence)?;
+        store.save_record(&name, &bytes, Some(account.as_bytes()))
+            .map_err(|_| AuthError::Persistence)
+    }
+
+    /// Persist rejection independently of neutralizing the credential envelope.
+    /// The fence is authoritative even if the account observer never runs and
+    /// replacing the original envelope fails. Identity/generation bookkeeping
+    /// survives; successful neutralization additionally removes both secrets.
+    fn persist_rejection(&self, account: AccountKey) -> Result<(), AuthError> {
+        let dir = account_credentials_dir(&self.0.state_base, account);
+        let store = AccountCredentialStore::open(dir, account)?;
+        let mut envelope = match store.load() {
+            Ok(envelope) => envelope,
+            Err(AuthError::NeedsSignIn) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let fence = Some((envelope.generation, envelope.authorization_epoch));
+        if self.refresh_fence(account)? != fence {
+            self.save_refresh_fence(account, fence)?;
+        }
+        envelope.zeroize_secrets();
+        envelope.access_token.clear();
         envelope.refresh_token = None;
         envelope.expires_at = 0;
-        let _ = store.save(&envelope);
+        #[cfg(any(test, feature = "test-support"))]
+        let replacement = if self.0.fail_rejection_replacement.load(Ordering::SeqCst) {
+            Err(AuthError::Persistence)
+        } else {
+            store.save(&envelope)
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let replacement = store.save(&envelope);
+        if let Err(error) = replacement {
+            // Rejection is already durable. Surface the failed secret cleanup
+            // without weakening the fence or replacing a later login outcome.
+            tracing::warn!(?error, "rejected credential envelope could not be neutralized; durable refresh fence retained");
+        }
+        Ok(())
     }
 }
 

@@ -517,6 +517,273 @@ mod tests {
         PinState, Visibility,
     };
 
+    mod selective_sync_dispatch {
+        use super::*;
+        use hfdrive_core::{
+            format::{ItemKind, ItemRecord},
+            ids::{CommitId, ItemId, OperationId, VersionId},
+            reconcile::{CatalogView, ItemState, ReconcileMode},
+            storage::Sha256Digest,
+        };
+        use hfdrive_state::{ObservationFlags, OperationState};
+        use std::collections::{BTreeSet, HashMap};
+
+        type LiveRuntime = sync::controller::ConnectionRuntime<
+            sync::remote::LiveRemote<DurableTokens, hfdrive_publication::S3Transport>,
+        >;
+
+        struct Fixture {
+            _directory: tempfile::TempDir,
+            provider: Arc<Provider>,
+            runtime: Arc<LiveRuntime>,
+            account: hfdrive_state::AccountStore,
+            connection: ConnectionId,
+            workspace: hfdrive_core::ids::WorkspaceId,
+            root: std::path::PathBuf,
+            records: Vec<ItemRecord>,
+            commit: CommitId,
+            selected: ItemId,
+            nested: ItemId,
+            leaf: ItemId,
+            other: ItemId,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let fixture = sync::test_support::connection_fixture().await;
+                let paths = StatePaths::new(fixture.directory.path().join("state"));
+                let key = fixture.account.account_key();
+                let mut envelope = rejected_envelope("sync-fixture");
+                envelope.namespace = "test-user".to_owned();
+                envelope.access_token = "selective-sync-fixture-not-a-live-token".to_owned();
+                envelope.refresh_token = None;
+                hfdrive_auth::AccountCredentialStore::open(paths.account(key).credentials(), key)
+                    .unwrap().save(&envelope).unwrap();
+                fixture.state.select_account(key).await.unwrap();
+                fixture.state.close().await.unwrap();
+                let provider = Provider::open(paths, "S-1-5-21-fixture".to_owned()).await.unwrap();
+                let account = provider.state.open_account(key).await.unwrap();
+                let [selected, nested, leaf, other] = std::array::from_fn(|_| ItemId::new());
+                let revision = OperationId::new();
+                let root = ItemRecord {
+                    item_id: fixture.root_item, parent_id: None, name: String::new(),
+                    kind: ItemKind::Directory, item_revision: revision, content_version_id: None,
+                    deleted: false, content_operation: revision, location_operation: revision,
+                    deletion_operation: None,
+                };
+                let records = vec![
+                    root.clone(),
+                    ItemRecord { item_id: selected, parent_id: Some(fixture.root_item), name: "selected".to_owned(), ..root.clone() },
+                    ItemRecord { item_id: nested, parent_id: Some(selected), name: "nested".to_owned(), ..root.clone() },
+                    ItemRecord {
+                        item_id: leaf, parent_id: Some(nested), name: "leaf.txt".to_owned(),
+                        kind: ItemKind::File, content_version_id: Some(VersionId::new()), ..root.clone()
+                    },
+                    ItemRecord { item_id: other, parent_id: Some(fixture.root_item), name: "other".to_owned(), ..root },
+                ];
+                for item in &records {
+                    let content = item.content_version_id.map(|_| (Sha256Digest::of(b"committed"), 9));
+                    account.upsert_item(sync::plan::registry_item(
+                        fixture.connection, item, content.map(|(digest, _)| digest),
+                        content.map(|(_, size)| size), None,
+                    )).await.unwrap();
+                    account.bump_observation(fixture.connection, item.item_id, Some(91)).await.unwrap();
+                    account.set_observation_flags(fixture.connection, item.item_id, ObservationFlags {
+                        dirty: Some(false), ..Default::default()
+                    }).await.unwrap();
+                }
+                let commit = CommitId::new();
+                sync::plan::record_common_bases(&account, fixture.connection, commit, &records).await.unwrap();
+                account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(commit)).await.unwrap();
+                let record = provider.state.reconcile_connections().await.unwrap().into_iter()
+                    .find(|record| record.connection_id == fixture.connection).unwrap();
+                // Construction only: the runtime stays paused, with no CFAPI
+                // registration, observer or remote task. Dispatch and state are real.
+                let remote = provider.remote_for(&record, &provider.current_account().unwrap()).unwrap();
+                let cancel = provider.shutdown.child_token();
+                let (_notifications, receiver) = mpsc::channel(1);
+                let runtime = sync::controller::ConnectionRuntime::start(
+                    sync::controller::ConnectionConfig {
+                        connection_id: fixture.connection, workspace: fixture.workspace,
+                        root_item_id: fixture.root_item, device_id: provider.device_id,
+                        root: fixture.root.clone(), staging_dir: fixture.directory.path().join("snapshots"),
+                        recovery_dir: fixture.directory.path().join("recovery"),
+                        mode: hfdrive_state::ConnectionMode::Writable, start_paused: true,
+                    },
+                    account.clone(), remote, Arc::new(provider.scheduler.clone()),
+                    Arc::new(sync::activity::ActivityRegistry::new()), cancel.clone(), receiver,
+                );
+                provider.engine.as_ref().unwrap().insert_runtime_for_test(runtime.clone(), cancel).await;
+                Self {
+                    _directory: fixture.directory, provider, runtime, account,
+                    connection: fixture.connection, workspace: fixture.workspace, root: fixture.root,
+                    records, commit, selected, nested, leaf, other,
+                }
+            }
+
+            fn request(&self, roots: &[ItemId]) -> Request {
+                Request::SetSelectiveSync(hfdrive_protocol::SetSelectiveSyncRequest {
+                    operation_id: Uuid::new_v4(), connection_id: *self.connection.as_uuid(),
+                    exclude_item_ids: roots.iter().map(|item| *item.as_uuid()).collect(),
+                })
+            }
+
+            async fn apply(&self, roots: &[ItemId]) -> hfdrive_protocol::SetSelectiveSyncResult {
+                let reply = self.provider.dispatch(self.request(roots), CancellationToken::new()).await;
+                let ResponseResult::SetSelectiveSync(result) = reply.result.unwrap() else {
+                    panic!("selective sync result");
+                };
+                assert!(result.retained_dirty_item_ids.is_empty());
+                result
+            }
+
+            async fn observation(&self, item: ItemId) -> hfdrive_state::LocalObservation {
+                self.account.observation(self.connection, item).await.unwrap().unwrap()
+            }
+
+            async fn close(self) {
+                self.provider.drain().await.unwrap();
+                let Fixture { _directory, provider, runtime, account, .. } = self;
+                drop(runtime);
+                drop(account);
+                drop(provider);
+                _directory.close().unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn selective_sync_dispatch_refuses_dirty_and_pinned_descendants_durably() {
+            for pinned in [false, true] {
+                let fixture = Fixture::new().await;
+                let guarded = fixture.account.set_observation_flags(fixture.connection, fixture.leaf, ObservationFlags {
+                    dirty: Some(!pinned), pin_requested: Some(pinned), ..Default::default()
+                }).await.unwrap();
+                let request = fixture.request(&[fixture.selected]);
+                let operation = OperationId::from_uuid(request.operation_id().unwrap()).unwrap();
+                let reply = fixture.provider.dispatch(request.clone(), CancellationToken::new()).await;
+                assert_eq!(reply.result.unwrap_err().code, ProtocolErrorCode::Conflict);
+                assert_eq!(fixture.observation(fixture.leaf).await, guarded);
+                assert!(fixture.account.excluded_observations(fixture.connection).await.unwrap().is_empty());
+                let receipt = fixture.provider.state.get_operation(operation).await.unwrap().unwrap();
+                assert_eq!(receipt.state, OperationState::Failed);
+                assert_eq!(receipt.error_code.as_deref(), Some(ProtocolErrorCode::Conflict.wire()));
+                fixture.account.set_observation_flags(fixture.connection, fixture.leaf, ObservationFlags {
+                    dirty: Some(false), pin_requested: Some(false), ..Default::default()
+                }).await.unwrap();
+                let replay = fixture.provider.dispatch(request, CancellationToken::new()).await;
+                assert_eq!(replay.result.unwrap_err().code, ProtocolErrorCode::Conflict);
+                assert!(fixture.account.excluded_observations(fixture.connection).await.unwrap().is_empty());
+                assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+                fixture.close().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn selective_sync_dispatch_reincludes_only_removed_subtrees_and_validates_before_mutation() {
+            let fixture = Fixture::new().await;
+            let excluded = fixture.apply(&[fixture.selected, fixture.other]).await;
+            assert_eq!(
+                excluded.excluded_item_ids.into_iter().collect::<BTreeSet<_>>(),
+                [fixture.selected, fixture.nested, fixture.leaf, fixture.other].map(|id| *id.as_uuid()).into_iter().collect(),
+            );
+            let retained = fixture.observation(fixture.leaf).await;
+            let other = fixture.observation(fixture.other).await;
+            fixture.apply(&[fixture.selected, fixture.nested, fixture.other, fixture.selected]).await;
+            assert_eq!(fixture.observation(fixture.leaf).await, retained, "retained descendants must not be toggled through inclusion");
+            fixture.apply(&[fixture.nested, fixture.other]).await;
+            assert!(!fixture.observation(fixture.selected).await.excluded);
+            for item in [fixture.nested, fixture.leaf] {
+                let observation = fixture.observation(item).await;
+                assert!(observation.excluded);
+                assert_eq!(observation.generation, 0);
+                assert_eq!(observation.observed_usn, None);
+            }
+            assert_eq!(fixture.observation(fixture.other).await, other, "independent retained roots keep their evidence");
+            fixture.apply(&[fixture.other]).await;
+            for item in [fixture.selected, fixture.nested, fixture.leaf] {
+                let observation = fixture.observation(item).await;
+                assert!(!observation.excluded);
+                assert_eq!(observation.generation, 0);
+                assert_eq!(observation.observed_usn, None);
+            }
+            for (id, code) in [
+                (Uuid::nil(), ProtocolErrorCode::InvalidRequest),
+                (Uuid::new_v4(), ProtocolErrorCode::NotFound),
+            ] {
+                let request = Request::SetSelectiveSync(hfdrive_protocol::SetSelectiveSyncRequest {
+                    operation_id: Uuid::new_v4(), connection_id: *fixture.connection.as_uuid(),
+                    exclude_item_ids: vec![id],
+                });
+                let reply = fixture.provider.dispatch(request, CancellationToken::new()).await;
+                assert_eq!(reply.result.unwrap_err().code, code);
+                assert_eq!(fixture.observation(fixture.other).await, other);
+            }
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            fixture.close().await;
+        }
+
+        #[tokio::test]
+        async fn selective_sync_dispatch_absence_materializes_after_reinclusion_never_deletes() {
+            use sync::observe::{ObservationBatch, RawObservation};
+            use hfdrive_windows::filesystem::WatchAction;
+            let fixture = Fixture::new().await;
+            let sealed = fixture.account.list_common_bases(fixture.connection, fixture.commit).await.unwrap();
+            fixture.apply(&[fixture.selected, fixture.other]).await;
+            fixture.account.begin_scan(fixture.connection, "fixture-volume".to_owned(), "fixture-journal".to_owned()).await.unwrap();
+            fixture.account.complete_scan(fixture.connection, None).await.unwrap();
+            fixture.runtime.ingest_observations(ObservationBatch {
+                observations: ["selected", "selected/nested", "selected/nested/leaf.txt", "other"]
+                    .into_iter().map(|path| RawObservation {
+                        relative_path: path.into(), action: WatchAction::Removed,
+                    }).collect(),
+                rescan_required: false,
+            }).await.unwrap();
+            assert!(fixture.account.scan_state(fixture.connection).await.unwrap().unwrap().may_infer_deletion());
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            assert!(sync::plan::missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap().is_empty());
+
+            let included = fixture.apply(&[]).await;
+            assert!(included.excluded_item_ids.is_empty());
+            let missing = sync::plan::missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+            assert_eq!(missing.len(), 4, "reincluded absence schedules materialization, not local deletion");
+            for item in &missing {
+                let observation = fixture.observation(*item).await;
+                assert!(!observation.excluded && !observation.dirty);
+                assert_eq!(observation.generation, 0);
+                assert_eq!(observation.observed_usn, None);
+            }
+            let remote = Arc::new(CatalogView::new(fixture.records.iter().map(|record| {
+                let content = record.content_version_id.map(|_| (Sha256Digest::of(b"committed"), 9));
+                ItemState::from_record(record, content.map(|(digest, _)| digest), content.map(|(_, size)| size)).unwrap()
+            }).collect()).unwrap());
+            let sources = sync::plan::PlanSources {
+                base: sync::plan::materialization_base(remote.clone(), missing).unwrap(),
+                remote, intents: Vec::new(),
+            };
+            let planned = sync::plan::plan_round(
+                &fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources,
+            ).await.unwrap();
+            assert!(planned.plan.remote_ops.is_empty());
+            assert_eq!(planned.plan.local_actions.len(), 4);
+            let mut facts = HashMap::new();
+            for action in &planned.plan.local_actions {
+                assert_eq!(action.action, hfdrive_core::reconcile::LocalActionKind::CreatePlaceholder);
+                facts.insert(action.action_id, sync::plan::ActionFacts {
+                    source_path: None,
+                    target_path: Some(sync::controller::registry_path(&fixture.account, fixture.connection, action.item_id).await.unwrap()),
+                    expected_file_id: None, expected_generation: None, expected_usn: None,
+                });
+            }
+            sync::plan::persist_plan_records(&fixture.account, fixture.connection, &planned.plan, &facts).await.unwrap();
+            let actions = fixture.account.pending_local_actions(fixture.connection).await.unwrap();
+            assert_eq!(actions.len(), 4);
+            assert!(actions.iter().all(|action| action.kind == hfdrive_state::LocalActionKind::CreatePlaceholder));
+            assert_eq!(fixture.account.list_common_bases(fixture.connection, fixture.commit).await.unwrap(), sealed);
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            fixture.close().await;
+        }
+    }
+
     fn account() -> AccountStatus {
         AccountStatus {
             state: AuthenticationState::SignedIn,
