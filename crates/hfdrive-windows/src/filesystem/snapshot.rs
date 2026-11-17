@@ -1072,10 +1072,10 @@ fn smoke_edited_owned_placeholder_is_recaptured_in_place() {
     let source = root.join("recapture.bin");
     std::fs::write(&source, b"edited placeholder bytes").unwrap();
 
-    let staging = root.join("_smoke-staging");
+    let staging = tempfile::tempdir().expect("create test-owned staging outside the sync root");
     let captured = capture_snapshot_with(
         &source,
-        &staging,
+        staging.path(),
         SnapshotId::new(),
         None,
         PlaceholderPolicy::RecaptureOwned,
@@ -1083,6 +1083,5 @@ fn smoke_edited_owned_placeholder_is_recaptured_in_place() {
     .expect("owned placeholder recaptured in place");
     assert_eq!(std::fs::read(&captured.staged_path).unwrap(), b"edited placeholder bytes");
     assert_eq!(captured.evidence.placeholder, Some(identity));
-    let _ = std::fs::remove_dir_all(&staging);
     let _ = std::fs::remove_file(&source);
 }
