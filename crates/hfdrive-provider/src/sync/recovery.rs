@@ -11,6 +11,11 @@
 //!   128-bit file id), size and modification time are captured before the
 //!   copy and re-verified after it, so a source that changed mid-copy is
 //!   never reported as preserved;
+//! * it is **content-checked**: every preservation and every reuse re-reads
+//!   the source's current bytes through one coherent read (write and delete
+//!   sharing denied) and compares SHA-256 digests. Identity, size and
+//!   timestamps alone cannot tell a file from a same-size, same-timestamp
+//!   replacement — a stale copy is never bound to content it does not hold;
 //! * it is **hash-verified**: the copy's bytes on disk in the recovery area
 //!   are re-hashed and must equal the digest of the bytes read from the
 //!   source. A truncated or corrupted copy is a preservation error and never
@@ -22,7 +27,9 @@
 //!   whose copy still hashes correctly is preserved content already — the
 //!   copy is reused instead of duplicated. Anything else (missing sidecar,
 //!   stale metadata, tampered bytes) is never trusted and never overwritten:
-//!   the next free collision slot is used instead;
+//!   the next free collision slot is used instead. A reuse additionally
+//!   re-hashes the source's **current** bytes and requires them to equal the
+//!   copy's digest before the copy counts as this source's preservation;
 //! * both names of one copy are **reserved with `create_new`**, so a copy
 //!   never overwrites an occupant and no two attempts can take one slot; a
 //!   reservation conflict moves to the next slot, and a failed attempt
@@ -38,6 +45,9 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use hfdrive_windows::filesystem::snapshot::{classify_reparse, copy_hashed_coherent, read_hashed_coherent, CopyError, SourceKind};
+use hfdrive_windows::filesystem::volume::query_file_state;
+use hfdrive_windows::filesystem::FsError;
 use sha2::{Digest, Sha256};
 
 /// Why a preservation copy could not be produced or verified.
@@ -113,7 +123,9 @@ pub fn preserve_item_bytes(
 }
 
 /// Copies `source` to the recovery area with the full metadata and digest
-/// proof described at the module root.
+/// proof described at the module root. The source is read through one
+/// coherent handle (write and delete sharing denied) and its current content
+/// digest is part of the proof: metadata equality never vouches for content.
 pub fn preserve_dirty_copy(
     source: &Path,
     recovery_dir: &Path,
@@ -121,6 +133,7 @@ pub fn preserve_dirty_copy(
     display_path: &str,
 ) -> Result<RecoveryCopy, RecoveryError> {
     std::fs::create_dir_all(recovery_dir).map_err(|_| RecoveryError::AreaUnavailable)?;
+    guard_source(source)?;
     let before = capture(source)?;
     let record = RecoverySource {
         label: label.to_owned(),
@@ -129,7 +142,7 @@ pub fn preserve_dirty_copy(
         file_id: before.file_id,
         size: before.size,
         last_write_time_100ns: before.last_write_time_100ns,
-        sha256: [0u8; 32],
+        sha256: before.sha256,
     };
 
     // Reuse a fully verified previous copy before writing a new one.
@@ -217,13 +230,17 @@ fn reserve_pair(
     }
 }
 
-/// The captured pre-copy facts the copy is verified against.
+/// The captured pre-copy facts the copy is verified against: identity,
+/// size, modification time **and** the SHA-256 of the source's current
+/// bytes. Metadata alone cannot tell a file from a same-size,
+/// same-timestamp replacement; the digest is what binds the copy to content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Captured {
     volume_serial_number: u64,
     file_id: [u8; 16],
     size: u64,
     last_write_time_100ns: i64,
+    sha256: [u8; 32],
 }
 
 /// Deterministic interleaving seams for the preservation regressions. Both
@@ -281,21 +298,54 @@ mod seams {
 }
 
 fn capture(path: &Path) -> Result<Captured, RecoveryError> {
-    let state = hfdrive_windows::filesystem::volume::query_file_state(path).map_err(|error| {
-        // Only a source the OS reports missing is "gone". Every other metadata
-        // failure (sharing violation, access denied, an unreadable volume) is
-        // an unreadable source error, never a claim that nothing is there.
-        match error {
-            hfdrive_windows::filesystem::FsError::NotFound { .. } => RecoveryError::SourceGone,
-            _ => RecoveryError::Unreadable,
-        }
-    })?;
+    // One coherent read (write and delete sharing denied) yields both the
+    // identity/size/mtime facts and the SHA-256 of the exact bytes a copy
+    // would hold. Metadata alone cannot tell a file from a same-size,
+    // same-timestamp replacement, so the content digest is part of every
+    // later comparison.
+    let (state, sha256, _size) = read_hashed_coherent(path).map_err(map_source_error)?;
     Ok(Captured {
         volume_serial_number: state.identity.volume_serial_number,
         file_id: state.identity.file_id,
         size: state.size,
         last_write_time_100ns: state.last_write_time_100ns,
+        sha256,
     })
+}
+
+/// Refuses sources that must never be read or followed: a reparse point that
+/// is not a verified owned HFDR placeholder (junction, mount point, symlink,
+/// another provider's placeholder) is rejected, never followed into another
+/// location. Ordinary files and verified owned placeholders (whose local
+/// dirty bytes are preservable) pass.
+fn guard_source(source: &Path) -> Result<(), RecoveryError> {
+    let state = query_file_state(source).map_err(map_source_error)?;
+    if !state.identity.is_reparse_point() {
+        return Ok(());
+    }
+    let identity = hfdrive_windows::cfapi::ops::read_placeholder_identity(source, None)
+        .map_err(|_| RecoveryError::Unreadable)?;
+    match classify_reparse(state.identity.attributes, state.identity.reparse_tag, identity) {
+        SourceKind::Plain | SourceKind::OwnedPlaceholder(_) => Ok(()),
+        SourceKind::ForeignLink => Err(RecoveryError::Unreadable),
+    }
+}
+
+fn map_source_error(error: FsError) -> RecoveryError {
+    // Only a source the OS reports missing is "gone". Every other failure
+    // (sharing violation, access denied, an unreadable volume) is an
+    // unreadable source error, never a claim that nothing is there.
+    match error {
+        FsError::NotFound { .. } => RecoveryError::SourceGone,
+        _ => RecoveryError::Unreadable,
+    }
+}
+
+fn map_copy_error(error: CopyError) -> RecoveryError {
+    match error {
+        CopyError::Source(error) => map_source_error(error),
+        CopyError::Sink(_) => RecoveryError::WriteFailed,
+    }
 }
 
 fn base_name_hint(display_path: &str) -> String {
@@ -332,11 +382,15 @@ fn existing_candidates(recovery_dir: &Path, hint: &str, label_hash: &str) -> Vec
 }
 
 /// A previous copy counts as already preserved only when its sidecar records
-/// the exact same source identity/size/mtime and the copy's current bytes hash
-/// to the recorded digest. Anything else is never trusted. Even a fully
-/// verified candidate is reused only after the source is re-read and still
-/// matches: a source that changed (or vanished) in the meantime is rejected,
-/// never silently bound to a stale copy.
+/// the exact same source identity/size/mtime **and content digest** and the
+/// copy's current bytes hash to the recorded digest. Anything else is never
+/// trusted. A candidate whose recorded digest differs from the source's
+/// current content is not this content's preservation (a same-size,
+/// same-timestamp replacement looks identical in metadata) — it is skipped,
+/// never reused, and a fresh copy is written. Even a fully verified candidate
+/// is reused only after the source is re-read and still matches: a source
+/// that changed (or vanished) in the meantime is rejected, never silently
+/// bound to a stale copy.
 fn verified_existing(
     target: &Path,
     record: &RecoverySource,
@@ -354,6 +408,11 @@ fn verified_existing(
         return Ok(None);
     };
     if previous.sha256 != digest || metadata_of(&previous) != metadata_of(record) {
+        return Ok(None);
+    }
+    // Content binding: the copy must hold exactly the source's current
+    // bytes, not merely share its identity, size and timestamp.
+    if previous.sha256 != before.sha256 {
         return Ok(None);
     }
     // The candidate is proven — but the reuse claims this copy is the source's
@@ -379,7 +438,9 @@ fn sidecar_name(target: &Path) -> PathBuf {
 }
 
 /// The identity/size/mtime projection a reuse decision compares on (the
-/// digest and label are checked separately).
+/// digest and label are checked separately — and the digest is content
+/// binding, not decoration: metadata equality alone never vouches for
+/// equal bytes).
 fn metadata_of(record: &RecoverySource) -> (&str, u64, [u8; 16], u64, i64) {
     (
         record.label.as_str(),
@@ -390,16 +451,17 @@ fn metadata_of(record: &RecoverySource) -> (&str, u64, [u8; 16], u64, i64) {
     )
 }
 
-/// Streams `source` into the reserved payload handle, re-verifies the
-/// source's metadata and the payload's digest, then writes the reserved
-/// sidecar handle. The durability order is **payload -> sidecar -> success**:
-/// the payload is flushed to stable storage (`File::sync_all`, the same
-/// `FlushFileBuffers` write-through the staged-capture path uses — a rename
-/// helper has no role at these unique reserved names) before the sidecar
-/// record is written, and the sidecar is flushed before the copy is reported
-/// preserved. A crash in between leaves at most an orphan payload that no
-/// sidecar vouches for. On any failure the caller retains the unverified
-/// remnants rather than risking a replacement-aware delete. Returns the digest.
+/// Streams `source` into the reserved payload handle through one coherent
+/// read (write and delete sharing denied), re-verifies the source's metadata
+/// **and content digest**, then writes the reserved sidecar handle. The
+/// durability order is **payload -> sidecar -> success**: the payload is
+/// flushed to stable storage (`File::sync_all`, the same `FlushFileBuffers`
+/// write-through the staged-capture path uses — a rename helper has no role
+/// at these unique reserved names) before the sidecar record is written, and
+/// the sidecar is flushed before the copy is reported as preserved. A crash
+/// in between leaves at most an orphan payload that no sidecar vouches for.
+/// On any failure the caller retains the unverified remnants rather than
+/// risking a replacement-aware delete. Returns the digest.
 fn write_verified(
     source: &Path,
     mut payload: std::fs::File,
@@ -409,9 +471,13 @@ fn write_verified(
     before: &Captured,
     record: &RecoverySource,
 ) -> Result<[u8; 32], RecoveryError> {
-    let (digest, written) = copy_hashed(source, &mut payload)?;
-    let after = capture(source)?;
-    if written != before.size || after != *before {
+    let (state, digest, written) =
+        copy_hashed_coherent(source, &mut payload).map_err(map_copy_error)?;
+    if written != before.size
+        || state.identity.volume_serial_number != before.volume_serial_number
+        || state.identity.file_id != before.file_id
+        || state.last_write_time_100ns != before.last_write_time_100ns
+    {
         // The source changed while it was being preserved: the partially
         // copied payload is never reported preserved and never keeps bytes
         // the caller believes belong to `before`.
@@ -419,6 +485,12 @@ fn write_verified(
     }
     if file_digest(target).as_ref() != Some(&digest) {
         return Err(RecoveryError::DigestMismatch);
+    }
+    // Content binding: the copied bytes must be exactly the source content
+    // observed before the copy. A same-size, same-timestamp replacement shows
+    // up here and is never reported preserved.
+    if digest != before.sha256 {
+        return Err(RecoveryError::SourceChanged);
     }
     // The payload is durable before the sidecar record vouches for it.
     payload.sync_all().map_err(|_| RecoveryError::WriteFailed)?;
@@ -430,29 +502,6 @@ fn write_verified(
     // The sidecar is durable before the copy is reported as preserved.
     sidecar.sync_all().map_err(|_| RecoveryError::WriteFailed)?;
     Ok(digest)
-}
-
-/// Streams `source` to `target` while hashing the bytes read from the source.
-/// Returns the source digest and the number of bytes copied.
-fn copy_hashed(source: &Path, target: &mut std::fs::File) -> Result<([u8; 32], u64), RecoveryError> {
-    let mut input = std::fs::File::open(source).map_err(|_| RecoveryError::SourceGone)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut written = 0u64;
-    loop {
-        let read = input.read(&mut buffer).map_err(|_| RecoveryError::Unreadable)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        target.write_all(&buffer[..read]).map_err(|_| RecoveryError::WriteFailed)?;
-        written = written.saturating_add(read as u64);
-    }
-    target.flush().map_err(|_| RecoveryError::WriteFailed)?;
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok((out, written))
 }
 
 fn file_digest(path: &Path) -> Option<[u8; 32]> {
@@ -591,5 +640,72 @@ mod tests {
         std::fs::write(&source, b"bytes").unwrap();
         let copy = preserve_item_bytes(&source, &recovery, "item-a", "src.txt").unwrap();
         assert!(copy.is_some(), "resident dirty bytes always produce a verified copy");
+    }
+
+    #[test]
+    fn equal_length_same_timestamp_replacement_is_never_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = root.path().join("recovery");
+        let source = root.path().join("src.txt");
+        std::fs::write(&source, b"AAAAAAAA").unwrap();
+        let original =
+            hfdrive_windows::filesystem::volume::query_file_state(&source).unwrap();
+        let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let first = preserve_dirty_copy(&source, &recovery, "item-a", "src.txt").unwrap();
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"AAAAAAAA");
+
+        // Same file, same length, same modification time — different bytes.
+        // Metadata equality alone cannot tell the two apart; only the content
+        // binding can, and it must refuse to bind the stale copy.
+        std::fs::write(&source, b"BBBBBBBB").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&source).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        drop(file);
+        let replaced =
+            hfdrive_windows::filesystem::volume::query_file_state(&source).unwrap();
+        assert_eq!(replaced.size, original.size, "same length");
+        assert_eq!(
+            replaced.last_write_time_100ns, original.last_write_time_100ns,
+            "the replacement carries the original timestamp"
+        );
+        assert_eq!(replaced.identity.file_id, original.identity.file_id, "same identity");
+
+        let second = preserve_dirty_copy(&source, &recovery, "item-a", "src.txt").unwrap();
+        assert_ne!(
+            second.path, first.path,
+            "a same-size/same-timestamp replacement never reuses the stale copy"
+        );
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"AAAAAAAA", "the old copy is retained");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"BBBBBBBB", "the new copy holds the new bytes");
+        assert_ne!(
+            first.source.sha256, second.source.sha256,
+            "the sidecars bind different content digests"
+        );
+    }
+
+    #[test]
+    fn a_live_writer_never_produces_a_preserved_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = root.path().join("recovery");
+        let source = root.path().join("src.txt");
+        std::fs::write(&source, b"live bytes").unwrap();
+        // Hold the file with write access: every preservation read denies
+        // write sharing, so a concurrent writer must fail the preservation
+        // instead of yielding a torn or stale copy.
+        let holder = std::fs::OpenOptions::new().write(true).open(&source).unwrap();
+        let result = preserve_dirty_copy(&source, &recovery, "item-a", "src.txt");
+        drop(holder);
+        assert!(
+            matches!(result, Err(RecoveryError::Unreadable)),
+            "a source that cannot be read coherently is never reported preserved"
+        );
+        let claimed: Vec<_> = std::fs::read_dir(&recovery)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            claimed.is_empty(),
+            "no copy slot holds bytes for a refused preservation: {claimed:?}"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"live bytes", "the source is untouched");
     }
 }

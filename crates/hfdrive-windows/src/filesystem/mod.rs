@@ -15,7 +15,10 @@
 //! data) are refused outright; the caller materializes them first. Identity
 //! (volume serial + 128-bit file ID), size, timestamps and, when the volume
 //! has a USN journal, the file's USN are recorded as evidence so the provider
-//! can bind its database generation to what was actually read.
+//! can bind its database generation to what was actually read — metadata
+//! equality alone never proves equal content. A reparse point is captured
+//! only as a **verified owned HFDR placeholder** recaptured in place; every
+//! foreign link is rejected and never followed.
 
 use std::path::PathBuf;
 
@@ -29,7 +32,11 @@ pub mod watch;
 
 pub use enumerate::{scan_metadata, MetadataEntry, ScanBudget, ScanReport, VisitFlow};
 pub use names::{decode_component, validate_component, windows_case_equivalent, windows_exact_equal, NameCheckError};
-pub use snapshot::{capture_snapshot, CapturedSnapshot, SnapshotEvidence, SnapshotWarning};
+pub use snapshot::{
+    capture_snapshot, capture_snapshot_with, classify_reparse, copy_hashed_coherent,
+    read_hashed_coherent, CapturedSnapshot, CopyError, PlaceholderPolicy, SnapshotEvidence,
+    SnapshotWarning, SourceKind,
+};
 pub use usn::{CatchUp, ResetReason, UsnChange, UsnCursor, UsnJournal, UsnReader};
 pub use validate::{validate_sync_root, RootContext, ValidatedRoot};
 pub use volume::{
