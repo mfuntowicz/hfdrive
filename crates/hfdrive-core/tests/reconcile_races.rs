@@ -2,11 +2,11 @@
 //! reconciliation: every race family, conflict retry identity/name
 //! stability, incomplete-context refusal, and read-only behaviour.
 
-use hfdrive_core::format::{DisplayMetadata, ItemKind};
+use hfdrive_core::format::{DisplayMetadata, ItemKind, MAX_COMMIT_OPERATIONS};
 use hfdrive_core::ids::{ItemId, OperationId, UploadId, VersionId, WorkspaceId};
 use hfdrive_core::reconcile::{
-    conflict_identity, conflict_name, reconcile, CatalogView, ConflictKind, ConflictNames,
-    ConflictOutcome, DeterministicIds, IntentOutcomeKind, ItemState, LocalActionKind,
+    conflict_identity, conflict_name, reconcile, CatalogView, CommitBatch, ConflictKind,
+    ConflictNames, ConflictOutcome, DeterministicIds, IntentOutcomeKind, ItemState, LocalActionKind,
     LocalChange, LocalIntent, LocalOrigin, MissingRef, NewContent, NtfsNameCompare, OrdinalIgnoreCase,
     ReconcileError, ReconcileInput, ReconcileMode, ReconcilePlan,
 };
@@ -164,6 +164,22 @@ fn outcome_of(plan: &ReconcilePlan, operation: OperationId) -> IntentOutcomeKind
         .find(|i| i.operation_id == operation)
         .expect("intent outcome present")
         .outcome
+}
+
+/// The exact operation-id set a batch must claim: every id referenced by the
+/// batch's own records, ascending. `CommitBatch::operation_ids` must equal
+/// this recomputation over just the batch's records.
+fn batch_ids(batch: &CommitBatch) -> Vec<OperationId> {
+    let mut ids = std::collections::BTreeSet::new();
+    for op in &batch.remote_ops {
+        ids.insert(op.record.item_revision);
+        ids.insert(op.record.content_operation);
+        ids.insert(op.record.location_operation);
+        if let Some(deleted) = op.record.deletion_operation {
+            ids.insert(deleted);
+        }
+    }
+    ids.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +926,227 @@ fn commit_batches_cover_every_op_in_order_without_truncation() {
     }
     // Invalid bounds are refused instead of silently truncating.
     assert!(plan.commit_batches(0, 1000).is_err());
+}
+
+#[test]
+fn commit_batches_three_creates_split_at_the_two_two_limits() {
+    let base = view(vec![root_state()]);
+    let remote = base.clone();
+    let local: Vec<LocalIntent> = (0u128..3)
+        .map(|n| {
+            edit(
+                op(0x0001 + n),
+                uid(0x1000_0000_0000_4000_8000_0000_0000_0000 + n),
+                LocalChange::Create {
+                    parent_id: uid(ROOT),
+                    name: format!("f{n}.txt"),
+                    kind: ItemKind::File,
+                    content: Some(new_content(&format!("v{n}"), n as u8 + 1, 1)),
+                },
+            )
+        })
+        .collect();
+    let plan = run(ReconcileMode::Writable, &base, &local, &remote);
+    assert_eq!(plan.remote_ops.len(), 3);
+
+    let batches = plan.commit_batches(2, 2).expect("batches");
+    assert_eq!(batches.len(), 2, "three creates split into [2, 1] at the (2, 2) limits");
+    assert_eq!(batches[0].index, 0);
+    assert_eq!(batches[1].index, 1);
+    assert_eq!(batches[0].remote_ops.len(), 2);
+    assert_eq!(batches[1].remote_ops.len(), 1);
+
+    // Exact, disjoint id sets: each batch claims only its own records' ids.
+    assert_eq!(batches[0].operation_ids, vec![op(0x0001), op(0x0002)]);
+    assert_eq!(batches[1].operation_ids, vec![op(0x0003)]);
+    for batch in &batches {
+        assert_eq!(
+            batch.operation_ids,
+            batch_ids(batch),
+            "ids are recomputed from the batch's own records"
+        );
+        assert!(batch.operation_ids.len() <= 2, "operation bound preserved");
+        assert!(batch.changes.len() <= 2, "change bound preserved");
+        assert_eq!(batch.changes.len(), batch.remote_ops.len());
+        let mut sorted = batch.changes.clone();
+        sorted.sort_by_key(|c| c.item_id);
+        assert_eq!(batch.changes, sorted, "changes ascend by item id");
+    }
+    let mut disjoint = std::collections::BTreeSet::new();
+    for batch in &batches {
+        for id in &batch.operation_ids {
+            assert!(disjoint.insert(*id), "each operation id is claimed by exactly one batch");
+        }
+    }
+    let union: Vec<OperationId> = disjoint.into_iter().collect();
+    assert_eq!(union, plan.operation_ids, "the batches claim the realized ids exactly once");
+
+    // Recovery semantics: contiguous prefixes in plan order, no truncation.
+    let flat: Vec<_> = batches.iter().flat_map(|b| b.remote_ops.iter()).collect();
+    assert_eq!(flat.len(), plan.remote_ops.len());
+    for (a, b) in flat.into_iter().zip(plan.remote_ops.iter()) {
+        assert_eq!(a, b, "batch concatenation reproduces the plan order");
+    }
+
+    // Bounds still refuse unsatisfiable input.
+    assert!(plan.commit_batches(0, 2).is_err());
+    assert!(plan.commit_batches(2, 0).is_err());
+    // Deterministic: re-running produces identical batches.
+    assert_eq!(batches, plan.commit_batches(2, 2).expect("batches"));
+}
+
+#[test]
+fn commit_batches_operation_ids_are_exact_and_disjoint_after_a_split() {
+    // A content edit merged with a remote rename emits one record referencing
+    // two distinct operation ids; the two creates reference one each. A split
+    // must recompute the incoming op's ids against a fresh set instead of
+    // retaining the previous batch's ids.
+    let base = view(vec![
+        root_state(),
+        file_state(uid(ITEM_A), uid(ROOT), "old.txt", ver("v0"), digest(0), 10, op(0x2000)),
+    ]);
+    let remote = view(vec![
+        root_state(),
+        file_state(uid(ITEM_A), uid(ROOT), "new.txt", ver("v0"), digest(0), 10, op(0x3000)),
+    ]);
+    let x1 = uid(0x1000_0000_0000_4000_8000_0000_0000_0001);
+    let x2 = uid(0x1000_0000_0000_4000_8000_0000_0000_0002);
+    let local = vec![
+        edit(
+            op(0x0001),
+            uid(ITEM_A),
+            LocalChange::Content { content: new_content("v1", 1, 11) },
+        ),
+        edit(
+            op(0x0002),
+            x1,
+            LocalChange::Create {
+                parent_id: uid(ROOT),
+                name: "a.txt".to_owned(),
+                kind: ItemKind::File,
+                content: Some(new_content("va", 2, 1)),
+            },
+        ),
+        edit(
+            op(0x0003),
+            x2,
+            LocalChange::Create {
+                parent_id: uid(ROOT),
+                name: "b.txt".to_owned(),
+                kind: ItemKind::File,
+                content: Some(new_content("vb", 3, 1)),
+            },
+        ),
+    ];
+    let plan = run(ReconcileMode::Writable, &base, &local, &remote);
+    assert_eq!(plan.remote_ops.len(), 3);
+
+    // The merged edit record references its own content operation and the
+    // remote rename operation.
+    let edit_op = plan
+        .remote_ops
+        .iter()
+        .find(|o| o.item_id() == uid(ITEM_A))
+        .expect("edit upsert");
+    assert_eq!(edit_op.record.content_operation, op(0x0001));
+    assert_eq!(edit_op.record.location_operation, op(0x3000));
+
+    // Two changes fit, but the edit's second id forces the split.
+    let batches = plan.commit_batches(10, 2).expect("batches");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].remote_ops.len(), 2);
+    assert_eq!(batches[1].remote_ops.len(), 1);
+    assert_eq!(batches[0].operation_ids, vec![op(0x0002), op(0x0003)], "the creates only");
+    assert_eq!(
+        batches[1].operation_ids,
+        vec![op(0x0001), op(0x3000)],
+        "the split batch recomputes the incoming op's ids from a fresh set"
+    );
+    for batch in &batches {
+        assert_eq!(batch.operation_ids, batch_ids(batch));
+    }
+    let mut disjoint = std::collections::BTreeSet::new();
+    for batch in &batches {
+        for id in &batch.operation_ids {
+            assert!(disjoint.insert(*id), "batches claim disjoint id sets");
+        }
+    }
+    let union: Vec<OperationId> = disjoint.into_iter().collect();
+    assert_eq!(union, plan.operation_ids);
+    assert_eq!(plan.operation_ids.len(), 4);
+    // Deterministic: re-running produces identical batches.
+    assert_eq!(batches, plan.commit_batches(10, 2).expect("batches"));
+}
+
+#[test]
+fn commit_batches_split_exactly_at_the_1001_operation_boundary() {
+    let build = |count: u128| -> ReconcilePlan {
+        let base = view(vec![root_state()]);
+        let remote = base.clone();
+        let local: Vec<LocalIntent> = (0..count)
+            .map(|n| {
+                edit(
+                    op(0x0001 + n),
+                    uid(0x1000_0000_0000_4000_8000_0000_0000_0000 + n),
+                    LocalChange::Create {
+                        parent_id: uid(ROOT),
+                        name: format!("f{n}.txt"),
+                        kind: ItemKind::File,
+                        content: Some(new_content(&format!("v{n}"), (n % 251) as u8, 1)),
+                    },
+                )
+            })
+            .collect();
+        run(ReconcileMode::Writable, &base, &local, &remote)
+    };
+
+    // Exactly at the v1 commit bound: one batch, no split.
+    let at_bound = build(MAX_COMMIT_OPERATIONS as u128);
+    assert_eq!(at_bound.remote_ops.len(), MAX_COMMIT_OPERATIONS);
+    let one = at_bound
+        .commit_batches(MAX_COMMIT_OPERATIONS, MAX_COMMIT_OPERATIONS)
+        .expect("batches");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].remote_ops.len(), MAX_COMMIT_OPERATIONS);
+    assert_eq!(one[0].operation_ids.len(), MAX_COMMIT_OPERATIONS);
+    assert_eq!(one[0].operation_ids, batch_ids(&one[0]));
+
+    // One past the bound: 1000 + 1, never truncation and never leakage.
+    let over = build(MAX_COMMIT_OPERATIONS as u128 + 1);
+    assert_eq!(over.remote_ops.len(), MAX_COMMIT_OPERATIONS + 1);
+    let batches = over
+        .commit_batches(MAX_COMMIT_OPERATIONS, MAX_COMMIT_OPERATIONS)
+        .expect("batches");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].remote_ops.len(), MAX_COMMIT_OPERATIONS);
+    assert_eq!(batches[1].remote_ops.len(), 1);
+    assert_eq!(batches[0].operation_ids.len(), MAX_COMMIT_OPERATIONS);
+    assert_eq!(
+        batches[1].operation_ids,
+        vec![op(0x0001 + MAX_COMMIT_OPERATIONS as u128)],
+        "the trailing batch carries only its own operation id"
+    );
+    for batch in &batches {
+        assert_eq!(batch.operation_ids, batch_ids(batch));
+        assert!(batch.operation_ids.len() <= MAX_COMMIT_OPERATIONS);
+        assert!(batch.changes.len() <= MAX_COMMIT_OPERATIONS);
+    }
+    let mut disjoint = std::collections::BTreeSet::new();
+    for batch in &batches {
+        for id in &batch.operation_ids {
+            assert!(disjoint.insert(*id), "batches claim disjoint id sets");
+        }
+    }
+    let union: Vec<OperationId> = disjoint.into_iter().collect();
+    assert_eq!(union, over.operation_ids);
+    assert_eq!(over.operation_ids.len(), MAX_COMMIT_OPERATIONS + 1);
+
+    // Recovery semantics: contiguous prefixes in plan order, no truncation.
+    let flat: Vec<_> = batches.iter().flat_map(|b| b.remote_ops.iter()).collect();
+    assert_eq!(flat.len(), over.remote_ops.len());
+    for (a, b) in flat.into_iter().zip(over.remote_ops.iter()) {
+        assert_eq!(a, b, "batch concatenation reproduces the plan order");
+    }
 }
 
 #[test]

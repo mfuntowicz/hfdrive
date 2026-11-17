@@ -845,7 +845,9 @@ impl ReconcilePlan {
     /// and references at most `max_operations` distinct operation ids (the
     /// v1 commit bounds are 1000 and 1000). Every op lands in exactly one
     /// batch, in the original order, so partial publication is resumable but
-    /// never counts as a completed operation.
+    /// never counts as a completed operation. Each batch's `operation_ids` is
+    /// recomputed from a fresh set over only its own records: a batch never
+    /// inherits ids from the batches before it.
     pub fn commit_batches(
         &self,
         max_changes: usize,
@@ -858,19 +860,28 @@ impl ReconcilePlan {
         let mut current: Vec<RemoteOp> = Vec::new();
         let mut current_ops: BTreeSet<OperationId> = BTreeSet::new();
         for op in &self.remote_ops {
+            // The incoming op's ids are computed against the current batch's
+            // set; after a split they are recomputed against a fresh, empty
+            // set so a batch never inherits the previous batch's ids.
             let mut next_ops = current_ops.clone();
             record_ops(&op.record, &mut next_ops);
             if !current.is_empty()
                 && (current.len() + 1 > max_changes || next_ops.len() > max_operations)
             {
-                batches.push(make_batch(batches.len(), &mut current, &mut current_ops));
+                // The batch takes the accumulated ops as they stand; the op
+                // that triggered the split starts the next batch, so its ids
+                // are recomputed against a fresh, empty set instead of the
+                // previous batch's.
+                batches.push(make_batch(batches.len(), &mut current, &current_ops));
+                next_ops = BTreeSet::new();
+                record_ops(&op.record, &mut next_ops);
             }
-            current_ops = next_ops;
-            if current_ops.len() > max_operations {
+            if next_ops.len() > max_operations {
                 // One operation referencing more ids than the bound cannot be
                 // truncated; refuse instead of splitting it.
                 return Err(ReconcileError::InvalidBatchBound);
             }
+            current_ops = next_ops;
             current.push(op.clone());
         }
         if !current.is_empty() {
@@ -883,7 +894,7 @@ impl ReconcilePlan {
 fn make_batch(
     index: usize,
     current: &mut Vec<RemoteOp>,
-    current_ops: &mut BTreeSet<OperationId>,
+    current_ops: &BTreeSet<OperationId>,
 ) -> CommitBatch {
     let mut changes: Vec<ItemChange> = current
         .iter()
