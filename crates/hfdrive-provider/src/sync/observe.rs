@@ -61,6 +61,9 @@ pub enum Classification {
     Echo { item_id: ItemId },
     /// Inside an excluded selective-sync subtree: bookkeeping only.
     Excluded,
+    /// Clean presence after inclusion: restore deletion evidence without
+    /// creating a local edit or clearing a newer generation.
+    Materialized { item_id: ItemId, observed_usn: Option<u64> },
     /// A brand-new local item (file or directory).
     Created {
         item_id: ItemId,
@@ -81,6 +84,24 @@ pub enum Classification {
     RescanRequired,
     /// Noise (unrelated files, partial state, unsupported entries).
     Ignored,
+}
+
+fn clean_presence_classification(
+    item_id: ItemId,
+    observation: Option<&hfdrive_state::LocalObservation>,
+    observed_usn: Option<u64>,
+    in_sync: bool,
+) -> Option<Classification> {
+    let usn_matches = observed_usn.is_some()
+        && observation.is_some_and(|observation| observation.observed_usn == observed_usn);
+    if !in_sync && !usn_matches {
+        return None;
+    }
+    Some(if observation.is_some_and(|observation| observation.generation == 0 && !observation.dirty) {
+        Classification::Materialized { item_id, observed_usn }
+    } else {
+        Classification::Ignored
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -610,18 +631,19 @@ pub async fn classify_observation(
 
     if !matches!(action, WatchAction::Removed | WatchAction::RenamedFrom | WatchAction::RenamedTo) {
         if let (Some(item_id), Some(live)) = (item_id, live.as_ref()) {
-            if hfdrive_windows::filesystem::volume::placeholder_state(
-                live.identity.attributes, live.identity.reparse_tag,
-            ).is_in_sync() {
-                return Classification::Ignored;
-            }
-            if let (Some(usn), Ok(Some(observation))) = (
+            let observation = match state.observation(connection, item_id).await {
+                Ok(observation) => observation,
+                Err(_) => return Classification::RescanRequired,
+            };
+            if let Some(classification) = clean_presence_classification(
+                item_id,
+                observation.as_ref(),
                 live.usn.and_then(|usn| u64::try_from(usn).ok()),
-                state.observation(connection, item_id).await,
+                hfdrive_windows::filesystem::volume::placeholder_state(
+                    live.identity.attributes, live.identity.reparse_tag,
+                ).is_in_sync(),
             ) {
-                if observation.observed_usn == Some(usn) {
-                    return Classification::Ignored;
-                }
+                return classification;
             }
         }
     }
@@ -785,6 +807,30 @@ mod tests {
     use super::*;
     use hfdrive_core::ids::ConnectionId;
     use hfdrive_state::LocalActionKind;
+
+    #[test]
+    fn clean_presence_materializes_generation_zero_without_hiding_newer_work() {
+        let item_id = ItemId::new();
+        let mut observation = hfdrive_state::LocalObservation {
+            connection_id: ConnectionId::new(), item_id, generation: 0, observed_usn: None,
+            dirty: false, pin_requested: false, pin_complete: false, excluded: false, scan_epoch: 0,
+        };
+        assert_eq!(
+            clean_presence_classification(item_id, Some(&observation), Some(17), true),
+            Some(Classification::Materialized { item_id, observed_usn: Some(17) }),
+        );
+        assert_eq!(clean_presence_classification(item_id, Some(&observation), None, false), None);
+        observation.observed_usn = Some(17);
+        assert_eq!(
+            clean_presence_classification(item_id, Some(&observation), Some(17), false),
+            Some(Classification::Materialized { item_id, observed_usn: Some(17) }),
+        );
+        assert_eq!(clean_presence_classification(item_id, Some(&observation), Some(18), false), None);
+        observation.dirty = true;
+        assert_eq!(clean_presence_classification(item_id, Some(&observation), Some(17), true), Some(Classification::Ignored));
+        observation.generation = 2;
+        assert_eq!(clean_presence_classification(item_id, Some(&observation), Some(17), true), Some(Classification::Ignored));
+    }
 
     fn action(item_id: ItemId, state: LocalActionState) -> LocalAction {
         LocalAction {

@@ -14,8 +14,8 @@
 //! Non-conflict identifiers are supplied by this side ([`RandomIds`]) and the
 //! produced local actions/conflicts are persisted **before** any effect runs.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use hfdrive_core::catalog::{CatalogReader, CatalogRoot, PageSource};
 use hfdrive_core::format::{self, ItemRecord};
@@ -211,6 +211,68 @@ pub async fn build_base_view<D: DigestSource>(
         items.push(ItemState::from_record(&record, sha256, size)?);
     }
     Ok(CatalogView::new(items)?)
+}
+
+/// Included generation-zero items are materialization candidates only if
+/// their registry path is actually missing. Present items retain their
+/// base until local discovery can observe them; unreadable paths fail closed.
+pub(crate) async fn missing_materializations(
+    state: &AccountStore,
+    connection: ConnectionId,
+    root: &Path,
+) -> Result<HashSet<ItemId>, PlanError> {
+    let mut missing = HashSet::new();
+    for item in state.unmaterialized_items(connection).await? {
+        if item.parent_id.is_none()
+            || crate::sync::observe::excluded_here(state, connection, item.item_id).await
+        {
+            continue;
+        }
+        let path = crate::sync::controller::registry_path(state, connection, item.item_id)
+            .await.ok_or_else(|| PlanError::MissingContext("materialization item path".to_owned()))?;
+        match std::fs::symlink_metadata(root.join(path)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.insert(item.item_id);
+            }
+            Err(_) => return Err(PlanError::MissingContext("materialization path is unreadable".to_owned())),
+        }
+    }
+    Ok(missing)
+}
+
+/// Builds a planning-only base that treats missing selected items as not yet
+/// materialized. Removing their descendants preserves parent closure, even if
+/// a descendant still has older observation evidence. The sealed common-base
+/// rows are untouched; the unchanged remote view then plans guarded creates.
+pub(crate) fn materialization_base(
+    base: CatalogView,
+    mut missing: HashSet<ItemId>,
+) -> Result<CatalogView, PlanError> {
+    if let Some(root) = base.root_id() {
+        missing.remove(&root);
+    }
+    missing.retain(|item| base.contains(*item));
+    if missing.is_empty() {
+        return Ok(base);
+    }
+    let mut children: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+    for item in base.iter() {
+        if let Some(parent) = item.parent_id {
+            children.entry(parent).or_default().push(item.item_id);
+        }
+    }
+    let mut pending: Vec<_> = missing.iter().copied().collect();
+    while let Some(parent) = pending.pop() {
+        if let Some(descendants) = children.get(&parent) {
+            for &child in descendants {
+                if missing.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    Ok(CatalogView::new(base.iter().filter(|item| !missing.contains(&item.item_id)).cloned().collect())?)
 }
 
 /// Walks the committed remote catalog into a complete namespace view.
@@ -658,6 +720,58 @@ impl<R: RemoteOps> DigestSource for RemoteDigests<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn materialization_base_keeps_present_items_and_removes_missing_parent_descendants() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let missing_parent = ItemId::new();
+        let descendant = ItemId::new();
+        let present = ItemId::new();
+        let revision = OperationId::new();
+        let root = ItemRecord {
+            item_id: fixture.root_item, parent_id: None, name: String::new(),
+            kind: format::ItemKind::Directory, item_revision: revision,
+            content_version_id: None, deleted: false, content_operation: revision,
+            location_operation: revision, deletion_operation: None,
+        };
+        let records = vec![
+            root.clone(),
+            ItemRecord { item_id: missing_parent, parent_id: Some(fixture.root_item), name: "missing".to_owned(), ..root.clone() },
+            ItemRecord { item_id: descendant, parent_id: Some(missing_parent), name: "child".to_owned(), ..root.clone() },
+            ItemRecord { item_id: present, parent_id: Some(fixture.root_item), name: "present".to_owned(), ..root },
+        ];
+        for record in &records {
+            fixture.account.upsert_item(registry_item(fixture.connection, record, None, None, None)).await.unwrap();
+        }
+        let commit = CommitId::new();
+        record_common_bases(&fixture.account, fixture.connection, commit, &records).await.unwrap();
+        let sealed = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, fixture.root_item, true).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, fixture.root_item, false).await.unwrap();
+        fixture.account.bump_observation(fixture.connection, descendant, Some(13)).await.unwrap();
+        fixture.account.set_observation_flags(fixture.connection, descendant, hfdrive_state::ObservationFlags {
+            dirty: Some(false), ..Default::default()
+        }).await.unwrap();
+        std::fs::create_dir(fixture.root.join("present")).unwrap();
+
+        let missing = missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+        assert_eq!(missing, HashSet::from([missing_parent]));
+        let remote = CatalogView::new(records.iter().map(|record| ItemState::from_record(record, None, None).unwrap()).collect()).unwrap();
+        let base = materialization_base(remote.clone(), missing).unwrap();
+        assert!(base.contains(present), "a present generation-zero item must retain its base");
+        assert!(!base.contains(missing_parent));
+        assert!(!base.contains(descendant), "omission must preserve parent closure");
+        let sources = PlanSources { base, remote, intents: Vec::new(), names: HashMap::new() };
+        let planned = plan_round(&fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources).await.unwrap();
+        assert!(planned.plan.remote_ops.is_empty());
+        assert_eq!(planned.plan.local_actions.len(), 2);
+        assert!(planned.plan.local_actions.iter().all(|action| {
+            action.action == hfdrive_core::reconcile::LocalActionKind::CreatePlaceholder
+                && action.expected.is_none()
+        }));
+        assert_eq!(fixture.account.list_common_bases(fixture.connection, commit).await.unwrap(), sealed);
+        fixture.state.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn common_base_view_selects_only_the_applied_commit() {

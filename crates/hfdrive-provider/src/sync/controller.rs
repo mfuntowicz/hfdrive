@@ -193,6 +193,14 @@ pub struct ConnectionRuntime<R: RemoteOps> {
     health: watch::Sender<ConnectionHealth>,
     echo: tokio::sync::Mutex<EchoTable>,
     pending_removals: tokio::sync::Mutex<PendingRemovals>,
+    /// Serializes selective-sync transitions with observation classification
+    /// and deletion inference. Acquired before the echo/pending-removal locks.
+    selection: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    scan_deletion_gate: std::sync::Mutex<Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>>,
     /// Held across each drive round so quiescence can await exactly the
     /// in-flight dispatch instead of guessing at pause timing.
     dispatch: tokio::sync::Mutex<()>,
@@ -593,6 +601,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             health: health_tx,
             echo: tokio::sync::Mutex::new(EchoTable::default()),
             pending_removals: tokio::sync::Mutex::new(PendingRemovals::default()),
+            selection: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            scan_deletion_gate: std::sync::Mutex::new(None),
             dispatch: tokio::sync::Mutex::new(()),
             active_round: std::sync::Mutex::new(None),
             pump: tokio::sync::Mutex::new(None),
@@ -1521,6 +1532,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         batch: crate::sync::observe::ObservationBatch,
         source: ObservationSource,
     ) -> Result<(), ()> {
+        let _selection = self.selection.lock().await;
         let result: Result<(), ()> = async {
             if batch.rescan_required {
                 self.scan_requested.store(true, Ordering::Release);
@@ -1548,6 +1560,10 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                     Classification::Echo { .. }
                     | Classification::Excluded
                     | Classification::Ignored => {}
+                    Classification::Materialized { item_id, observed_usn } => {
+                        self.state.record_materialized(self.config.connection_id, item_id, observed_usn)
+                            .await.map_err(|_| ())?;
+                    }
                     Classification::RescanRequired => {
                         self.scan_requested.store(true, Ordering::Release);
                         self.state.invalidate_scan(self.config.connection_id).await.map_err(|_| ())?;
@@ -1751,15 +1767,30 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             if !completed.may_infer_deletion() {
                 return Err("Local discovery was invalidated; no deletions were inferred");
             }
+            // Earlier scan ingestion has released its selection guard. Keep
+            // this separate guard through every evidence read and intent write.
+            let _selection = self.selection.lock().await;
             let explicit: std::collections::HashSet<_> =
                 self.pending_removals.lock().await.release(true).into_iter().collect();
             let seen: std::collections::HashSet<_> = entries.iter().map(|entry| entry.relative_path.as_path()).collect();
             let by_id: std::collections::HashMap<_, _> = known.iter().map(|item| (item.item_id, item)).collect();
             for item in &known {
                 if item.item_id == self.config.root_item_id { continue; }
-                if !explicit.contains(&item.item_id)
-                    && self.state.observation(self.config.connection_id, item.item_id).await
-                        .map_err(|_| "Local observation state is unavailable")?.is_none()
+                let observation = self.state.observation(self.config.connection_id, item.item_id).await
+                    .map_err(|_| "Local observation state is unavailable")?;
+                #[cfg(test)]
+                {
+                    let gate = self.scan_deletion_gate.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+                    if let Some((reached, resume)) = gate {
+                        let _ = reached.send(());
+                        let _ = resume.await;
+                    }
+                }
+                // Selection journals generation zero without proving local
+                // presence. Its absence must materialize, never tombstone.
+                if observation.as_ref().is_some_and(|observation| observation.generation == 0)
+                    || (!explicit.contains(&item.item_id) && observation.is_none())
                 { continue; }
                 let mut names = Vec::new();
                 let mut current = item;
@@ -1777,7 +1808,7 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
                             &self.state, self.config.connection_id, self.config.root_item_id,
                             &self.config.root, &echo, &path,
                             hfdrive_windows::filesystem::WatchAction::Removed, now_ms(),
-                        ).await, Classification::Echo { .. }) {
+                        ).await, Classification::Echo { .. } | Classification::Excluded) {
                             continue;
                         }
                         drop(echo);
@@ -2108,30 +2139,23 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
         }
     }
 
-    /// Sets the selective-sync exclusion of one subtree. Excluding dirty or
-    /// pinned content is refused (the caller surfaces the affected work for
-    /// explicit user review); exclusions never publish deletions.
+    /// Journals the selective-sync exclusion of a root and every descendant
+    /// atomically. Any dirty or pin-requested member refuses exclusion before
+    /// any flag changes; neither exclusion nor inclusion publishes deletions.
     pub async fn set_excluded(&self, item_id: ItemId, excluded: bool) -> Result<(), PublishError> {
-        if excluded {
-            let busy = self
-                .state
-                .observation(self.config.connection_id, item_id)
-                .await?
-                .map(|o| o.dirty || o.pin_requested)
-                .unwrap_or(false);
-            if busy {
-                return Err(PublishError::LocalApply(
-                    "dirty or pinned content must be resolved before exclusion",
-                ));
-            }
+        let _selection = self.selection.lock().await;
+        if !self.state
+            .set_subtree_excluded(self.config.connection_id, item_id, excluded)
+            .await?
+        {
+            return Err(PublishError::LocalApply(
+                "dirty or pinned content must be resolved before exclusion",
+            ));
         }
-        self.state
-            .set_observation_flags(
-                self.config.connection_id,
-                item_id,
-                ObservationFlags { excluded: Some(excluded), ..ObservationFlags::default() },
-            )
-            .await?;
+        if !excluded {
+            self.scan_requested.store(true, Ordering::Release);
+            self.reconcile_requested.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -2246,14 +2270,9 @@ impl<R: RemoteOps> ConnectionRuntime<R> {
             match decision {
                 crate::sync::apply::RecoveryDecision::Done => {
                     let mut echo = self.echo.lock().await;
-                    self.state
-                        .set_local_action_state(
-                            self.config.connection_id,
-                            action.action_id,
-                            LocalActionState::Recovered,
-                        )
-                        .await?;
-                    echo.note_applied(&action, &self.config.root);
+                    crate::sync::apply::complete_action(
+                        &self.state, &action, &self.config.root, LocalActionState::Recovered, &mut echo,
+                    ).await?;
                 }
                 crate::sync::apply::RecoveryDecision::Retry => {
                     self.state.set_local_action_state(
@@ -2365,6 +2384,530 @@ pub async fn registry_path(
 mod tests {
     use super::*;
     use crate::sync::cfapi_pump::PumpOutcome;
+
+    async fn wait_for_selective_scan(
+        runtime: &ConnectionRuntime<crate::sync::test_support::HeadOnlyRemote>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.local_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_inclusion_waits_for_stale_scan_evidence() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let item = local_item(&fixture, "excluded.txt").await;
+        fixture.account.bump_observation(fixture.connection, item, Some(31)).await.unwrap();
+        fixture.account.set_observation_flags(fixture.connection, item, ObservationFlags {
+            dirty: Some(false), ..Default::default()
+        }).await.unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+        runtime.set_excluded(item, true).await.unwrap();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *runtime.scan_deletion_gate.lock().unwrap() = Some((reached_tx, resume_rx));
+        runtime.start_observer().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx).await.unwrap().unwrap();
+
+        // The completed scan has read the old nonzero generation, but has
+        // not yet classified absence. Inclusion cannot reset that evidence
+        // underneath the scan's classification and intent persistence.
+        let inclusion = runtime.set_excluded(item, false);
+        tokio::pin!(inclusion);
+        tokio::select! {
+            biased;
+            result = &mut inclusion => panic!("inclusion crossed the scan evidence boundary: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        let old = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+        assert!(old.excluded);
+        assert_eq!(old.generation, 1);
+        resume_tx.send(()).unwrap();
+        inclusion.await.unwrap();
+        wait_for_selective_scan(&runtime).await;
+        let included = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+        assert!(!included.excluded);
+        assert_eq!(included.generation, 0);
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_clean_reincluded_presence_allows_genuine_deletion() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use hfdrive_windows::filesystem::WatchAction;
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let item = local_item(&fixture, "retained.txt").await;
+        let path = fixture.root.join("retained.txt");
+        std::fs::write(&path, b"retained committed bytes").unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+        runtime.set_excluded(item, true).await.unwrap();
+        runtime.set_excluded(item, false).await.unwrap();
+        let usn = u64::try_from(query_file_state(&path).unwrap().usn.unwrap()).unwrap();
+        // Rebind provider-observed metadata without treating it as an edit.
+        fixture.account.update_observed_usn(fixture.connection, item, 0, usn).await.unwrap();
+        runtime.ingest_observations(ObservationBatch {
+            observations: vec![RawObservation { relative_path: "retained.txt".into(), action: WatchAction::Modified }],
+            rescan_required: false,
+        }).await.unwrap();
+        let present = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+        assert_eq!(present.generation, 1);
+        assert_eq!(present.observed_usn, Some(usn));
+        assert!(!present.dirty);
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+        runtime.ingest_observations(ObservationBatch {
+            observations: vec![RawObservation { relative_path: "retained.txt".into(), action: WatchAction::Removed }],
+            rescan_required: false,
+        }).await.unwrap();
+        runtime.start_observer().await;
+        wait_for_selective_scan(&runtime).await;
+        let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(parse_intent(&entries[0]).unwrap(), SyncIntent::Delete { item_id } if item_id == *item.as_uuid()));
+        assert_eq!(entries[0].observed_generation, 2);
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_materialized_evidence_preserves_newer_dirty_work() {
+        let fixture = crate::sync::test_support::connection_fixture().await;
+        let item = local_item(&fixture, "materialized.txt").await;
+        fixture.account.set_subtree_excluded(fixture.connection, item, true).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, item, false).await.unwrap();
+        fixture.account.set_observation_flags(fixture.connection, item, ObservationFlags {
+            dirty: Some(true), pin_requested: Some(true), ..Default::default()
+        }).await.unwrap();
+        assert!(fixture.account.record_materialized(fixture.connection, item, Some(41)).await.unwrap());
+        let present = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+        assert_eq!(present.generation, 1);
+        assert_eq!(present.observed_usn, Some(41));
+        assert!(!present.dirty);
+        assert!(present.pin_requested);
+        let newer = fixture.account.bump_observation(fixture.connection, item, Some(42)).await.unwrap();
+        assert!(!fixture.account.record_materialized(fixture.connection, item, Some(43)).await.unwrap());
+        assert_eq!(fixture.account.observation(fixture.connection, item).await.unwrap(), Some(newer));
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_materialized_action_restores_deletion_evidence_and_retries_record_failure() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use hfdrive_windows::filesystem::WatchAction;
+        for fail_record in [false, true] {
+            let fixture = crate::sync::test_support::connection_fixture().await;
+            let action = journaled_echo_action(&fixture, "before.txt", Some("after.txt")).await;
+            let item = action.item_id.unwrap();
+            fixture.account.set_subtree_excluded(fixture.connection, item, true).await.unwrap();
+            fixture.account.set_subtree_excluded(fixture.connection, item, false).await.unwrap();
+            let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+                .account(fixture.account.account_key()).database();
+            let raw = rusqlite::Connection::open(database).unwrap();
+            if fail_record {
+                raw.execute_batch(
+                    "CREATE TRIGGER fail_materialized BEFORE UPDATE OF generation ON local_observations
+                     WHEN OLD.generation = 0 AND NEW.generation = 1
+                     BEGIN SELECT RAISE(FAIL, 'materialization record interrupted'); END;",
+                ).unwrap();
+            }
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            let result = crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel)).await;
+            if fail_record {
+                assert!(result.is_err());
+                assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, LocalActionState::Pending);
+                assert_eq!(fixture.account.observation(fixture.connection, item).await.unwrap().unwrap().generation, 0);
+                assert!(fixture.root.join("after.txt").exists());
+                raw.execute_batch("DROP TRIGGER fail_materialized;").unwrap();
+                assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+                assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, LocalActionState::Recovered);
+            } else {
+                assert_eq!(result.unwrap().applied, 1);
+            }
+            let present = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+            assert_eq!(present.generation, 1);
+            assert!(!present.dirty);
+            assert_eq!(present.observed_usn, query_file_state(&fixture.root.join("after.txt")).unwrap().usn.map(|usn| u64::try_from(usn).unwrap()));
+            let mut record = fixture.account.item(fixture.connection, item).await.unwrap().unwrap();
+            record.name = "after.txt".to_owned();
+            record.name_key = record.name.clone();
+            fixture.account.upsert_item(record).await.unwrap();
+
+            std::fs::remove_file(fixture.root.join("after.txt")).unwrap();
+            runtime.ingest_observations(ObservationBatch {
+                observations: vec![RawObservation { relative_path: "after.txt".into(), action: WatchAction::Removed }],
+                rescan_required: false,
+            }).await.unwrap();
+            runtime.start_observer().await;
+            wait_for_selective_scan(&runtime).await;
+            let entries = fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(matches!(parse_intent(&entries[0]).unwrap(), SyncIntent::Delete { item_id } if item_id == *item.as_uuid()));
+            assert_eq!(entries[0].observed_generation, 2);
+            drop(raw);
+            runtime.disconnect().await.unwrap();
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_sync_action_completion_is_atomic_on_failure_and_after_reopen() {
+        for completion in [LocalActionState::Applied, LocalActionState::Recovered] {
+            let mut fixture = crate::sync::test_support::connection_fixture().await;
+            let action = journaled_echo_action(&fixture, "before.txt", Some("after.txt")).await;
+            let item = action.item_id.unwrap();
+            fixture.account.set_subtree_excluded(fixture.connection, item, true).await.unwrap();
+            fixture.account.set_subtree_excluded(fixture.connection, item, false).await.unwrap();
+            let paths = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"));
+            let account_key = fixture.account.account_key();
+            let raw = rusqlite::Connection::open(paths.account(account_key).database()).unwrap();
+            raw.execute_batch(
+                "CREATE TRIGGER fail_action_completion BEFORE UPDATE OF state ON local_actions
+                 WHEN NEW.state IN ('applied', 'recovered')
+                 BEGIN SELECT RAISE(FAIL, 'action completion interrupted'); END;",
+            ).unwrap();
+            let (runtime, cancel) = unlink_runtime(&fixture);
+            assert!(crate::sync::publish::execute_pending_actions(&runtime.round_context(&cancel)).await.is_err());
+            assert!(fixture.root.join("after.txt").exists());
+            assert!(!fixture.root.join("before.txt").exists());
+            let unchanged = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+            assert_eq!(unchanged.generation, 0, "the failed action update must roll back presence evidence");
+            assert_eq!(unchanged.observed_usn, None);
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, LocalActionState::Pending);
+
+            // Recovery must still prove the original generation-zero target,
+            // rather than requeueing a now-missing source as a local deletion.
+            assert!(runtime.recover_actions().await.is_err());
+            assert_eq!(fixture.account.observation(fixture.connection, item).await.unwrap(), Some(unchanged));
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, LocalActionState::Pending);
+            raw.execute_batch("DROP TRIGGER fail_action_completion;").unwrap();
+            if completion == LocalActionState::Recovered {
+                assert_eq!(runtime.recover_actions().await.unwrap(), 0);
+            } else {
+                // The guarded rename already succeeded; retry only its
+                // durable completion, not the filesystem effect.
+                let mut echo = runtime.echo.lock().await;
+                crate::sync::apply::complete_action(
+                    &fixture.account, &action, &fixture.root, completion, &mut echo,
+                ).await.unwrap();
+            }
+            let current_usn = query_file_state(&fixture.root.join("after.txt")).unwrap().usn
+                .and_then(|usn| u64::try_from(usn).ok());
+            drop(raw);
+            runtime.disconnect().await.unwrap();
+            drop(runtime);
+            fixture.state.close().await.unwrap();
+            fixture.state = hfdrive_state::StateStore::open(paths).await.unwrap();
+            fixture.account = fixture.state.open_account(account_key).await.unwrap();
+            let present = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+            assert_eq!(present.generation, 1);
+            assert_eq!(present.observed_usn, current_usn);
+            assert!(!present.dirty);
+            assert_eq!(fixture.account.local_action(fixture.connection, action.action_id).await.unwrap().unwrap().state, completion);
+            assert!(fixture.account.pending_local_actions(fixture.connection).await.unwrap().is_empty());
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+            fixture.state.close().await.unwrap();
+        }
+    }
+
+    async fn selective_sync_items(
+        fixture: &crate::sync::test_support::TestConnection,
+    ) -> [ItemId; 4] {
+        use hfdrive_state::ItemKind::{Directory, File};
+        let ids = [ItemId::new(), ItemId::new(), ItemId::new(), ItemId::new()];
+        for (item_id, parent_id, name, kind) in [
+            (ids[0], fixture.root_item, "selected", Directory),
+            (ids[1], ids[0], "nested", Directory),
+            (ids[2], ids[1], "leaf.txt", File),
+            (ids[3], fixture.root_item, "outside.txt", File),
+        ] {
+            fixture.account.upsert_item(hfdrive_state::ItemRecord {
+                connection_id: fixture.connection, item_id, parent_id: Some(parent_id),
+                name: name.to_owned(), name_key: name.to_owned(), kind,
+                revision: OperationId::new(), content_version_id: None, deleted: false,
+                metadata_json: serde_json::json!({}),
+            }).await.unwrap();
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn selective_sync_refuses_dirty_descendant_without_partial_transition() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let [selected, nested, leaf, outside] = selective_sync_items(&fixture).await;
+        let dirty = fixture.account.bump_observation(fixture.connection, leaf, Some(17)).await.unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+
+        assert!(matches!(runtime.set_excluded(selected, true).await,
+            Err(PublishError::LocalApply("dirty or pinned content must be resolved before exclusion"))));
+        for item in [selected, nested, outside] {
+            assert!(fixture.account.observation(fixture.connection, item).await.unwrap().is_none());
+        }
+        assert_eq!(fixture.account.observation(fixture.connection, leaf).await.unwrap(), Some(dirty));
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_refuses_pin_requested_descendant_without_partial_transition() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let [selected, nested, leaf, outside] = selective_sync_items(&fixture).await;
+        fixture.account.bump_observation(fixture.connection, leaf, Some(23)).await.unwrap();
+        let pinned = fixture.account.set_observation_flags(fixture.connection, leaf, ObservationFlags {
+            dirty: Some(false), pin_requested: Some(true), pin_complete: Some(false),
+            ..ObservationFlags::default()
+        }).await.unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+
+        assert!(matches!(runtime.set_excluded(selected, true).await,
+            Err(PublishError::LocalApply("dirty or pinned content must be resolved before exclusion"))));
+        for item in [selected, nested, outside] {
+            assert!(fixture.account.observation(fixture.connection, item).await.unwrap().is_none());
+        }
+        assert_eq!(fixture.account.observation(fixture.connection, leaf).await.unwrap(), Some(pinned));
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_nested_exclusion_and_inclusion_persist_after_reopen() {
+        use crate::sync::test_support::connection_fixture;
+        let mut fixture = connection_fixture().await;
+        let [selected, nested, leaf, outside] = selective_sync_items(&fixture).await;
+        fixture.account.bump_observation(fixture.connection, leaf, Some(71)).await.unwrap();
+        let mut expected_leaf = fixture.account.set_observation_flags(
+            fixture.connection, leaf, ObservationFlags { dirty: Some(false), ..ObservationFlags::default() },
+        ).await.unwrap();
+        fixture.account.bump_observation(fixture.connection, outside, Some(81)).await.unwrap();
+        let expected_outside = fixture.account.set_observation_flags(
+            fixture.connection, outside,
+            ObservationFlags { pin_requested: Some(true), ..ObservationFlags::default() },
+        ).await.unwrap();
+        let original_items = fixture.account.list_all_items(fixture.connection, true).await.unwrap();
+        let paths = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"));
+        let account_key = fixture.account.account_key();
+
+        for excluded in [true, false, true, false] {
+            let (runtime, _) = unlink_runtime(&fixture);
+            runtime.set_excluded(selected, excluded).await.unwrap();
+            runtime.set_excluded(selected, excluded).await.unwrap();
+            runtime.disconnect().await.unwrap();
+            drop(runtime);
+            fixture.state.close().await.unwrap();
+            fixture.state = hfdrive_state::StateStore::open(paths.clone()).await.unwrap();
+            fixture.account = fixture.state.open_account(account_key).await.unwrap();
+
+            for item in [selected, nested] {
+                let observation = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+                assert_eq!(observation.excluded, excluded);
+                assert_eq!(observation.generation, 0);
+                assert!(!observation.dirty && !observation.pin_requested);
+            }
+            expected_leaf.excluded = excluded;
+            if !excluded {
+                expected_leaf.generation = 0;
+                expected_leaf.observed_usn = None;
+            }
+            assert_eq!(fixture.account.observation(fixture.connection, leaf).await.unwrap().as_ref(), Some(&expected_leaf));
+            assert_eq!(fixture.account.observation(fixture.connection, outside).await.unwrap().as_ref(), Some(&expected_outside));
+            assert!(fixture.account.observation(fixture.connection, fixture.root_item).await.unwrap().is_none());
+            assert_eq!(fixture.account.list_all_items(fixture.connection, true).await.unwrap(), original_items);
+            assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        }
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_failed_transition_rolls_back_every_descendant() {
+        use crate::sync::test_support::connection_fixture;
+        let fixture = connection_fixture().await;
+        let [selected, nested, leaf, _] = selective_sync_items(&fixture).await;
+        let database = hfdrive_state::StatePaths::new(fixture.directory.path().join("state"))
+            .account(fixture.account.account_key()).database();
+        let raw = rusqlite::Connection::open(database).unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+        for excluded in [true, false] {
+            // FAIL retains earlier rows from this SQL statement unless the
+            // enclosing account transaction rolls back. Reject the second
+            // row regardless of the recursive query's traversal order.
+            raw.execute_batch(
+                "CREATE TRIGGER fail_selective_sync BEFORE INSERT ON local_observations
+                 WHEN EXISTS (
+                     SELECT 1 FROM local_observations
+                     WHERE connection_id = NEW.connection_id AND excluded = NEW.excluded
+                 )
+                 BEGIN SELECT RAISE(FAIL, 'selective sync interrupted'); END;",
+            ).unwrap();
+            assert!(runtime.set_excluded(selected, excluded).await.is_err());
+            for item in [selected, nested, leaf] {
+                let observation = fixture.account.observation(fixture.connection, item).await.unwrap();
+                if excluded {
+                    assert!(observation.is_none());
+                } else {
+                    assert!(observation.unwrap().excluded);
+                }
+            }
+            raw.execute_batch("DROP TRIGGER fail_selective_sync;").unwrap();
+            runtime.set_excluded(selected, excluded).await.unwrap();
+        }
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        drop(raw);
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_exclusion_never_queues_deletions_from_notifications_or_scan() {
+        use crate::sync::observe::{ObservationBatch, RawObservation};
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_windows::filesystem::WatchAction;
+        let fixture = connection_fixture().await;
+        let [selected, nested, leaf, _] = selective_sync_items(&fixture).await;
+        let (runtime, _) = unlink_runtime(&fixture);
+        runtime.set_excluded(selected, true).await.unwrap();
+        runtime.ingest_observations(ObservationBatch {
+            observations: ["selected", "selected/nested", "selected/nested/leaf.txt"]
+                .into_iter().map(|path| RawObservation {
+                    relative_path: PathBuf::from(path), action: WatchAction::Removed,
+                }).collect(),
+            rescan_required: false,
+        }).await.unwrap();
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+
+        // The local subtree is absent. A completed discovery must honor the
+        // durable exclusion even without a pending watcher notification.
+        runtime.start_observer().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.local_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(fixture.account.scan_state(fixture.connection).await.unwrap().unwrap().may_infer_deletion());
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        for item in [selected, nested, leaf] {
+            let observation = fixture.account.observation(fixture.connection, item).await.unwrap().unwrap();
+            assert!(observation.excluded && !observation.dirty);
+            assert_eq!(observation.generation, 0);
+            assert!(!fixture.account.item(fixture.connection, item).await.unwrap().unwrap().deleted);
+        }
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selective_sync_reinclusion_materializes_missing_descendants_without_deletions() {
+        use crate::sync::plan;
+        use crate::sync::test_support::connection_fixture;
+        use hfdrive_core::format::{ItemKind, ItemRecord};
+        use hfdrive_core::reconcile::{CatalogView, ItemState, LocalActionKind};
+        use hfdrive_core::storage::Sha256Digest;
+        let fixture = connection_fixture().await;
+        let selected = ItemId::new();
+        let nested = ItemId::new();
+        let leaf = ItemId::new();
+        let version = VersionId::new();
+        let revision = OperationId::new();
+        let bytes = b"committed bytes";
+        let digest = Sha256Digest::of(bytes);
+        let root = ItemRecord {
+            item_id: fixture.root_item, parent_id: None, name: String::new(),
+            kind: ItemKind::Directory, item_revision: revision, content_version_id: None,
+            deleted: false, content_operation: revision, location_operation: revision,
+            deletion_operation: None,
+        };
+        let records = vec![
+            root.clone(),
+            ItemRecord { item_id: selected, parent_id: Some(fixture.root_item), name: "selected".to_owned(), ..root.clone() },
+            ItemRecord { item_id: nested, parent_id: Some(selected), name: "nested".to_owned(), ..root.clone() },
+            ItemRecord {
+                item_id: leaf, parent_id: Some(nested), name: "leaf.txt".to_owned(),
+                kind: ItemKind::File, content_version_id: Some(version), ..root
+            },
+        ];
+        for record in &records {
+            let content = record.content_version_id.map(|_| (digest, bytes.len() as u64));
+            fixture.account.upsert_item(plan::registry_item(
+                fixture.connection, record, content.map(|value| value.0),
+                content.map(|value| value.1), None,
+            )).await.unwrap();
+            fixture.account.bump_observation(fixture.connection, record.item_id, Some(91)).await.unwrap();
+            fixture.account.set_observation_flags(fixture.connection, record.item_id, ObservationFlags {
+                dirty: Some(false), ..Default::default()
+            }).await.unwrap();
+        }
+        let commit = hfdrive_core::ids::CommitId::new();
+        plan::record_common_bases(&fixture.account, fixture.connection, commit, &records).await.unwrap();
+        fixture.account.set_baseline(fixture.connection, hfdrive_state::BaselineKind::Applied, Some(commit)).await.unwrap();
+        let sealed = fixture.account.list_common_bases(fixture.connection, commit).await.unwrap();
+        std::fs::create_dir_all(fixture.root.join("selected/nested")).unwrap();
+        std::fs::write(fixture.root.join("selected/nested/leaf.txt"), bytes).unwrap();
+        let (runtime, _) = unlink_runtime(&fixture);
+
+        runtime.set_excluded(fixture.root_item, true).await.unwrap();
+        std::fs::remove_dir_all(fixture.root.join("selected")).unwrap();
+        runtime.set_excluded(fixture.root_item, false).await.unwrap();
+        for record in &records {
+            let observation = fixture.account.observation(fixture.connection, record.item_id).await.unwrap().unwrap();
+            assert!(!observation.excluded);
+            assert_eq!(observation.generation, 0);
+            assert_eq!(observation.observed_usn, None);
+        }
+        runtime.start_observer().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.local_ready.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(fixture.account.scan_state(fixture.connection).await.unwrap().unwrap().may_infer_deletion());
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+
+        let remote = CatalogView::new(sealed.iter().map(|row| {
+            let record = hfdrive_core::format::from_item_record_bytes(row.item_json.as_bytes()).unwrap();
+            let content = record.content_version_id.map(|_| (digest, bytes.len() as u64));
+            ItemState::from_record(&record, content.map(|value| value.0), content.map(|value| value.1)).unwrap()
+        }).collect()).unwrap();
+        let missing = plan::missing_materializations(&fixture.account, fixture.connection, &fixture.root).await.unwrap();
+        let base = plan::materialization_base(remote.clone(), missing).unwrap();
+        let sources = plan::PlanSources {
+            base, remote, intents: Vec::new(),
+            names: records.iter().map(|item| (item.item_id, item.name.clone())).collect(),
+        };
+        let planned = plan::plan_round(
+            &fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources,
+        ).await.unwrap();
+        assert!(planned.plan.remote_ops.is_empty());
+        assert_eq!(planned.plan.local_actions.len(), 3);
+        let mut facts = std::collections::HashMap::new();
+        for action in &planned.plan.local_actions {
+            assert_eq!(action.action, LocalActionKind::CreatePlaceholder);
+            assert!(action.expected.is_none());
+            assert!(!action.target.as_ref().unwrap().deleted);
+            if action.item_id == leaf {
+                assert_eq!(action.target.as_ref().unwrap().content_version_id, Some(version));
+            }
+            facts.insert(action.action_id, plan::ActionFacts {
+                source_path: None,
+                target_path: Some(registry_path(&fixture.account, fixture.connection, action.item_id).await.unwrap()),
+                expected_file_id: None, expected_generation: None, expected_usn: None,
+            });
+        }
+        plan::persist_plan_records(&fixture.account, fixture.connection, &planned.plan, &facts).await.unwrap();
+        let actions = fixture.account.pending_local_actions(fixture.connection).await.unwrap();
+        assert_eq!(actions.len(), 3);
+        assert!(actions.iter().all(|action| action.kind == hfdrive_state::LocalActionKind::CreatePlaceholder));
+        assert_eq!(fixture.account.list_common_bases(fixture.connection, commit).await.unwrap(), sealed);
+        assert!(fixture.account.list_outbox(fixture.connection, None, 100).await.unwrap().is_empty());
+        runtime.disconnect().await.unwrap();
+        fixture.state.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn startup_discovery_queues_an_existing_file_and_rolls_back_failed_work() {

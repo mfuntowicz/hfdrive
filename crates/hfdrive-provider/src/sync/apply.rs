@@ -753,19 +753,36 @@ pub async fn free_space_evidence(
     }
 }
 
-/// Closes an applied local action and registers all of its echo paths,
-/// including a rename's old/intermediate names and a deletion's absent path.
-/// The caller holds the observer's echo lock across this durable handoff:
-/// observers see either `InProgress` or the completed echo, never a gap.
+/// Atomically closes an applied/recovered action with any generation-zero
+/// presence evidence, then registers its old/target/intermediate echo paths.
+/// The caller holds the echo lock across this durable handoff: observers see
+/// either unfinished journal coverage or the completed echo, never a gap.
 pub async fn complete_action(
     state: &AccountStore,
     action: &hfdrive_state::LocalAction,
     root: &Path,
+    completion: LocalActionState,
     echo: &mut EchoTable,
 ) -> Result<(), hfdrive_state::StateError> {
-    state
-        .set_local_action_state(action.connection_id, action.action_id, LocalActionState::Applied)
-        .await?;
+    let observed_usn = if action.expected_generation == Some(0)
+        && action.kind != hfdrive_state::LocalActionKind::DeletePlaceholder
+    {
+        let path = action.target_path.as_ref().or(action.source_path.as_ref())
+            .ok_or_else(|| hfdrive_state::StateError::InvalidState {
+                entity: "local_action", id: action.action_id.to_string(),
+                detail: "materialized action has no target path".to_owned(),
+            })?;
+        let live = hfdrive_windows::filesystem::volume::query_file_state(&root.join(path))
+            .map_err(|_| hfdrive_state::StateError::Io(std::io::Error::other(
+                "materialized action target could not be inspected",
+            )))?;
+        live.usn.and_then(|usn| u64::try_from(usn).ok())
+    } else {
+        None
+    };
+    state.complete_local_action(
+        action.connection_id, action.action_id, completion, observed_usn,
+    ).await?;
     echo.note_applied(action, root);
     Ok(())
 }

@@ -360,7 +360,8 @@ async fn run_round_inner<R: RemoteOps>(
         }
     };
     let remote_moved = baseline.applied_commit != Some(head.head.commit_id);
-    if planning.is_empty() && !remote_moved {
+    let missing_materializations = plan::missing_materializations(ctx.state, ctx.connection, ctx.root).await?;
+    if planning.is_empty() && !remote_moved && missing_materializations.is_empty() {
         // A successful quiet poll still proves which commit is observable.
         // Do not leave initialized drives permanently without that evidence.
         if baseline.observed_commit != Some(head.head.commit_id) {
@@ -379,6 +380,7 @@ async fn run_round_inner<R: RemoteOps>(
     let digests_source = RemoteDigests::new(ctx.remote, ctx.workspace);
     let mut digests = DigestResolver::new(&digests_source, ctx.cancel);
     let base = build_base_view(ctx.state, ctx.connection, baseline.applied_commit, &mut digests).await?;
+    let base = plan::materialization_base(base, missing_materializations)?;
     let remote = build_remote_view(ctx.remote, catalog_root, &mut digests, ctx.cancel).await?;
     let names = collect_names(&base, &remote);
     let intents = build_local_intents(&planning, &names);
@@ -1226,12 +1228,19 @@ pub async fn execute_pending_actions<R: RemoteOps>(
             ctx.state
                 .set_local_action_state(ctx.connection, row.action_id, LocalActionState::InProgress)
                 .await?;
-            execute_one_action(ctx, &row).await
+            async {
+                let applied = execute_one_action(ctx, &row).await?;
+                if applied {
+                    let mut echo = ctx.echo.lock().await;
+                    apply::complete_action(
+                        ctx.state, &row, ctx.root, LocalActionState::Applied, &mut echo,
+                    ).await?;
+                }
+                Ok(applied)
+            }.await
         };
         match result {
             Ok(true) => {
-                let mut echo = ctx.echo.lock().await;
-                apply::complete_action(ctx.state, &row, ctx.root, &mut echo).await?;
                 outcome.applied += 1;
             }
             Ok(false) => {
@@ -1280,6 +1289,7 @@ pub async fn execute_pending_actions<R: RemoteOps>(
     }
     Ok(outcome)
 }
+
 
 /// Recheck after this round closes its entries: a replacement may have just
 /// published or converged. Until then, adopting R as B would lose its original
@@ -1668,6 +1678,10 @@ async fn bind_action_facts<R: RemoteOps>(
                     .await?
                     .map(|observation| observation.generation);
             }
+        }
+        if expected_path.is_none() {
+            fact.expected_generation = ctx.state.observation(ctx.connection, action.item_id).await?
+                .map(|observation| observation.generation);
         }
         facts.insert(action.action_id, fact);
     }
@@ -3664,6 +3678,43 @@ mod tests {
         ));
         assert_eq!(size, 4);
         assert!(!directory);
+        fixture.state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rematerialized_create_binds_generation_zero_before_execution() {
+        use hfdrive_core::reconcile::{CatalogView, LocalActionKind};
+        let fixture = connection_fixture().await;
+        let revision = OperationId::new();
+        let root = item_record(fixture.root_item, None, "", ItemKind::Directory, None, revision);
+        let child = item_record(
+            ItemId::new(), Some(fixture.root_item), "selected.txt", ItemKind::File,
+            Some(VersionId::new()), revision,
+        );
+        fixture.account.upsert_item(plan::target_registry_item(fixture.connection, &item_state(&child), &[])).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, child.item_id, true).await.unwrap();
+        fixture.account.set_subtree_excluded(fixture.connection, child.item_id, false).await.unwrap();
+        let sources = PlanSources {
+            base: CatalogView::new(vec![item_state(&root)]).unwrap(),
+            remote: CatalogView::new(vec![item_state(&root), item_state(&child)]).unwrap(),
+            intents: Vec::new(), names: HashMap::new(),
+        };
+        let planned = plan::plan_round(
+            &fixture.account, fixture.connection, fixture.workspace, ReconcileMode::Writable, &sources,
+        ).await.unwrap();
+        assert_eq!(planned.plan.local_actions.len(), 1);
+        assert_eq!(planned.plan.local_actions[0].action, LocalActionKind::CreatePlaceholder);
+        let remote = HeadOnlyRemote::default();
+        let scheduler = crate::scheduler::Scheduler::new(Default::default());
+        let cancel = CancellationToken::new();
+        let echo = tokio::sync::Mutex::new(crate::sync::observe::EchoTable::default());
+        let context = round_context(&fixture, &remote, &scheduler, &cancel, &echo);
+        let facts = bind_action_facts(&context, &planned.plan, &sources).await.unwrap();
+        plan::persist_plan_records(&fixture.account, fixture.connection, &planned.plan, &facts).await.unwrap();
+        let actions = fixture.account.pending_local_actions(fixture.connection).await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].expected_generation, Some(0));
+        assert_eq!(actions[0].target_path.as_deref(), Some(std::path::Path::new("selected.txt")));
         fixture.state.close().await.unwrap();
     }
 

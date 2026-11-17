@@ -2701,6 +2701,48 @@ impl Db {
             .ok_or_else(|| StateError::not_found("local_action", action_id))
     }
 
+    pub(crate) fn complete_local_action(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        action_id: ActionId,
+        completion: LocalActionState,
+        observed_usn: Option<u64>,
+    ) -> SResult<LocalAction> {
+        if !matches!(completion, LocalActionState::Applied | LocalActionState::Recovered) {
+            return Err(StateError::invalid_state("local_action", action_id, "completion must be applied or recovered"));
+        }
+        let now = schema::checked_i64(schema::now_ms())?;
+        let conn = self.account_conn(account)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut action = query_optional(
+            &tx,
+            &format!("SELECT {LOCAL_ACTION_COLUMNS} FROM local_actions WHERE connection_id = ?1 AND action_id = ?2"),
+            params![connection_id.as_bytes().as_slice(), action_id.as_bytes().as_slice()],
+            s::read_local_action,
+        )?.ok_or_else(|| StateError::not_found("local_action", action_id))?;
+        if matches!(action.state, LocalActionState::Applied | LocalActionState::Recovered) {
+            return Ok(action);
+        }
+        if action.expected_generation == Some(0) && action.kind != LocalActionKind::DeletePlaceholder {
+            let item_id = action.item_id.ok_or_else(|| {
+                StateError::invalid_state("local_action", action_id, "materialized action has no item")
+            })?;
+            record_materialized_conn(&tx, connection_id, item_id, observed_usn)?;
+        }
+        tx.execute(
+            "UPDATE local_actions SET state = ?3, updated_at_ms = ?4 WHERE connection_id = ?1 AND action_id = ?2",
+            params![
+                connection_id.as_bytes().as_slice(), action_id.as_bytes().as_slice(),
+                s::action_state_text(completion), now,
+            ],
+        )?;
+        clear_work_error_conn(&tx, connection_id, WorkErrorKind::Action, *action_id.as_uuid())?;
+        tx.commit()?;
+        action.state = completion;
+        Ok(action)
+    }
+
     pub(crate) fn local_action(
         &mut self,
         account: AccountKey,
@@ -2785,6 +2827,16 @@ impl Db {
             .ok_or_else(|| StateError::not_found("observation", item_id))
     }
 
+    pub(crate) fn record_materialized(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+        observed_usn: Option<u64>,
+    ) -> SResult<bool> {
+        record_materialized_conn(self.account_conn(account)?, connection_id, item_id, observed_usn)
+    }
+
     pub(crate) fn set_observation_flags(
         &mut self,
         account: AccountKey,
@@ -2825,6 +2877,65 @@ impl Db {
         }
         self.observation(account, connection_id, item_id)?
             .ok_or_else(|| StateError::not_found("observation", item_id))
+    }
+
+    /// Review and transition the whole subtree at one durable boundary. The
+    /// recursive query follows connection-scoped parent identities, including
+    /// tombstones that may still have local work. UNION also terminates cycles
+    /// without silently truncating a deep subtree. Inclusion invalidates old
+    /// presence evidence, not item history: exclusion is never a remote edit.
+    pub(crate) fn set_subtree_excluded(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+        excluded: bool,
+    ) -> SResult<bool> {
+        let conn = self.account_conn(account)?;
+        let tx = conn.unchecked_transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM items WHERE connection_id = ?1 AND item_id = ?2)",
+            params![connection_id.as_bytes().as_slice(), item_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StateError::not_found("item", item_id));
+        }
+        let changed = tx.execute(
+            "WITH RECURSIVE subtree(item_id) AS (
+                 SELECT item_id FROM items WHERE connection_id = ?1 AND item_id = ?2
+                 UNION
+                 SELECT child.item_id FROM items AS child
+                 JOIN subtree AS parent ON child.parent_id = parent.item_id
+                 WHERE child.connection_id = ?1
+             )
+             INSERT INTO local_observations
+               (connection_id, item_id, generation, observed_usn, dirty, pin_requested,
+                pin_complete, excluded, scan_epoch)
+             SELECT ?1, item_id, 0, NULL, 0, 0, 0, ?3, 0 FROM subtree
+             WHERE ?3 = 0 OR NOT EXISTS (
+                 SELECT 1 FROM subtree AS member
+                 JOIN local_observations AS observation
+                   ON observation.connection_id = ?1 AND observation.item_id = member.item_id
+                 WHERE observation.dirty = 1 OR observation.pin_requested = 1
+             )
+             ON CONFLICT(connection_id, item_id) DO UPDATE SET
+               generation = CASE WHEN local_observations.excluded = 1 AND excluded.excluded = 0
+                                 THEN 0 ELSE local_observations.generation END,
+               observed_usn = CASE WHEN local_observations.excluded = 1 AND excluded.excluded = 0
+                                   THEN NULL ELSE local_observations.observed_usn END,
+               excluded = excluded.excluded",
+            params![
+                connection_id.as_bytes().as_slice(),
+                item_id.as_bytes().as_slice(),
+                i64::from(excluded),
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub(crate) fn observation(
@@ -3058,6 +3169,25 @@ impl Db {
              FROM local_observations WHERE connection_id = ?1 AND excluded = 1 ORDER BY item_id",
             params![connection_id.as_bytes().as_slice()],
             s::read_observation,
+        )
+    }
+
+    pub(crate) fn unmaterialized_items(
+        &mut self,
+        account: AccountKey,
+        connection_id: ConnectionId,
+    ) -> SResult<Vec<ItemRecord>> {
+        let conn = self.account_conn(account)?;
+        query_many(
+            conn,
+            "SELECT i.connection_id, i.item_id, i.parent_id, i.name, i.name_key, i.kind,
+                    i.revision, i.content_version_id, i.deleted, i.metadata_json
+             FROM items AS i JOIN local_observations AS o
+               ON o.connection_id = i.connection_id AND o.item_id = i.item_id
+             WHERE i.connection_id = ?1 AND i.deleted = 0 AND o.generation = 0 AND o.excluded = 0
+             ORDER BY i.item_id",
+            params![connection_id.as_bytes().as_slice()],
+            s::read_item,
         )
     }
 
@@ -3515,6 +3645,25 @@ fn clear_work_error_conn(
         ],
     )?;
     Ok(())
+}
+
+/// Shared generation guard for observation-only evidence and atomic action
+/// completion. The caller's transaction owns this update when an action closes.
+fn record_materialized_conn(
+    conn: &Connection,
+    connection_id: ConnectionId,
+    item_id: ItemId,
+    observed_usn: Option<u64>,
+) -> SResult<bool> {
+    Ok(conn.execute(
+        "UPDATE local_observations SET generation = 1, observed_usn = ?3, dirty = 0
+         WHERE connection_id = ?1 AND item_id = ?2 AND generation = 0 AND excluded = 0",
+        params![
+            connection_id.as_bytes().as_slice(),
+            item_id.as_bytes().as_slice(),
+            observed_usn.map(schema::checked_i64).transpose()?,
+        ],
+    )? != 0)
 }
 
 /// Stores one remembered base item record, reporting whether a row was

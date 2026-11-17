@@ -817,6 +817,24 @@ impl AccountStore {
             .await
     }
 
+    /// Commits Applied/Recovered together with generation-zero clean presence
+    /// and action-error clearing. For a non-delete action expecting generation
+    /// zero, the caller must prove the target is present and supply its current
+    /// USN (None only when the filesystem cannot provide one). Newer local
+    /// generations are untouched; failure rolls back every part of completion.
+    pub async fn complete_local_action(
+        &self,
+        connection_id: ConnectionId,
+        action_id: ActionId,
+        completion: LocalActionState,
+        observed_usn: Option<u64>,
+    ) -> Result<LocalAction, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| db.complete_local_action(account, connection_id, action_id, completion, observed_usn))
+            .await
+    }
+
     pub async fn local_action(
         &self,
         connection_id: ConnectionId,
@@ -861,6 +879,21 @@ impl AccountStore {
             .await
     }
 
+    /// Records proven clean presence only for an unmaterialized generation.
+    /// Returns false for a missing, excluded, or newer observation; newer
+    /// dirty work and all selection/pin flags are never overwritten.
+    pub async fn record_materialized(
+        &self,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+        observed_usn: Option<u64>,
+    ) -> Result<bool, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| db.record_materialized(account, connection_id, item_id, observed_usn))
+            .await
+    }
+
     pub async fn set_observation_flags(
         &self,
         connection_id: ConnectionId,
@@ -870,6 +903,26 @@ impl AccountStore {
         let (account, queue) = (self.account, self.queue.clone());
         queue
             .call(move |db| db.set_observation_flags(account, connection_id, item_id, flags))
+            .await
+    }
+
+    /// Journals the exclusion flag for a root item and every registered
+    /// descendant in one account transaction, creating clean generation-zero
+    /// observations for previously unobserved items. Returns `false` without
+    /// changing any row if exclusion encounters dirty or pin-requested work.
+    /// Inclusion resets previously excluded members' generation and USN so
+    /// their local absence is not deletion evidence. Replaying inclusion does
+    /// not reset newly observed work. Neither transition creates remote intent
+    /// or changes item revisions, dirty/pin state, or deletion flags.
+    pub async fn set_subtree_excluded(
+        &self,
+        connection_id: ConnectionId,
+        item_id: ItemId,
+        excluded: bool,
+    ) -> Result<bool, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue
+            .call(move |db| db.set_subtree_excluded(account, connection_id, item_id, excluded))
             .await
     }
 
@@ -952,6 +1005,17 @@ impl AccountStore {
     ) -> Result<Vec<LocalObservation>, StateError> {
         let (account, queue) = (self.account, self.queue.clone());
         queue.call(move |db| db.excluded_observations(account, connection_id)).await
+    }
+
+    /// Included live items whose local presence has not been observed since
+    /// selection. Callers must still check ancestor exclusions and the actual
+    /// filesystem before planning materialization.
+    pub async fn unmaterialized_items(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<ItemRecord>, StateError> {
+        let (account, queue) = (self.account, self.queue.clone());
+        queue.call(move |db| db.unmaterialized_items(account, connection_id)).await
     }
 
     /// Complete connection traversal for maintenance operations such as
