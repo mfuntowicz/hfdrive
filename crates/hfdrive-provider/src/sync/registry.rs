@@ -178,8 +178,9 @@ pub fn registration_present(user_sid: &str, connection: ConnectionId) -> Result<
 
 /// Every HF Drive root registered with Windows (any provider), used for
 /// overlap checks and restore reconciliation.
-pub fn registered_roots() -> Result<Vec<RegisteredRoot>, AdmissionError> {
-    registration::registered_sync_roots().map_err(|_| AdmissionError::Registration)
+pub fn registered_roots(skip_path_for: Option<&str>) -> Result<Vec<RegisteredRoot>, AdmissionError> {
+    registration::registered_sync_roots_skipping_path_for(skip_path_for)
+        .map_err(|_| AdmissionError::Registration)
 }
 
 /// Verifies the volume recorded at registration still backs the root. A

@@ -77,3 +77,35 @@ fn registration_policy_is_frozen_to_the_supported_combination() {
     assert_eq!(SYNC_POLICY.population, PopulationPolicy::Full);
     assert_eq!(SYNC_POLICY.hardlinks, HardlinkPolicy::None);
 }
+
+#[test]
+fn candidate_registration_does_not_require_enumerating_deleted_roots() {
+    use hfdrive_windows::cfapi::{register_sync_root, unregister_sync_root, RegistrationInfo};
+    use hfdrive_windows::filesystem::validate::{validate_sync_root, RootContext};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("candidate");
+    std::fs::create_dir(&root).unwrap();
+    let validated = validate_sync_root(
+        &root,
+        &RootContext {
+            state_dir: directory.path().join("state"),
+            configured_roots: Vec::new(),
+            existing_sync_root_id: None,
+        },
+    )
+    .unwrap();
+    let connection = ConnectionId::new();
+    register_sync_root(
+        &validated,
+        "S-1-5-21-1-2-3-1001",
+        &RegistrationInfo {
+            connection,
+            display_name: "HF Drive registration test".to_owned(),
+            icon_resource: "@HFDrive,-101".to_owned(),
+            version: "0.1.0".to_owned(),
+        },
+    )
+    .unwrap();
+    unregister_sync_root("S-1-5-21-1-2-3-1001", connection).unwrap();
+}

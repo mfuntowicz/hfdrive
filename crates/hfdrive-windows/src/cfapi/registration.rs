@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use hfdrive_core::ids::ConnectionId;
 use uuid::Uuid;
+use windows::Storage::Provider::StorageProviderSyncRootInfo;
 
 use crate::filesystem::validate::ValidatedRoot;
 
@@ -178,6 +179,30 @@ pub fn unregister_sync_root(user_sid: &str, connection: ConnectionId) -> CfResul
     }
 }
 
+/// Queries one registration by candidate folder without enumerating other roots.
+pub fn sync_root_info_for_folder(path: &std::path::Path) -> CfResult<Option<StorageProviderSyncRootInfo>> {
+    match crate::ffi::syncroot::sync_root_info_for_folder(path) {
+        Ok(info) => Ok(Some(info)),
+        Err(2) | Err(1168) | Err(0x8007_0021) | Err(0x8007_00A1) => Ok(None),
+        Err(code) => Err(CfError::Win32 {
+            operation: "StorageProviderSyncRootManager.GetSyncRootInformationForFolder",
+            code,
+        }),
+    }
+}
+
+/// Gets one registration by stable ID without resolving its folder object.
+pub fn sync_root_info_for_id(id: &str) -> CfResult<Option<StorageProviderSyncRootInfo>> {
+    match crate::ffi::syncroot::sync_root_info_for_id(id) {
+        Ok(info) => Ok(Some(info)),
+        Err(2) | Err(1168) | Err(0x8007_0021) | Err(0x8007_00A1) => Ok(None),
+        Err(code) => Err(CfError::Win32 {
+            operation: "StorageProviderSyncRootManager.GetSyncRootInformationForId",
+            code,
+        }),
+    }
+}
+
 /// Checks one registration by stable ID without resolving its folder object.
 /// A deleted folder therefore cannot crash or block teardown verification.
 pub fn sync_root_registered(user_sid: &str, connection: ConnectionId) -> CfResult<bool> {
@@ -195,7 +220,12 @@ pub fn sync_root_registered(user_sid: &str, connection: ConnectionId) -> CfResul
 /// All sync roots registered with Windows (any provider). Used by root
 /// overlap validation and by reconnect flows.
 pub fn registered_sync_roots() -> CfResult<Vec<RegisteredRoot>> {
-    let roots = crate::ffi::syncroot::current_roots().map_err(|code| CfError::Win32 {
+    registered_sync_roots_skipping_path_for(None)
+}
+
+/// Enumerates roots while skipping path resolution for one deleted root ID.
+pub fn registered_sync_roots_skipping_path_for(skip_id: Option<&str>) -> CfResult<Vec<RegisteredRoot>> {
+    let roots = crate::ffi::syncroot::current_roots(skip_id).map_err(|code| CfError::Win32 {
         operation: "StorageProviderSyncRootManager.GetCurrentSyncRoots",
         code,
     })?;

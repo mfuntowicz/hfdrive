@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
-use windows::core::{GUID, HSTRING, Interface};
+use windows::core::{GUID, HSTRING};
 use windows::Storage::Provider::{
     StorageProviderHardlinkPolicy, StorageProviderHydrationPolicy,
     StorageProviderHydrationPolicyModifier, StorageProviderInSyncPolicy,
@@ -257,7 +257,7 @@ pub(crate) struct RegisteredRoot {
 }
 
 /// All sync roots registered with Windows (any provider).
-pub(crate) fn current_roots() -> Result<Vec<RegisteredRoot>, u32> {
+pub(crate) fn current_roots(_skip_path_for: Option<&str>) -> Result<Vec<RegisteredRoot>, u32> {
     let _mta = MtaGuard::enter()?;
     let roots =
         StorageProviderSyncRootManager::GetCurrentSyncRoots().map_err(|e| super::error_code(&e))?;
@@ -266,12 +266,20 @@ pub(crate) fn current_roots() -> Result<Vec<RegisteredRoot>, u32> {
     for index in 0..size {
         let info = roots.GetAt(index).map_err(|e| super::error_code(&e))?;
         let id = info.Id().map_err(|e| super::error_code(&e))?.to_string();
-        out.push(RegisteredRoot {
-            id,
-            path: info_path(&info).ok(),
-        });
+        // A deleted root's IStorageFolder can fail natively. Only its stable
+        // ID is needed for identity/overlap checks; never resolve the folder
+        // object during enumeration.
+        out.push(RegisteredRoot { id, path: None });
     }
     Ok(out)
+}
+
+/// Queries one registration by candidate folder without enumerating other roots.
+pub(crate) fn sync_root_info_for_folder(path: &Path) -> Result<StorageProviderSyncRootInfo, u32> {
+    let _mta = MtaGuard::enter()?;
+    let folder = resolve_folder(path)?;
+    StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder)
+        .map_err(|e| super::error_code(&e))
 }
 
 /// Queries one registration by stable ID without touching its folder object.
@@ -279,13 +287,6 @@ pub(crate) fn sync_root_info_for_id(id: &str) -> Result<StorageProviderSyncRootI
     let _mta = MtaGuard::enter()?;
     StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id))
         .map_err(|e| super::error_code(&e))
-}
-
-fn info_path(info: &StorageProviderSyncRootInfo) -> Result<PathBuf, u32> {
-    let folder = info.Path().map_err(|e| super::error_code(&e))?;
-    let item: windows::Storage::IStorageItem = folder.cast().map_err(|e| super::error_code(&e))?;
-    let path = item.Path().map_err(|e| super::error_code(&e))?;
-    Ok(PathBuf::from(path.to_string()))
 }
 
 /// Resolve a filesystem path to its WinRT folder object, waiting for the

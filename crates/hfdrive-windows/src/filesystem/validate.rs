@@ -216,47 +216,71 @@ fn check_overlaps(
         }
     }
 
-    // Registered sync roots (any provider) must not overlap.
-    let registered = crate::ffi::syncroot::current_roots()
-        .map_err(|code| FsError::Win32 { operation: "GetCurrentSyncRoots", code })?;
-    let mut owned = false;
-    for root in registered {
-        let claimed = context.existing_sync_root_id.as_deref() == Some(root.id.as_str());
-        let Some(path) = root.path.as_deref() else {
-            if claimed {
-                return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
-            }
-            continue;
+    if let Some(expected) = context.existing_sync_root_id.as_deref() {
+        let info = crate::cfapi::registration::sync_root_info_for_id(expected)
+            .map_err(|error| match error {
+                crate::cfapi::CfError::Win32 { code, .. } => FsError::Win32 {
+                    operation: "GetSyncRootInformationForId",
+                    code,
+                },
+                _ => FsError::OverlapsSyncRoot { other: final_path.to_path_buf() },
+            })?;
+        let Some(info) = info else {
+            return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
         };
-        let handle = match raw::open_query(path, true) {
-            Ok(handle) => handle,
-            Err(code) if !claimed && (code == 2 || code == 3) => continue,
-            Err(code) => return Err(raw_classify(path, code)),
-        };
-        let other = PathBuf::from(
-            raw::final_path(&handle).map_err(op("GetFinalPathNameByHandleW"))?,
-        );
-        if claimed {
-            let other_id = raw::id_info(&handle)
-                .map_err(op("GetFileInformationByHandleEx(FileIdInfo)"))?;
-            if registration_matches(
-                context.existing_sync_root_id.as_deref(),
-                &root.id,
-                final_path,
-                identity,
-                &other,
-                &other_id,
-            ) {
-                owned = true;
-                continue;
-            }
-            return Err(FsError::OverlapsSyncRoot { other });
+        let id = info.Id()
+            .map_err(|error| FsError::Win32 {
+                operation: "StorageProviderSyncRootInfo.Id",
+                code: error.code().0 as u32,
+            })?
+            .to_string();
+        if registration_matches(
+            Some(expected),
+            &id,
+            final_path,
+            identity,
+            final_path,
+            identity,
+        ) {
+            return Ok(true);
         }
-        if overlaps(final_path, &other) {
-            return Err(FsError::OverlapsSyncRoot { other });
-        }
+        return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
     }
-    Ok(owned)
+
+    // Check only the candidate registration. Enumerating every registered
+    // root can crash Windows when any older root's folder was deleted.
+    let registered = crate::cfapi::registration::sync_root_info_for_folder(final_path)
+        .map_err(|error| match error {
+            crate::cfapi::CfError::Win32 { code, .. } => FsError::Win32 {
+                operation: "GetSyncRootInformationForFolder",
+                code,
+            },
+            _ => FsError::OverlapsSyncRoot { other: final_path.to_path_buf() },
+        })?;
+    let Some(info) = registered else {
+        return Ok(false);
+    };
+    let id = info.Id()
+        .map_err(|error| FsError::Win32 {
+            operation: "StorageProviderSyncRootInfo.Id",
+            code: error.code().0 as u32,
+        })?
+        .to_string();
+    let claimed = context.existing_sync_root_id.as_deref() == Some(id.as_str());
+    if claimed {
+        if registration_matches(
+            context.existing_sync_root_id.as_deref(),
+            &id,
+            final_path,
+            identity,
+            final_path,
+            identity,
+        ) {
+            return Ok(true);
+        }
+        return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
+    }
+    Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() })
 }
 
 /// Canonicalize an existing path through a handle; `Ok(None)` when absent.

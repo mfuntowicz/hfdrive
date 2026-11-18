@@ -104,8 +104,11 @@ impl Provider {
                 // Synchronizing the account failed and its token epoch was
                 // cleared: the session needs a new interactive grant.
                 let _ = self.publish_account_error(AccountFailure::SignInRequired, error);
-            } else if let Err(error) = self.restore_connections().await {
-                // The session itself is intact; only restoration failed.
+            }
+            // Remote account sync and local root restoration are independent:
+            // an offline or rejected remote response must not strand a valid
+            // local runtime. Any restoration failure is reported separately.
+            if let Err(error) = self.restore_connections().await {
                 let _ = self.publish_account_error(AccountFailure::Restore, error);
             }
             tokio::select! {

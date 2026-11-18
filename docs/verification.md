@@ -1037,3 +1037,17 @@ verification.
   protocol/view-model tests. Evidence:
   `artifacts/tests/missing-root-final-suites.log` and
   `artifacts/tests/remove-connection-managed.log`.
+
+## Sync-root registration crash — 2026-11-18
+
+- **diagnosed** — `GetCurrentSyncRoots` and deleted-folder `IStorageFolder`
+  resolution could crash `Windows.FileExplorer.Common.dll` during setup and
+  restoration. Existing connections now validate by exact sync-root ID, new
+  candidates use `GetSyncRootInformationForFolder`, and local restoration is
+  attempted independently of remote account synchronization.
+- **passed** — `candidate_registration_does_not_require_enumerating_deleted_roots`
+  validates, registers and unregisters a temporary root without any remote
+  operation. The final provider and Windows suites also pass: 255 provider
+  unit, 6 session, 16 durability, 122 Windows unit plus all Windows
+  integration suites. Evidence: `artifacts/tests/syncroot-final-suites.log`
+  and `artifacts/tests/candidate-registration.log`.
