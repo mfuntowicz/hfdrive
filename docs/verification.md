@@ -1047,7 +1047,11 @@ verification.
   attempted independently of remote account synchronization.
 - **passed** — `candidate_registration_does_not_require_enumerating_deleted_roots`
   validates, registers and unregisters a temporary root without any remote
-  operation. The final provider and Windows suites also pass: 255 provider
-  unit, 6 session, 16 durability, 122 Windows unit plus all Windows
-  integration suites. Evidence: `artifacts/tests/syncroot-final-suites.log`
-  and `artifacts/tests/candidate-registration.log`.
+  operation. A missing candidate folder returns no registration instead of
+  surfacing `0x800700A1`. The setup footer now keeps an indeterminate progress
+  bar and the active probe message visible while work runs. The final provider
+  and Windows suites also pass: 255 provider unit, 6 session, 16 durability,
+  122 Windows unit plus all Windows integration suites. Evidence:
+  `artifacts/tests/syncroot-final-suites.log`,
+  `artifacts/tests/candidate-registration.log`, and
+  `artifacts/tests/setup-progress-build.log`.

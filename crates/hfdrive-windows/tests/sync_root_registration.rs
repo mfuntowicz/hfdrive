@@ -108,4 +108,7 @@ fn candidate_registration_does_not_require_enumerating_deleted_roots() {
     )
     .unwrap();
     unregister_sync_root("S-1-5-21-1-2-3-1001", connection).unwrap();
+
+    let missing = directory.path().join("missing");
+    assert!(hfdrive_windows::cfapi::sync_root_info_for_folder(&missing).unwrap().is_none());
 }

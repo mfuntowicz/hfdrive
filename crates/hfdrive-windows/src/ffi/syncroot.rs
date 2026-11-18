@@ -275,10 +275,9 @@ pub(crate) fn current_roots(_skip_path_for: Option<&str>) -> Result<Vec<Register
 }
 
 /// Queries one registration by candidate folder without enumerating other roots.
-pub(crate) fn sync_root_info_for_folder(path: &Path) -> Result<StorageProviderSyncRootInfo, u32> {
+pub(crate) fn sync_root_info_for_folder(folder: &StorageFolder) -> Result<StorageProviderSyncRootInfo, u32> {
     let _mta = MtaGuard::enter()?;
-    let folder = resolve_folder(path)?;
-    StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder)
+    StorageProviderSyncRootManager::GetSyncRootInformationForFolder(folder)
         .map_err(|e| super::error_code(&e))
 }
 
@@ -292,7 +291,7 @@ pub(crate) fn sync_root_info_for_id(id: &str) -> Result<StorageProviderSyncRootI
 /// Resolve a filesystem path to its WinRT folder object, waiting for the
 /// async operation on the calling (MTA) thread. Resolving a local folder
 /// completes promptly; the wait is bounded and cancellable only by timeout.
-fn resolve_folder(path: &Path) -> Result<StorageFolder, u32> {
+pub(crate) fn resolve_folder(path: &Path) -> Result<StorageFolder, u32> {
     let hpath = HSTRING::from(path.to_string_lossy().as_ref());
     let operation =
         StorageFolder::GetFolderFromPathAsync(&hpath).map_err(|e| super::error_code(&e))?;
