@@ -19,7 +19,7 @@ use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Storage::CloudFilters::{
     CfConnectSyncRoot, CfConvertToPlaceholder, CfCreatePlaceholders, CfDehydratePlaceholder,
     CfDisconnectSyncRoot, CfExecute, CfGetPlaceholderInfo, CfGetPlaceholderRangeInfo,
-    CfGetPlaceholderStateFromAttributeTag, CfHydratePlaceholder,
+    CfGetPlaceholderStateFromAttributeTag, CfGetSyncRootInfoByPath, CfHydratePlaceholder,
     CfOpenFileWithOplock, CfReportProviderProgress, CfRevertPlaceholder,
     CfSetInSyncState, CfSetPinState, CfUpdatePlaceholder, CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS,
     CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
@@ -37,6 +37,7 @@ use windows::Win32::Storage::CloudFilters::{
     CF_OPERATION_TYPE_TRANSFER_DATA, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
     CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAGS, CF_PLACEHOLDER_CREATE_INFO,
     CF_PLACEHOLDER_INFO_BASIC, CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH,
+    CF_SYNC_ROOT_BASIC_INFO, CF_SYNC_ROOT_INFO_BASIC,
     CF_PLACEHOLDER_RANGE_INFO_ONDISK, CF_PIN_STATE_PINNED,
     CF_PIN_STATE_EXCLUDED, CF_PIN_STATE_UNPINNED, CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE,
     CF_SET_PIN_FLAG_NONE, CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
@@ -1578,6 +1579,37 @@ pub(crate) fn dehydrate(handle: &impl CfaHandle) -> Result<(), u32> {
         )
         .map_err(|e| super::error_code(&e))
     }
+}
+
+/// `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT` (390): no sync root contains this path.
+const ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT: u32 = 390;
+/// `ERROR_NOT_A_CLOUD_SYNC_ROOT` (405): the path is not a cloud sync root.
+const ERROR_NOT_A_CLOUD_SYNC_ROOT: u32 = 405;
+
+/// Whether a fully qualified path belongs to a registered cloud sync root.
+/// This queries only the candidate and never enumerates or resolves other roots.
+pub(crate) fn sync_root_registered(path: &Path) -> Result<bool, u32> {
+    let path = wide(path);
+    let mut info = CF_SYNC_ROOT_BASIC_INFO::default();
+    // SAFETY: `path` is NUL-terminated and `info` is the exact output type
+    // required for `CF_SYNC_ROOT_INFO_BASIC`.
+    unsafe {
+        CfGetSyncRootInfoByPath(
+            windows::core::PCWSTR(path.as_ptr()),
+            CF_SYNC_ROOT_INFO_BASIC,
+            &mut info as *mut CF_SYNC_ROOT_BASIC_INFO as *mut c_void,
+            size_of::<CF_SYNC_ROOT_BASIC_INFO>() as u32,
+            None,
+        )
+    }
+    .map(|()| true)
+    .or_else(|error| {
+        let code = super::error_code(&error);
+        match code {
+            2 | 3 | ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT | ERROR_NOT_A_CLOUD_SYNC_ROOT => Ok(false),
+            _ => Err(code),
+        }
+    })
 }
 
 /// Pin/in-sync state of a placeholder.

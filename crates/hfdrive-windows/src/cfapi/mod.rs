@@ -42,8 +42,8 @@ pub use ops::{
     PlaceholderOutcome, PlaceholderRequestOutcome, UpdateSpec,
 };
 pub use registration::{
-    register_sync_root, registered_sync_roots, sync_root_id, sync_root_info_for_folder,
-    sync_root_info_for_id, unregister_sync_root,
+    register_sync_root, registered_sync_roots, sync_root_id, sync_root_info_for_id,
+    sync_root_registered_at_path, unregister_sync_root,
     HardlinkPolicy, HydrationModifiers, HydrationPolicy, PopulationPolicy, RegisteredRoot,
     RegistrationInfo, RegistrationOutcome, SyncPolicy, HFDRIVE_PROVIDER_GUID,
     SYNC_POLICY, SYNC_ROOT_ID_MAX_LEN,

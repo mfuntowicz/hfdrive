@@ -5,7 +5,8 @@
 //! mount down to the root itself, canonicalized (no traversal spelling), with
 //! every path component a supported name, and non-overlapping with any other
 //! configured HF Drive root, the application state/cache/staging directory,
-//! or any sync root registered with Windows (`GetCurrentSyncRoots`).
+//! or any sync root containing the candidate (`CfGetSyncRootInfoByPath`;
+//! reconnect uses an exact registration ID lookup).
 //! Everything is checked through open handles; nothing is inferred from
 //! strings alone.
 //!
@@ -247,40 +248,21 @@ fn check_overlaps(
         return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
     }
 
-    // Check only the candidate registration. Enumerating every registered
-    // root can crash Windows when any older root's folder was deleted.
-    let registered = crate::cfapi::registration::sync_root_info_for_folder(final_path)
+    // Check only the candidate. Enumerating every registered root or resolving
+    // its WinRT folder can crash Windows when an older root was deleted.
+    let registered = crate::cfapi::registration::sync_root_registered_at_path(final_path)
         .map_err(|error| match error {
             crate::cfapi::CfError::Win32 { code, .. } => FsError::Win32 {
-                operation: "GetSyncRootInformationForFolder",
+                operation: "CfGetSyncRootInfoByPath",
                 code,
             },
             _ => FsError::OverlapsSyncRoot { other: final_path.to_path_buf() },
         })?;
-    let Some(info) = registered else {
-        return Ok(false);
-    };
-    let id = info.Id()
-        .map_err(|error| FsError::Win32 {
-            operation: "StorageProviderSyncRootInfo.Id",
-            code: error.code().0 as u32,
-        })?
-        .to_string();
-    let claimed = context.existing_sync_root_id.as_deref() == Some(id.as_str());
-    if claimed {
-        if registration_matches(
-            context.existing_sync_root_id.as_deref(),
-            &id,
-            final_path,
-            identity,
-            final_path,
-            identity,
-        ) {
-            return Ok(true);
-        }
-        return Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() });
+    if registered {
+        Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() })
+    } else {
+        Ok(false)
     }
-    Err(FsError::OverlapsSyncRoot { other: final_path.to_path_buf() })
 }
 
 /// Canonicalize an existing path through a handle; `Ok(None)` when absent.

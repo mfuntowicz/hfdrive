@@ -1055,3 +1055,26 @@ verification.
   `artifacts/tests/syncroot-final-suites.log`,
   `artifacts/tests/candidate-registration.log`, and
   `artifacts/tests/setup-progress-build.log`.
+
+### Native candidate sync-root query — 2026-11-18
+
+- **diagnosed** — the follow-up `0x800700A1` came from passing the canonical
+  extended `\\?\` path to WinRT folder resolution. Converting that path was
+  not sufficient: `GetSyncRootInformationForFolder` also returned
+  `ERROR_ELEMENT_NOT_FOUND` (1168) immediately after a successful test
+  registration, so treating its absence errors as “unregistered” could hide
+  real overlaps. New-candidate admission now uses
+  `CfGetSyncRootInfoByPath(CF_SYNC_ROOT_INFO_BASIC)` directly. It handles
+  `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT` (390) and
+  `ERROR_NOT_A_CLOUD_SYNC_ROOT` (405), without enumerating other roots or
+  resolving deleted folders. Registration and reconnect-by-ID remain WinRT.
+- **passed** — `candidate_registration_does_not_require_enumerating_deleted_roots`
+  admits an unregistered canonical path, detects it again after registration,
+  unregisters it, and returns false for a missing path. Command:
+  `cargo test -p hfdrive-windows --locked --target x86_64-pc-windows-msvc --test sync_root_registration candidate_registration_does_not_require_enumerating_deleted_roots -- --exact --nocapture`.
+- **passed** — the rebuilt debug provider and actual desktop setup advanced
+  from **Check & review** to **Step 4 of 4 — Ready to connect?** for
+  `mfuntowicz/drive` and `C:\Users\momo-\HF Drive\drive`, with no
+  `LocalRootInvalid` panel. **Connect drive** was not clicked and the provider
+  still reported zero connections. Evidence:
+  `artifacts/acceptance/syncroot-review-fixed.png`.

@@ -107,8 +107,13 @@ fn candidate_registration_does_not_require_enumerating_deleted_roots() {
         },
     )
     .unwrap();
+    let registered = hfdrive_windows::cfapi::sync_root_registered_at_path(&validated.final_path);
     unregister_sync_root("S-1-5-21-1-2-3-1001", connection).unwrap();
+    assert!(
+        registered.unwrap(),
+        "the canonical extended path must detect the registered root"
+    );
 
     let missing = directory.path().join("missing");
-    assert!(hfdrive_windows::cfapi::sync_root_info_for_folder(&missing).unwrap().is_none());
+    assert!(!hfdrive_windows::cfapi::sync_root_registered_at_path(&missing).unwrap());
 }

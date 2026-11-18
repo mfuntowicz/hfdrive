@@ -179,26 +179,13 @@ pub fn unregister_sync_root(user_sid: &str, connection: ConnectionId) -> CfResul
     }
 }
 
-/// Queries one registration by candidate folder without enumerating other roots.
-pub fn sync_root_info_for_folder(path: &std::path::Path) -> CfResult<Option<StorageProviderSyncRootInfo>> {
-    let folder = match crate::ffi::syncroot::resolve_folder(path) {
-        Ok(folder) => folder,
-        Err(2) | Err(1168) | Err(0x8007_0002) | Err(0x8007_0021) | Err(0x8007_00A1) => return Ok(None),
-        Err(code) => {
-            return Err(CfError::Win32 {
-                operation: "StorageFolder.GetFolderFromPathAsync",
-                code,
-            });
-        }
-    };
-    match crate::ffi::syncroot::sync_root_info_for_folder(&folder) {
-        Ok(info) => Ok(Some(info)),
-        Err(2) | Err(1168) | Err(0x8007_0002) | Err(0x8007_0021) | Err(0x8007_00A1) => Ok(None),
-        Err(code) => Err(CfError::Win32 {
-            operation: "StorageProviderSyncRootManager.GetSyncRootInformationForFolder",
-            code,
-        }),
-    }
+/// Checks whether any registered sync root contains `path`, without
+/// enumerating other roots or resolving their possibly deleted folders.
+pub fn sync_root_registered_at_path(path: &std::path::Path) -> CfResult<bool> {
+    crate::ffi::cfapi::sync_root_registered(path).map_err(|code| CfError::Win32 {
+        operation: "CfGetSyncRootInfoByPath",
+        code,
+    })
 }
 
 /// Gets one registration by stable ID without resolving its folder object.

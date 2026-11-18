@@ -274,13 +274,6 @@ pub(crate) fn current_roots(_skip_path_for: Option<&str>) -> Result<Vec<Register
     Ok(out)
 }
 
-/// Queries one registration by candidate folder without enumerating other roots.
-pub(crate) fn sync_root_info_for_folder(folder: &StorageFolder) -> Result<StorageProviderSyncRootInfo, u32> {
-    let _mta = MtaGuard::enter()?;
-    StorageProviderSyncRootManager::GetSyncRootInformationForFolder(folder)
-        .map_err(|e| super::error_code(&e))
-}
-
 /// Queries one registration by stable ID without touching its folder object.
 pub(crate) fn sync_root_info_for_id(id: &str) -> Result<StorageProviderSyncRootInfo, u32> {
     let _mta = MtaGuard::enter()?;
